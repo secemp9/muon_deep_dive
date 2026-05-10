@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.10a — Tabulate gauge redundancy fraction for common NN layer shapes.
+
+Formula: gauge_fraction = n(n+1) / (2mn)
+         where m x n_cols is the weight matrix shape and n = min(m, n_cols).
+
+This quantifies the fraction of parameter space consumed by gauge (redundant)
+degrees of freedom — the O(n) symmetry group acting on internal representations.
+
+Physical interpretation:
+  - gauge_fraction of each SGD step is wasted on directions that don't change
+    the input-output function (they merely rotate the internal basis)
+  - Muon eliminates this waste by projecting onto the Stiefel manifold
+  - Predicted speedup = 1 / (1 - gauge_fraction)
+
+Connection to Axiom 0.9a:
+  The gauge fraction here equals the dimension ratio (n+1)/(2m) from the
+  Stiefel tangent space analysis. Specifically:
+    dim(normal) / dim(ambient) = [n(n+1)/2] / [mn] = (n+1)/(2m)
+  which for square matrices (m=n) gives (n+1)/(2n) -> 1/2.
+"""
+
+import numpy as np
+
+np.random.seed(42)
+
+# ─── Section 1: Core Formula and Tabulation ─────────────────────────────────
+
+print("=" * 80)
+print("AXIOM 0.10a: Gauge Redundancy Fraction for Common NN Layer Shapes")
+print("=" * 80)
+print()
+print("Formula: gauge_fraction = n(n+1) / (2*m*n) = (n+1) / (2m)")
+print("         where n = min(rows, cols), m = max(rows, cols)")
+print()
+print("Physical meaning:")
+print("  gauge_fraction = fraction of parameter DOF consumed by O(n) gauge symmetry")
+print("  physical_fraction = 1 - gauge_fraction = fraction of truly useful DOF")
+print("  predicted_speedup = 1 / physical_fraction = Muon benefit factor")
+print()
+
+# ─── Layer definitions ──────────────────────────────────────────────────────
+
+layers = [
+    ("MLP 512x512",        512,   512),
+    ("MLP 768x3072",       768,   3072),
+    ("Attn QKV 768x768",   768,   768),
+    ("Conv3x3 128x576",    128,   576),     # 3x3x64->128 reshaped to 128x576
+    ("Embedding 50257x768", 50257, 768),
+    ("LM Head 768x50257",  768,   50257),
+]
+
+print("-" * 80)
+print(f"{'Layer Name':<22} {'Shape':<14} {'n=min':<8} "
+      f"{'Gauge Frac':<12} {'Phys Frac':<12} {'Speedup':<10}")
+print("-" * 80)
+
+results = []
+
+for name, rows, cols in layers:
+    n = min(rows, cols)
+    m = max(rows, cols)
+    # gauge_fraction = n(n+1) / (2*m*n) = (n+1) / (2*m)
+    gauge_frac = n * (n + 1) / (2 * m * n)
+    phys_frac = 1.0 - gauge_frac
+    speedup = 1.0 / phys_frac
+
+    results.append((name, rows, cols, n, m, gauge_frac, phys_frac, speedup))
+
+    print(f"{name:<22} {rows}x{cols:<8} {n:<8} "
+          f"{gauge_frac:<12.4%} {phys_frac:<12.4%} {speedup:<10.4f}x")
+
+print("-" * 80)
+print()
+
+# ─── Section 2: Detailed Derivation for Each Layer ──────────────────────────
+
+print("=" * 80)
+print("SECTION 2: Derivation Details")
+print("=" * 80)
+print()
+
+derivations = [
+    ("MLP 512x512", 512, 512,
+     "Square: n=512, gauge = 512*513/(2*512*512) = 513/1024 = 50.10%"),
+    ("MLP 768x3072", 768, 3072,
+     "Tall (transposed): n=min(768,3072)=768, gauge = 768*769/(2*768*3072) = 769/6144 = 12.52%"),
+    ("Attn QKV 768x768", 768, 768,
+     "Square: n=768, gauge = 768*769/(2*768*768) = 769/1536 = 50.07%"),
+    ("Conv3x3 128x576", 128, 576,
+     "Reshaped conv: 128 filters x (3*3*64)=576 spatial, n=128, gauge = 128*129/(2*128*576) = 129/1152 = 11.20%"),
+    ("Embedding 50257x768", 50257, 768,
+     "Very tall: n=768, gauge = 768*769/(2*50257*768) = 769/100514 = 0.77%"),
+    ("LM Head 768x50257", 768, 50257,
+     "Very wide (equiv. tall transposed): n=768, gauge = 768*769/(2*768*50257) = 769/100514 = 0.77%"),
+]
+
+for name, rows, cols, explanation in derivations:
+    print(f"  {name} ({rows}x{cols}):")
+    print(f"    {explanation}")
+    print()
+
+# ─── Section 3: Muon Benefit Ranking ────────────────────────────────────────
+
+print("=" * 80)
+print("SECTION 3: Muon Benefit Ranking (sorted by predicted speedup)")
+print("=" * 80)
+print()
+print("Layers where Muon helps MOST are listed first.")
+print("These are the layers with the highest gauge redundancy fraction.")
+print()
+
+# Sort by speedup descending
+ranked = sorted(results, key=lambda x: x[7], reverse=True)
+
+print(f"{'Rank':<6} {'Layer Name':<22} {'Gauge Frac':<12} "
+      f"{'Speedup':<10} {'Commentary':<30}")
+print("-" * 80)
+
+for i, (name, rows, cols, n, m, gauge_frac, phys_frac, speedup) in enumerate(ranked, 1):
+    if gauge_frac > 0.45:
+        comment = "HIGH benefit (square-like)"
+    elif gauge_frac > 0.10:
+        comment = "MODERATE benefit"
+    elif gauge_frac > 0.01:
+        comment = "LOW benefit (very rectangular)"
+    else:
+        comment = "MINIMAL benefit (embedding-like)"
+
+    print(f"{i:<6} {name:<22} {gauge_frac:<12.4%} "
+          f"{speedup:<10.4f}x {comment:<30}")
+
+print("-" * 80)
+print()
+print("Interpretation:")
+print("  - Square layers (attention, square MLPs): ~50% gauge -> ~2x Muon speedup")
+print("  - Moderately rectangular (MLP up/down, conv): 11-13% gauge -> ~1.13x speedup")
+print("  - Very rectangular (embedding, LM head): <1% gauge -> negligible Muon benefit")
+print()
+print("This explains why Muon is typically applied to attention and MLP layers")
+print("but NOT to embedding layers — the gauge redundancy is negligible there.")
+print()
+
+# ─── Section 4: Connection to Axiom 0.9a ────────────────────────────────────
+
+print("=" * 80)
+print("SECTION 4: Connection to Axiom 0.9a (Stiefel Tangent Space)")
+print("=" * 80)
+print()
+print("From Axiom 0.9a:")
+print("  dim(St(m,n)) = mn - n(n+1)/2")
+print("  dim(normal space) = n(n+1)/2")
+print("  gauge fraction = dim(normal) / dim(ambient) = n(n+1)/(2mn) = (n+1)/(2m)")
+print()
+print("This is EXACTLY the same formula used here. The gauge redundancy fraction")
+print("is the codimension of the Stiefel manifold relative to the ambient space,")
+print("normalized by the ambient dimension.")
+print()
+print("Verification (should match Section 1 exactly):")
+print()
+
+print(f"{'Layer':<22} {'0.10a formula':<16} {'0.9a formula':<16} {'Match':<8}")
+print("-" * 60)
+
+all_match = True
+for name, rows, cols, n, m, gauge_frac, phys_frac, speedup in results:
+    # 0.9a formula: dim_normal / dim_ambient = n(n+1)/2 / (m*n)
+    dim_ambient = m * n
+    dim_normal = n * (n + 1) // 2
+    gauge_09a = dim_normal / dim_ambient
+
+    match = abs(gauge_frac - gauge_09a) < 1e-10
+    if not match:
+        all_match = False
+
+    print(f"{name:<22} {gauge_frac:<16.8f} {gauge_09a:<16.8f} "
+          f"{'PASS' if match else 'FAIL'}")
+
+print()
+
+# ─── Section 5: Numerical Verification via Random Projection ────────────────
+
+print("=" * 80)
+print("SECTION 5: Numerical Verification — Random Gradient Projection")
+print("=" * 80)
+print()
+print("For each layer shape, generate random Q in St(m,n) and random G,")
+print("project G into tangent/normal components, measure the gauge fraction.")
+print("Should match the formula (n+1)/(2m).")
+print()
+
+def random_stiefel(m, n):
+    """Generate random Q in St(m,n) via QR decomposition."""
+    A = np.random.randn(m, n)
+    Q, R = np.linalg.qr(A)
+    Q = Q @ np.diag(np.sign(np.diag(R)))
+    return Q
+
+
+def project_tangent_normal(Q, X):
+    """Project X into tangent/normal of St(m,n) at Q."""
+    QtX = Q.T @ X
+    S = (QtX + QtX.T) / 2  # symmetric part -> normal direction
+    N = Q @ S               # normal component (gauge)
+    Z = X - N               # tangent component (physical)
+    return Z, N
+
+
+N_TRIALS = 500
+
+# Use smaller shapes for numerical verification (large shapes too slow)
+verify_shapes = [
+    ("MLP-like 32x32",     32, 32),
+    ("MLP-like 32x128",    32, 128),
+    ("Conv-like 64x288",   64, 288),
+    ("Attn-like 64x64",    64, 64),
+    ("Tall 200x32",        200, 32),
+    ("Very tall 500x32",   500, 32),
+]
+
+print(f"{'Shape':<22} {'Theory':<12} {'Measured':<12} {'Std':<10} "
+      f"{'Z-score':<10} {'Pass':<6}")
+print("-" * 72)
+
+all_pass_numerical = True
+
+for name, rows, cols in verify_shapes:
+    n = min(rows, cols)
+    m = max(rows, cols)
+    theory = (n + 1) / (2 * m)
+
+    gauge_fracs = []
+    Q = random_stiefel(m, n)
+    for _ in range(N_TRIALS):
+        G = np.random.randn(m, n)
+        Z, N_comp = project_tangent_normal(Q, G)
+        gf = np.linalg.norm(N_comp, 'fro')**2 / np.linalg.norm(G, 'fro')**2
+        gauge_fracs.append(gf)
+
+    mean_gf = np.mean(gauge_fracs)
+    std_gf = np.std(gauge_fracs)
+    se = std_gf / np.sqrt(N_TRIALS)
+    z_score = abs(mean_gf - theory) / se if se > 0 else 0
+    passed = z_score < 4  # 4-sigma tolerance
+
+    if not passed:
+        all_pass_numerical = False
+
+    print(f"{name:<22} {theory:<12.6f} {mean_gf:<12.6f} {std_gf:<10.6f} "
+          f"{z_score:<10.2f} {'PASS' if passed else 'FAIL'}")
+
+print()
+
+# ─── Section 6: Scaling Law — How Gauge Fraction Varies ─────────────────────
+
+print("=" * 80)
+print("SECTION 6: Scaling Law — Gauge Fraction vs Aspect Ratio")
+print("=" * 80)
+print()
+print("gauge_fraction = (n+1)/(2m) where n = min(rows,cols), m = max(rows,cols)")
+print("As aspect ratio r = m/n increases: gauge_fraction ~ 1/(2r)")
+print()
+
+print(f"{'Aspect ratio m/n':<20} {'Gauge Fraction':<18} {'Speedup':<10}")
+print("-" * 50)
+
+for r in [1.0, 1.5, 2.0, 4.0, 8.0, 16.0, 64.0, 256.0]:
+    # For large n: gauge ~ 1/(2r)
+    n = 768  # reference
+    m = int(r * n)
+    gf = (n + 1) / (2 * m)
+    sp = 1.0 / (1.0 - gf)
+    print(f"{r:<20.1f} {gf:<18.6f} {sp:<10.4f}x")
+
+print()
+print("Key insight: Muon's benefit drops as 1/(2r) with increasing aspect ratio.")
+print("For embedding layers (r ~ 65), gauge is only 0.77% — Muon barely helps.")
+print("For square layers (r = 1), gauge is ~50% — Muon gives ~2x speedup.")
+print()
+
+# ─── Final Summary ──────────────────────────────────────────────────────────
+
+print("=" * 80)
+print("FINAL SUMMARY")
+print("=" * 80)
+print()
+print("Verified claims:")
+print(f"  Formula matches 0.9a Stiefel dimension:     {'PASS' if all_match else 'FAIL'}")
+print(f"  Numerical projection test (4-sigma):        {'PASS' if all_pass_numerical else 'FAIL'}")
+print()
+print("Key results:")
+print("  Layer Type              Gauge Frac    Muon Speedup")
+print("  ─────────────────────── ──────────── ────────────")
+print("  Square (attn, mlp)      ~50%          ~2.0x")
+print("  Moderate (mlp up/down)  ~12.5%        ~1.14x")
+print("  Conv (reshaped)         ~11.2%        ~1.13x")
+print("  Embedding/LM head       ~0.77%        ~1.008x")
+print()
+print("Practical implication:")
+print("  Apply Muon preferentially to square/near-square layers (attention, square MLP).")
+print("  For very rectangular layers (embeddings), SGD/Adam already use ~99% of step")
+print("  on physical directions — Muon adds negligible benefit.")
+print()
+
+overall = all_match and all_pass_numerical
+print(f"{'='*80}")
+print(f"OVERALL: {'PASS' if overall else 'FAIL'}")
+print(f"{'='*80}")

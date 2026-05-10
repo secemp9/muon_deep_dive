@@ -1,0 +1,920 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.6b -- Compare step norms: ||Delta_SGD||_F vs ||Delta_Muon||_F vs ||Delta_Adam||_F
+                for the SAME loss decrease
+
+For a quadratic loss f(W) = ||AW - B||^2_F with known A, B, we compute the
+gradient G = 2 A^T (AW - B) and then form the update step under three optimizers:
+
+    SGD:   Delta = eta_sgd  * G
+    Muon:  Delta = eta_muon * ortho(G)          (polar factor UV^T)
+    Adam:  Delta = eta_adam * G / (sqrt(G^2) + eps)
+
+We match learning rates so that the first-order loss decrease  tr(G^T Delta)
+is IDENTICAL for all three.  Then we measure the cost of that step under
+several matrix norms:  Frobenius, spectral (operator), nuclear, and
+element-wise max.
+
+Hypothesis:
+  - Muon achieves the same loss decrease with the smallest spectral norm
+    (||Delta_Muon||_op < ||Delta_SGD||_op).
+  - SGD achieves the same loss decrease with the smallest Frobenius norm
+    (||Delta_SGD||_F < ||Delta_Muon||_F).
+  - Adam achieves the smallest element-wise max norm.
+  - Each optimizer is optimal in its own geometry.
+  - For gradients with more spread singular values, Muon's spectral
+    advantage grows.
+
+Sections:
+  1. Setup and single-step comparison (matched first-order loss decrease)
+  2. Actual (exact) loss decrease -- second-order effects
+  3. Condition number sweep  kappa in {1, 2, 5, 10, 50, 100, 1000}
+  4. Efficiency ratios (spectral vs Frobenius) across kappa
+  5. Rectangular weight matrices (8x5 -> 5x3 -> 8x3)
+  6. Multi-step trajectory (10 steps)
+  7. Statistical validation across 50 random problems
+  8. Final verdict
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+def sep(title: str) -> None:
+    """Print a section separator."""
+    print(f"\n{'=' * 76}")
+    print(f"  {title}")
+    print(f"{'=' * 76}\n")
+
+
+def subsep(title: str) -> None:
+    """Print a subsection separator."""
+    print(f"\n  {'-' * 70}")
+    print(f"    {title}")
+    print(f"  {'-' * 70}\n")
+
+
+def mat(name: str, A: np.ndarray) -> None:
+    """Pretty-print a labelled matrix."""
+    rows, cols = A.shape
+    print(f"  {name}  (shape {rows}x{cols}):")
+    show_r = min(rows, 6)
+    show_c = min(cols, 6)
+    for i in range(show_r):
+        vals = "  ".join(f"{A[i, j]: .8f}" for j in range(show_c))
+        suffix = "  ..." if cols > show_c else ""
+        print(f"    [{vals}{suffix}]")
+    if rows > show_r:
+        print(f"    ... ({rows - show_r} more rows)")
+    print()
+
+
+def ortho(M: np.ndarray) -> np.ndarray:
+    """Compute the polar factor Q = U V^T via thin SVD."""
+    U, _s, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def pf(ok: bool) -> str:
+    """Return PASS or FAIL string."""
+    return "PASS" if ok else "FAIL"
+
+
+# Global tracking
+all_pass = True
+total_checks = 0
+total_failures = 0
+
+
+def check(condition: bool, label: str) -> bool:
+    """Record a pass/fail check."""
+    global all_pass, total_checks, total_failures
+    total_checks += 1
+    if not condition:
+        all_pass = False
+        total_failures += 1
+    print(f"    [{pf(condition)}]  {label}")
+    return condition
+
+
+rng = np.random.default_rng(42)
+tol = 1e-8
+eps_adam = 1e-8  # Adam epsilon
+
+
+# ---------------------------------------------------------------------------
+#  Core routines for the experiment
+# ---------------------------------------------------------------------------
+
+def quadratic_loss(A, W, B):
+    """f(W) = ||AW - B||^2_F"""
+    R = A @ W - B
+    return np.sum(R ** 2)
+
+
+def quadratic_grad(A, W, B):
+    """Gradient: G = 2 A^T (AW - B)"""
+    return 2.0 * A.T @ (A @ W - B)
+
+
+def adam_direction(G, eps=1e-8):
+    """Adam-like direction: G / (sqrt(G^2) + eps).  Single-step approximation
+    where the second-moment estimate v = G^2 (no history)."""
+    return G / (np.sqrt(G ** 2) + eps)
+
+
+def match_lr_for_target(G, direction, target_decrease):
+    """Find learning rate eta such that tr(G^T (eta * direction)) = target_decrease.
+    Returns eta.  If tr(G^T direction) ~ 0, returns 0."""
+    inner = np.sum(G * direction)
+    if abs(inner) < 1e-30:
+        return 0.0
+    return target_decrease / inner
+
+
+def compute_all_norms(Delta):
+    """Return dict of matrix norms for a step Delta."""
+    sv = np.linalg.svd(Delta, compute_uv=False)
+    return {
+        "frob": np.linalg.norm(Delta, 'fro'),
+        "op": sv[0],
+        "nuc": np.sum(sv),
+        "max": np.max(np.abs(Delta)),
+    }
+
+
+def run_single_step_comparison(A, B, W, target_decrease=None):
+    """Run the three-optimizer comparison at a single point W.
+    Returns a dict of results for each optimizer."""
+    G = quadratic_grad(A, W, B)
+    loss_init = quadratic_loss(A, W, B)
+
+    # Compute raw directions
+    dir_sgd = G
+    dir_muon = ortho(G)
+    dir_adam = adam_direction(G, eps_adam)
+
+    # First-order loss decrease for unit-lr step: tr(G^T direction)
+    fo_sgd = np.sum(G * dir_sgd)
+
+    # Choose target = first-order decrease from SGD at a small lr
+    if target_decrease is None:
+        target_decrease = 0.01 * fo_sgd  # small step for linearity
+
+    # Match learning rates
+    eta_sgd = match_lr_for_target(G, dir_sgd, target_decrease)
+    eta_muon = match_lr_for_target(G, dir_muon, target_decrease)
+    eta_adam = match_lr_for_target(G, dir_adam, target_decrease)
+
+    # Compute actual steps
+    Delta_sgd = eta_sgd * dir_sgd
+    Delta_muon = eta_muon * dir_muon
+    Delta_adam = eta_adam * dir_adam
+
+    # Verify first-order decrease matches
+    fo_check_sgd = np.sum(G * Delta_sgd)
+    fo_check_muon = np.sum(G * Delta_muon)
+    fo_check_adam = np.sum(G * Delta_adam)
+
+    # Compute norms of each step
+    norms_sgd = compute_all_norms(Delta_sgd)
+    norms_muon = compute_all_norms(Delta_muon)
+    norms_adam = compute_all_norms(Delta_adam)
+
+    # Compute actual loss after step (exact for quadratic)
+    loss_sgd = quadratic_loss(A, W - Delta_sgd, B)
+    loss_muon = quadratic_loss(A, W - Delta_muon, B)
+    loss_adam = quadratic_loss(A, W - Delta_adam, B)
+
+    actual_dec_sgd = loss_init - loss_sgd
+    actual_dec_muon = loss_init - loss_muon
+    actual_dec_adam = loss_init - loss_adam
+
+    return {
+        "G": G,
+        "loss_init": loss_init,
+        "target_decrease": target_decrease,
+        "fo_check": {"sgd": fo_check_sgd, "muon": fo_check_muon, "adam": fo_check_adam},
+        "eta": {"sgd": eta_sgd, "muon": eta_muon, "adam": eta_adam},
+        "Delta": {"sgd": Delta_sgd, "muon": Delta_muon, "adam": Delta_adam},
+        "norms": {"sgd": norms_sgd, "muon": norms_muon, "adam": norms_adam},
+        "actual_decrease": {"sgd": actual_dec_sgd, "muon": actual_dec_muon, "adam": actual_dec_adam},
+    }
+
+
+# ===================================================================
+#  SECTION 1 -- Setup and single-step comparison
+# ===================================================================
+
+sep("SECTION 1: Setup and single-step comparison (matched first-order loss decrease)")
+
+print("  Quadratic loss: f(W) = ||AW - B||^2_F")
+print("  Gradient:       G = 2 A^T (AW - B)")
+print()
+print("  For each optimizer, we find learning rate eta so that the first-order")
+print("  loss decrease tr(G^T Delta) is identical.  Then we compare the cost")
+print("  of that step under different matrix norms.")
+print()
+
+# Setup: 5x5 problem
+m, n = 5, 5
+A = rng.standard_normal((m, n))
+B = rng.standard_normal((m, n))
+W_init = rng.standard_normal((n, n))
+
+mat("A", A)
+mat("B", B)
+mat("W_init", W_init)
+
+G = quadratic_grad(A, W_init, B)
+mat("G = gradient at W_init", G)
+
+# Show gradient singular values (important for understanding geometry)
+sv_G = np.linalg.svd(G, compute_uv=False)
+print(f"  Singular values of G: {sv_G}")
+print(f"  Condition number of G: {sv_G[0] / sv_G[-1]:.2f}")
+print()
+
+# Run comparison
+res = run_single_step_comparison(A, B, W_init)
+
+# Verify first-order decreases match
+subsep("First-order decrease matching")
+print(f"  Target first-order decrease: {res['target_decrease']:.8f}")
+print(f"  SGD  first-order decrease:   {res['fo_check']['sgd']:.8f}")
+print(f"  Muon first-order decrease:   {res['fo_check']['muon']:.8f}")
+print(f"  Adam first-order decrease:   {res['fo_check']['adam']:.8f}")
+print()
+print(f"  Learning rates: eta_sgd = {res['eta']['sgd']:.8e}")
+print(f"                  eta_muon = {res['eta']['muon']:.8e}")
+print(f"                  eta_adam = {res['eta']['adam']:.8e}")
+print()
+
+check(abs(res['fo_check']['sgd'] - res['target_decrease']) / res['target_decrease'] < 1e-10,
+      "SGD first-order decrease matches target")
+check(abs(res['fo_check']['muon'] - res['target_decrease']) / res['target_decrease'] < 1e-10,
+      "Muon first-order decrease matches target")
+check(abs(res['fo_check']['adam'] - res['target_decrease']) / res['target_decrease'] < 1e-10,
+      "Adam first-order decrease matches target")
+print()
+
+# Compare norms
+subsep("Step norms for matched first-order decrease")
+
+header = f"  {'Optimizer':>10s}  {'||D||_F':>12s}  {'||D||_op':>12s}  {'||D||_*':>12s}  {'||D||_max':>12s}"
+print(header)
+print(f"  {'-' * 10}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}")
+for opt in ["sgd", "muon", "adam"]:
+    nm = res["norms"][opt]
+    print(f"  {opt.upper():>10s}  {nm['frob']:>12.8f}  {nm['op']:>12.8f}  {nm['nuc']:>12.8f}  {nm['max']:>12.8f}")
+print()
+
+# Check the hypothesis: Muon has smallest spectral norm
+check(res["norms"]["muon"]["op"] < res["norms"]["sgd"]["op"],
+      f"||Delta_Muon||_op < ||Delta_SGD||_op  ({res['norms']['muon']['op']:.8f} < {res['norms']['sgd']['op']:.8f})")
+check(res["norms"]["muon"]["op"] < res["norms"]["adam"]["op"],
+      f"||Delta_Muon||_op < ||Delta_Adam||_op  ({res['norms']['muon']['op']:.8f} < {res['norms']['adam']['op']:.8f})")
+
+# Check: SGD has smallest Frobenius norm
+check(res["norms"]["sgd"]["frob"] < res["norms"]["muon"]["frob"],
+      f"||Delta_SGD||_F < ||Delta_Muon||_F  ({res['norms']['sgd']['frob']:.8f} < {res['norms']['muon']['frob']:.8f})")
+
+# Check: Adam has smallest element-wise max norm
+check(res["norms"]["adam"]["max"] < res["norms"]["sgd"]["max"],
+      f"||Delta_Adam||_max < ||Delta_SGD||_max  ({res['norms']['adam']['max']:.8f} < {res['norms']['sgd']['max']:.8f})")
+check(res["norms"]["adam"]["max"] < res["norms"]["muon"]["max"],
+      f"||Delta_Adam||_max < ||Delta_Muon||_max  ({res['norms']['adam']['max']:.8f} < {res['norms']['muon']['max']:.8f})")
+print()
+
+print("  Interpretation:")
+print("    For the SAME first-order loss decrease:")
+print("    - Muon uses the smallest spectral norm (fewest 'loud' singular values).")
+print("      This is the Von Neumann trace inequality: ortho(G) maximizes tr(G^T D)")
+print("      per unit ||D||_op, so matching the decrease requires the smallest ||D||_op.")
+print("    - SGD uses the smallest Frobenius norm (smallest total 'energy').")
+print("      The gradient direction maximizes tr(G^T D) per unit ||D||_F.")
+print("    - Adam uses the smallest element-wise max (no single parameter moves far).")
+print("      The sign-like direction maximizes tr(G^T D) per unit ||D||_inf.")
+print("    Each optimizer is optimal in its OWN geometry.")
+print()
+
+
+# ===================================================================
+#  SECTION 2 -- Actual loss decrease (second-order effects)
+# ===================================================================
+
+sep("SECTION 2: Actual loss decrease (exact, not just first-order)")
+
+print("  For the quadratic f(W) = ||AW - B||^2_F, we can compute the exact loss")
+print("  after each step.  The actual decrease may differ from the first-order")
+print("  prediction due to curvature (the Hessian term).")
+print()
+print("  f(W - Delta) = f(W) - tr(G^T Delta) + ||A Delta||^2_F")
+print("  actual_decrease = tr(G^T Delta) - ||A Delta||^2_F")
+print("                  = first_order_decrease - second_order_penalty")
+print()
+
+fo_target = res["target_decrease"]
+print(f"  Matched first-order decrease:  {fo_target:.8f}")
+print()
+
+header2 = f"  {'Optimizer':>10s}  {'1st-order':>14s}  {'2nd-order penalty':>18s}  {'Actual decrease':>16s}  {'Ratio actual/1st':>18s}"
+print(header2)
+print(f"  {'-' * 10}  {'-' * 14}  {'-' * 18}  {'-' * 16}  {'-' * 18}")
+for opt in ["sgd", "muon", "adam"]:
+    Delta = res["Delta"][opt]
+    second_order = np.sum((A @ Delta) ** 2)
+    actual = res["actual_decrease"][opt]
+    ratio_fo = actual / fo_target if abs(fo_target) > 1e-30 else 0.0
+    print(f"  {opt.upper():>10s}  {fo_target:>14.8f}  {second_order:>18.8f}  {actual:>16.8f}  {ratio_fo:>18.6f}")
+print()
+
+# The actual decrease differs from first-order because of the second-order term
+# For small steps, all three should be close
+print("  For small steps (eta << 1), the second-order penalty is negligible")
+print("  and all three optimizers achieve nearly the same actual decrease.")
+print()
+
+# Check: all actual decreases are positive (the step actually helps)
+for opt in ["sgd", "muon", "adam"]:
+    check(res["actual_decrease"][opt] > 0,
+          f"{opt.upper()} actual decrease > 0  ({res['actual_decrease'][opt]:.8f})")
+print()
+
+# Show second-order differences
+second_order_sgd = np.sum((A @ res["Delta"]["sgd"]) ** 2)
+second_order_muon = np.sum((A @ res["Delta"]["muon"]) ** 2)
+second_order_adam = np.sum((A @ res["Delta"]["adam"]) ** 2)
+
+print(f"  Second-order penalties:")
+print(f"    SGD:  ||A Delta_SGD||^2_F  = {second_order_sgd:.8e}")
+print(f"    Muon: ||A Delta_Muon||^2_F = {second_order_muon:.8e}")
+print(f"    Adam: ||A Delta_Adam||^2_F = {second_order_adam:.8e}")
+print()
+print("  The second-order penalty depends on how the step interacts with A,")
+print("  not just on the step norm.  This is where 'matching the loss landscape'")
+print("  matters -- the optimal geometry depends on the curvature structure.")
+print()
+
+
+# ===================================================================
+#  SECTION 3 -- Condition number sweep
+# ===================================================================
+
+sep("SECTION 3: Condition number sweep")
+
+print("  We construct A with controlled condition number kappa and repeat the")
+print("  single-step comparison.  The gradient G = 2 A^T(AW-B) inherits structure")
+print("  from A.  We use a TINY step (0.1% of ||G||^2_F) to stay in the linear regime.")
+print()
+print("  Analytical derivation of the spectral advantage ratio:")
+print()
+print("    SGD step:  Delta_SGD = eta_s * G")
+print("      ||Delta_SGD||_op = eta_s * sigma_1(G)")
+print("      tr(G^T Delta_SGD) = eta_s * ||G||_F^2")
+print()
+print("    Muon step: Delta_Muon = eta_m * ortho(G)")
+print("      ||Delta_Muon||_op = eta_m * 1 = eta_m")
+print("      tr(G^T Delta_Muon) = eta_m * ||G||_*  (nuclear norm)")
+print()
+print("    Matching: eta_s * ||G||_F^2 = eta_m * ||G||_*")
+print("    =>  eta_s = eta_m * ||G||_* / ||G||_F^2")
+print()
+print("    Ratio of spectral norms:")
+print("      ||D_SGD||_op / ||D_Muon||_op = eta_s * sigma_1(G) / eta_m")
+print("        = (||G||_* / ||G||_F^2) * sigma_1(G)")
+print("        = ||G||_* * sigma_1(G) / ||G||_F^2")
+print()
+
+kappas = [1, 2, 5, 10, 50, 100, 1000]
+
+# Generate fixed random orthogonal bases
+U_base, _ = np.linalg.qr(rng.standard_normal((5, 5)))
+V_base, _ = np.linalg.qr(rng.standard_normal((5, 5)))
+B_sweep = rng.standard_normal((5, 5))
+W_sweep = rng.standard_normal((5, 5))
+
+header3 = (f"  {'kappa':>7s}  {'||D_S||_op':>12s}  {'||D_M||_op':>12s}  {'||D_A||_op':>12s}  "
+           f"{'||D_S||_F':>12s}  {'||D_M||_F':>12s}  {'||D_A||_F':>12s}  "
+           f"{'op ratio':>10s}")
+print(header3)
+print(f"  {'-' * 7}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 10}")
+
+sweep_results = {}
+for kappa in kappas:
+    # Construct A with given condition number
+    s_vals = np.linspace(1.0, float(kappa), 5)
+    A_kappa = U_base @ np.diag(s_vals) @ V_base.T
+
+    # Use a tiny target decrease: 1% of the optimal SGD step's first-order decrease.
+    # For f(W) = ||AW-B||^2_F, the Lipschitz constant is L = 2*sigma_max(A)^2.
+    # The safe SGD step eta=1/L gives first-order decrease = ||G||^2_F / L.
+    # We use 1% of that to stay deep in the linear regime.
+    G_k = quadratic_grad(A_kappa, W_sweep, B_sweep)
+    L_k = 2.0 * s_vals[-1] ** 2
+    safe_fo_decrease = np.sum(G_k ** 2) / L_k
+    tiny_target = 0.01 * safe_fo_decrease
+    res_k = run_single_step_comparison(A_kappa, B_sweep, W_sweep, target_decrease=tiny_target)
+    sweep_results[kappa] = res_k
+
+    n_s = res_k["norms"]["sgd"]
+    n_m = res_k["norms"]["muon"]
+    n_a = res_k["norms"]["adam"]
+    op_ratio = n_s["op"] / n_m["op"] if n_m["op"] > 1e-30 else float('inf')
+
+    print(f"  {kappa:>7d}  {n_s['op']:>12.6f}  {n_m['op']:>12.6f}  {n_a['op']:>12.6f}  "
+          f"{n_s['frob']:>12.6f}  {n_m['frob']:>12.6f}  {n_a['frob']:>12.6f}  "
+          f"{op_ratio:>10.4f}x")
+
+print()
+
+# Check: Muon always has smallest spectral norm
+subsep("Verification: Muon spectral optimality across condition numbers")
+for kappa in kappas:
+    res_k = sweep_results[kappa]
+    muon_op = res_k["norms"]["muon"]["op"]
+    sgd_op = res_k["norms"]["sgd"]["op"]
+    check(muon_op <= sgd_op + tol,
+          f"kappa={kappa:>5d}: ||D_Muon||_op ({muon_op:.8f}) <= ||D_SGD||_op ({sgd_op:.8f})")
+print()
+
+# Check: SGD always has smallest Frobenius norm
+subsep("Verification: SGD Frobenius optimality across condition numbers")
+for kappa in kappas:
+    res_k = sweep_results[kappa]
+    sgd_frob = res_k["norms"]["sgd"]["frob"]
+    muon_frob = res_k["norms"]["muon"]["frob"]
+    check(sgd_frob <= muon_frob + tol,
+          f"kappa={kappa:>5d}: ||D_SGD||_F ({sgd_frob:.8f}) <= ||D_Muon||_F ({muon_frob:.8f})")
+print()
+
+# Verify the analytical formula for the spectral advantage ratio
+subsep("Analytical verification of spectral advantage ratio")
+print("  The ratio ||D_SGD||_op / ||D_Muon||_op should equal")
+print("  ||G||_* * sigma_1(G) / ||G||_F^2  (derived above).")
+print()
+
+for kappa in kappas:
+    res_k = sweep_results[kappa]
+    G_k = res_k["G"]
+    sv_k = np.linalg.svd(G_k, compute_uv=False)
+    nuc_k = np.sum(sv_k)
+    frob_k = np.linalg.norm(G_k, 'fro')
+    op_k = sv_k[0]
+    theoretical = nuc_k * op_k / (frob_k ** 2)
+    empirical = res_k["norms"]["sgd"]["op"] / res_k["norms"]["muon"]["op"]
+    rel_err = abs(empirical - theoretical) / theoretical
+    print(f"    kappa(A) = {kappa:>5d}:  empirical = {empirical:.8f}  "
+          f"theoretical = {theoretical:.8f}  rel_error = {rel_err:.2e}")
+    check(rel_err < 1e-8,
+          f"kappa={kappa:>5d}: empirical matches analytical formula (rel err = {rel_err:.2e})")
+
+print()
+print("  The spectral advantage ratio is EXACTLY ||G||_* * sigma_1(G) / ||G||_F^2.")
+print("  This is always >= 1 (by Cauchy-Schwarz applied to singular values).")
+print("  It is largest when G has many significant singular values (spread spectrum).")
+print()
+
+
+# ===================================================================
+#  SECTION 4 -- Efficiency ratios
+# ===================================================================
+
+sep("SECTION 4: Efficiency ratios across condition numbers")
+
+print("  Define:")
+print("    Spectral efficiency  = actual_loss_decrease / ||Delta||_op")
+print("    Frobenius efficiency = actual_loss_decrease / ||Delta||_F")
+print()
+print("  Muon should have the BEST spectral efficiency (by Von Neumann).")
+print("  SGD should have the BEST Frobenius efficiency (by Cauchy-Schwarz).")
+print()
+print("  We use the tiny-step results from Section 3, which are well within")
+print("  the linear regime (actual decrease ~ first-order decrease).")
+print()
+
+header4 = (f"  {'kappa':>7s}  {'Spec eff SGD':>14s}  {'Spec eff Muon':>14s}  {'Spec eff Adam':>14s}  "
+           f"{'Frob eff SGD':>14s}  {'Frob eff Muon':>14s}  {'Frob eff Adam':>14s}")
+print(header4)
+print(f"  {'-' * 7}  {'-' * 14}  {'-' * 14}  {'-' * 14}  {'-' * 14}  {'-' * 14}  {'-' * 14}")
+
+muon_best_spec_count = 0
+sgd_best_frob_count = 0
+
+for kappa in kappas:
+    res_k = sweep_results[kappa]
+    eff = {}
+    for opt in ["sgd", "muon", "adam"]:
+        ad = res_k["actual_decrease"][opt]
+        n = res_k["norms"][opt]
+        eff[opt] = {
+            "spec": ad / n["op"] if n["op"] > 1e-30 else 0.0,
+            "frob": ad / n["frob"] if n["frob"] > 1e-30 else 0.0,
+        }
+    print(f"  {kappa:>7d}  {eff['sgd']['spec']:>14.6f}  {eff['muon']['spec']:>14.6f}  {eff['adam']['spec']:>14.6f}  "
+          f"{eff['sgd']['frob']:>14.6f}  {eff['muon']['frob']:>14.6f}  {eff['adam']['frob']:>14.6f}")
+
+    if eff['muon']['spec'] >= eff['sgd']['spec'] - tol and eff['muon']['spec'] >= eff['adam']['spec'] - tol:
+        muon_best_spec_count += 1
+    if eff['sgd']['frob'] >= eff['muon']['frob'] - tol and eff['sgd']['frob'] >= eff['adam']['frob'] - tol:
+        sgd_best_frob_count += 1
+
+print()
+check(muon_best_spec_count == len(kappas),
+      f"Muon has best spectral efficiency in {muon_best_spec_count}/{len(kappas)} cases")
+check(sgd_best_frob_count == len(kappas),
+      f"SGD has best Frobenius efficiency in {sgd_best_frob_count}/{len(kappas)} cases")
+print()
+
+print("  Each optimizer wins in its own geometry:")
+print("    - Muon: best loss decrease per unit spectral norm (by Von Neumann)")
+print("    - SGD:  best loss decrease per unit Frobenius norm (by Cauchy-Schwarz)")
+print("    - The 'right' optimizer depends on which norm constraints matter")
+print()
+
+
+# ===================================================================
+#  SECTION 5 -- Rectangular weight matrices
+# ===================================================================
+
+sep("SECTION 5: Rectangular weight matrices (8x5 -> 5x3 -> 8x3)")
+
+print("  Real neural network layers have rectangular weight matrices.")
+print("  Does the geometry story (Muon: spectral-optimal, SGD: Frobenius-optimal)")
+print("  still hold for non-square matrices?")
+print()
+
+m_rect, k_rect, n_rect = 8, 5, 3
+A_rect = rng.standard_normal((m_rect, k_rect))
+B_rect = rng.standard_normal((m_rect, n_rect))
+W_rect = rng.standard_normal((k_rect, n_rect))
+
+print(f"  A: {m_rect}x{k_rect},  W: {k_rect}x{n_rect},  B: {m_rect}x{n_rect}")
+print(f"  f(W) = ||AW - B||^2_F,  G = 2 A^T(AW - B)  shape {k_rect}x{n_rect}")
+print()
+
+# Run comparison for rectangular case
+res_rect = run_single_step_comparison(A_rect, B_rect, W_rect)
+
+# Show gradient info
+G_rect = res_rect["G"]
+sv_G_rect = np.linalg.svd(G_rect, compute_uv=False)
+print(f"  Gradient singular values: {sv_G_rect}")
+print(f"  Gradient shape: {G_rect.shape}")
+print()
+
+# Verify matching
+print(f"  Matched first-order decrease: {res_rect['target_decrease']:.8f}")
+for opt in ["sgd", "muon", "adam"]:
+    check(abs(res_rect['fo_check'][opt] - res_rect['target_decrease']) / abs(res_rect['target_decrease']) < 1e-10,
+          f"{opt.upper()} first-order decrease matches target (rectangular)")
+print()
+
+# Norm table
+header5 = f"  {'Optimizer':>10s}  {'||D||_F':>12s}  {'||D||_op':>12s}  {'||D||_*':>12s}  {'||D||_max':>12s}"
+print(header5)
+print(f"  {'-' * 10}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}")
+for opt in ["sgd", "muon", "adam"]:
+    nm = res_rect["norms"][opt]
+    print(f"  {opt.upper():>10s}  {nm['frob']:>12.8f}  {nm['op']:>12.8f}  {nm['nuc']:>12.8f}  {nm['max']:>12.8f}")
+print()
+
+check(res_rect["norms"]["muon"]["op"] < res_rect["norms"]["sgd"]["op"],
+      f"Rectangular: ||D_Muon||_op < ||D_SGD||_op  ({res_rect['norms']['muon']['op']:.8f} < {res_rect['norms']['sgd']['op']:.8f})")
+check(res_rect["norms"]["sgd"]["frob"] < res_rect["norms"]["muon"]["frob"],
+      f"Rectangular: ||D_SGD||_F < ||D_Muon||_F  ({res_rect['norms']['sgd']['frob']:.8f} < {res_rect['norms']['muon']['frob']:.8f})")
+print()
+
+print("  The geometry story holds perfectly for rectangular matrices.")
+print("  Von Neumann's trace inequality is shape-agnostic.")
+print()
+
+# Condition number sweep for rectangular
+subsep("Rectangular condition number sweep")
+
+kappas_rect = [1, 5, 50, 1000]
+U_rect_base, _ = np.linalg.qr(rng.standard_normal((m_rect, k_rect)), mode='reduced')
+V_rect_base, _ = np.linalg.qr(rng.standard_normal((k_rect, k_rect)))
+
+header5b = f"  {'kappa':>7s}  {'||D_S||_op':>12s}  {'||D_M||_op':>12s}  {'op ratio':>12s}  {'||D_S||_F':>12s}  {'||D_M||_F':>12s}"
+print(header5b)
+print(f"  {'-' * 7}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}")
+
+for kappa_r in kappas_rect:
+    s_rect_vals = np.linspace(1.0, float(kappa_r), k_rect)
+    A_rect_k = U_rect_base @ np.diag(s_rect_vals) @ V_rect_base.T
+    G_rk = quadratic_grad(A_rect_k, W_rect, B_rect)
+    L_rk = 2.0 * s_rect_vals[-1] ** 2
+    tiny_target_rk = 0.01 * np.sum(G_rk ** 2) / L_rk
+    res_rk = run_single_step_comparison(A_rect_k, B_rect, W_rect, target_decrease=tiny_target_rk)
+    n_s = res_rk["norms"]["sgd"]
+    n_m = res_rk["norms"]["muon"]
+    op_ratio_r = n_s["op"] / n_m["op"] if n_m["op"] > 1e-30 else float('inf')
+    print(f"  {kappa_r:>7d}  {n_s['op']:>12.6f}  {n_m['op']:>12.6f}  {op_ratio_r:>12.4f}x  "
+          f"{n_s['frob']:>12.6f}  {n_m['frob']:>12.6f}")
+
+    check(n_m["op"] <= n_s["op"] + tol,
+          f"Rectangular kappa={kappa_r}: Muon spectral <= SGD spectral")
+
+print()
+print("  Same pattern: Muon's spectral advantage holds across condition numbers,")
+print("  even for rectangular matrices.  The geometry is universal.")
+print()
+
+
+# ===================================================================
+#  SECTION 6 -- Multi-step trajectory (10 steps)
+# ===================================================================
+
+sep("SECTION 6: Multi-step trajectory (10 steps)")
+
+print("  Starting from the same W_init, take 10 gradient steps with each optimizer.")
+print("  For fair comparison, every optimizer uses a per-step line search to find")
+print("  the LR that minimizes the loss at each step.  This ensures each optimizer")
+print("  is doing its BEST, so we measure the geometry advantage purely.")
+print()
+
+n_steps = 10
+
+# Use a moderately ill-conditioned A
+kappa_multi = 10.0
+s_multi = np.linspace(1.0, kappa_multi, 5)
+A_multi = U_base @ np.diag(s_multi) @ V_base.T
+B_multi = rng.standard_normal((5, 5))
+W_multi_init = rng.standard_normal((5, 5))
+
+print(f"  A condition number: {kappa_multi}")
+print(f"  A singular values: {s_multi}")
+print(f"  Initial loss: {quadratic_loss(A_multi, W_multi_init, B_multi):.6f}")
+print()
+
+def exact_line_search_quadratic(A, B, W, direction):
+    """For f(W) = ||AW-B||^2_F, find optimal eta for W - eta*D.
+    f(W - eta*D) = f(W) - eta*tr(G^T D) + eta^2 * ||AD||^2_F
+    Minimized at eta* = tr(G^T D) / (2 * ||AD||^2_F)."""
+    G_ls = quadratic_grad(A, W, B)
+    numerator = np.sum(G_ls * direction)
+    denominator = 2.0 * np.sum((A @ direction) ** 2)
+    if denominator < 1e-30:
+        return 0.0
+    return numerator / denominator
+
+# Run trajectories with per-step exact line search
+losses_sgd = np.zeros(n_steps + 1)
+losses_muon = np.zeros(n_steps + 1)
+losses_adam = np.zeros(n_steps + 1)
+
+spec_norms_sgd = np.zeros(n_steps)
+spec_norms_muon = np.zeros(n_steps)
+spec_norms_adam = np.zeros(n_steps)
+
+frob_norms_sgd = np.zeros(n_steps)
+frob_norms_muon = np.zeros(n_steps)
+frob_norms_adam = np.zeros(n_steps)
+
+W_sgd = W_multi_init.copy()
+W_muon = W_multi_init.copy()
+W_adam = W_multi_init.copy()
+
+losses_sgd[0] = quadratic_loss(A_multi, W_sgd, B_multi)
+losses_muon[0] = quadratic_loss(A_multi, W_muon, B_multi)
+losses_adam[0] = quadratic_loss(A_multi, W_adam, B_multi)
+
+for step in range(n_steps):
+    # SGD with exact line search
+    G_s = quadratic_grad(A_multi, W_sgd, B_multi)
+    dir_s = G_s
+    lr_s = exact_line_search_quadratic(A_multi, B_multi, W_sgd, dir_s)
+    Delta_s = lr_s * dir_s
+    W_sgd = W_sgd - Delta_s
+    losses_sgd[step + 1] = quadratic_loss(A_multi, W_sgd, B_multi)
+    spec_norms_sgd[step] = np.linalg.svd(Delta_s, compute_uv=False)[0]
+    frob_norms_sgd[step] = np.linalg.norm(Delta_s, 'fro')
+
+    # Muon with exact line search
+    G_m = quadratic_grad(A_multi, W_muon, B_multi)
+    dir_m = ortho(G_m)
+    lr_m = exact_line_search_quadratic(A_multi, B_multi, W_muon, dir_m)
+    Delta_m = lr_m * dir_m
+    W_muon = W_muon - Delta_m
+    losses_muon[step + 1] = quadratic_loss(A_multi, W_muon, B_multi)
+    spec_norms_muon[step] = np.linalg.svd(Delta_m, compute_uv=False)[0]
+    frob_norms_muon[step] = np.linalg.norm(Delta_m, 'fro')
+
+    # Adam with exact line search on the Adam direction
+    G_a = quadratic_grad(A_multi, W_adam, B_multi)
+    dir_a = adam_direction(G_a, eps_adam)
+    lr_a = exact_line_search_quadratic(A_multi, B_multi, W_adam, dir_a)
+    Delta_a = lr_a * dir_a
+    W_adam = W_adam - Delta_a
+    losses_adam[step + 1] = quadratic_loss(A_multi, W_adam, B_multi)
+    spec_norms_adam[step] = np.linalg.svd(Delta_a, compute_uv=False)[0]
+    frob_norms_adam[step] = np.linalg.norm(Delta_a, 'fro')
+
+# Print loss trajectory
+subsep("Loss trajectory (exact line search at each step)")
+print(f"  {'Step':>6s}  {'Loss SGD':>14s}  {'Loss Muon':>14s}  {'Loss Adam':>14s}")
+print(f"  {'-' * 6}  {'-' * 14}  {'-' * 14}  {'-' * 14}")
+for step in range(n_steps + 1):
+    print(f"  {step:>6d}  {losses_sgd[step]:>14.6f}  {losses_muon[step]:>14.6f}  {losses_adam[step]:>14.6f}")
+print()
+
+# Check: all optimizers converge (loss monotonically decreasing with exact line search)
+sgd_converges = all(losses_sgd[i+1] <= losses_sgd[i] + tol for i in range(n_steps))
+muon_converges = all(losses_muon[i+1] <= losses_muon[i] + tol for i in range(n_steps))
+adam_converges = all(losses_adam[i+1] <= losses_adam[i] + tol for i in range(n_steps))
+
+check(sgd_converges, "SGD loss is monotonically decreasing (exact line search)")
+check(muon_converges, "Muon loss is monotonically decreasing (exact line search)")
+check(adam_converges, "Adam loss is monotonically decreasing (exact line search)")
+print()
+
+# Total loss decrease
+total_dec_sgd = losses_sgd[0] - losses_sgd[-1]
+total_dec_muon = losses_muon[0] - losses_muon[-1]
+total_dec_adam = losses_adam[0] - losses_adam[-1]
+print(f"  Total loss decrease after {n_steps} steps:")
+print(f"    SGD:  {total_dec_sgd:.6f}")
+print(f"    Muon: {total_dec_muon:.6f}")
+print(f"    Adam: {total_dec_adam:.6f}")
+print()
+
+# Cumulative step norms
+cum_spec_sgd = np.sum(spec_norms_sgd)
+cum_spec_muon = np.sum(spec_norms_muon)
+cum_spec_adam = np.sum(spec_norms_adam)
+cum_frob_sgd = np.sum(frob_norms_sgd)
+cum_frob_muon = np.sum(frob_norms_muon)
+cum_frob_adam = np.sum(frob_norms_adam)
+
+subsep("Cumulative step norms over trajectory")
+print(f"  {'Optimizer':>10s}  {'Sum ||D||_op':>14s}  {'Sum ||D||_F':>14s}  {'Total loss dec':>16s}  {'Dec/sum_op':>12s}  {'Dec/sum_F':>12s}")
+print(f"  {'-' * 10}  {'-' * 14}  {'-' * 14}  {'-' * 16}  {'-' * 12}  {'-' * 12}")
+for name, t_dec, c_spec, c_frob in [
+    ("SGD",  total_dec_sgd,  cum_spec_sgd,  cum_frob_sgd),
+    ("Muon", total_dec_muon, cum_spec_muon, cum_frob_muon),
+    ("Adam", total_dec_adam, cum_spec_adam,  cum_frob_adam),
+]:
+    eff_spec = t_dec / c_spec if c_spec > 1e-30 else 0.0
+    eff_frob = t_dec / c_frob if c_frob > 1e-30 else 0.0
+    print(f"  {name:>10s}  {c_spec:>14.6f}  {c_frob:>14.6f}  {t_dec:>16.6f}  {eff_spec:>12.6f}  {eff_frob:>12.6f}")
+print()
+
+spec_eff_sgd = total_dec_sgd / cum_spec_sgd if cum_spec_sgd > 1e-30 else 0.0
+spec_eff_muon = total_dec_muon / cum_spec_muon if cum_spec_muon > 1e-30 else 0.0
+spec_eff_adam = total_dec_adam / cum_spec_adam if cum_spec_adam > 1e-30 else 0.0
+
+frob_eff_sgd = total_dec_sgd / cum_frob_sgd if cum_frob_sgd > 1e-30 else 0.0
+frob_eff_muon = total_dec_muon / cum_frob_muon if cum_frob_muon > 1e-30 else 0.0
+
+print("  Multi-step spectral efficiency (loss decrease per cumulative spectral cost):")
+print(f"    SGD:  {spec_eff_sgd:.6f}")
+print(f"    Muon: {spec_eff_muon:.6f}")
+print(f"    Adam: {spec_eff_adam:.6f}")
+check(spec_eff_muon >= spec_eff_sgd - tol,
+      f"Muon spectral efficiency ({spec_eff_muon:.6f}) >= SGD ({spec_eff_sgd:.6f})")
+print()
+
+print("  Multi-step Frobenius efficiency (loss decrease per cumulative Frobenius cost):")
+print(f"    SGD:  {frob_eff_sgd:.6f}")
+print(f"    Muon: {frob_eff_muon:.6f}")
+check(frob_eff_sgd >= frob_eff_muon - tol,
+      f"SGD Frobenius efficiency ({frob_eff_sgd:.6f}) >= Muon ({frob_eff_muon:.6f})")
+print()
+
+# Per-step norms
+print(f"  Per-step spectral norms:")
+print(f"  {'Step':>6s}  {'||D_SGD||_op':>14s}  {'||D_Muon||_op':>14s}  {'||D_Adam||_op':>14s}")
+print(f"  {'-' * 6}  {'-' * 14}  {'-' * 14}  {'-' * 14}")
+for step in range(n_steps):
+    print(f"  {step:>6d}  {spec_norms_sgd[step]:>14.8f}  {spec_norms_muon[step]:>14.8f}  {spec_norms_adam[step]:>14.8f}")
+print()
+
+print("  Note: with exact line search, Muon's spectral norm per step VARIES")
+print("  (unlike fixed-LR Muon where ||eta * ortho(G)||_op = eta = const).")
+print("  The line-searched LR adapts to the curvature along each direction.")
+print("  However, the KEY property remains: Muon extracts the most loss")
+print("  decrease per unit spectral norm at every step, because ortho(G)")
+print("  is the steepest descent direction under the spectral norm.")
+print()
+
+
+# ===================================================================
+#  SECTION 7 -- Statistical validation across random problems
+# ===================================================================
+
+sep("SECTION 7: Statistical validation across 50 random problems")
+
+print("  Run the single-step comparison on 50 random (A, B, W) instances to")
+print("  confirm the geometry story is universal, not a fluke of one matrix.")
+print()
+
+n_random_problems = 50
+muon_spec_wins = 0
+sgd_frob_wins = 0
+adam_max_wins = 0
+
+for trial in range(n_random_problems):
+    A_r = rng.standard_normal((5, 5))
+    B_r = rng.standard_normal((5, 5))
+    W_r = rng.standard_normal((5, 5))
+    res_r = run_single_step_comparison(A_r, B_r, W_r)
+
+    if res_r["norms"]["muon"]["op"] <= res_r["norms"]["sgd"]["op"] + tol:
+        muon_spec_wins += 1
+    if res_r["norms"]["sgd"]["frob"] <= res_r["norms"]["muon"]["frob"] + tol:
+        sgd_frob_wins += 1
+    if (res_r["norms"]["adam"]["max"] <= res_r["norms"]["sgd"]["max"] + tol and
+        res_r["norms"]["adam"]["max"] <= res_r["norms"]["muon"]["max"] + tol):
+        adam_max_wins += 1
+
+print(f"  Muon has smallest ||D||_op: {muon_spec_wins}/{n_random_problems} cases")
+print(f"  SGD  has smallest ||D||_F:  {sgd_frob_wins}/{n_random_problems} cases")
+print(f"  Adam has smallest ||D||_max: {adam_max_wins}/{n_random_problems} cases")
+print()
+
+check(muon_spec_wins == n_random_problems,
+      f"Muon has smallest spectral norm in ALL {n_random_problems} random problems")
+check(sgd_frob_wins == n_random_problems,
+      f"SGD has smallest Frobenius norm in ALL {n_random_problems} random problems")
+check(adam_max_wins == n_random_problems,
+      f"Adam has smallest max-entry norm in ALL {n_random_problems} random problems")
+print()
+
+
+# ===================================================================
+#  FINAL VERDICT
+# ===================================================================
+
+sep("FINAL VERDICT")
+
+print(f"  Total checks:   {total_checks}")
+print(f"  Total failures: {total_failures}")
+print()
+
+if all_pass:
+    print("  ============================================")
+    print("  =            ALL TESTS PASSED              =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.6b VERIFIED:")
+    print()
+    print("  For the SAME first-order loss decrease tr(G^T Delta), each optimizer")
+    print("  minimizes the step cost under its own geometry:")
+    print()
+    print("  1. MUON (ortho(G)) minimizes the SPECTRAL NORM ||Delta||_op.")
+    print("     By Von Neumann's trace inequality, ortho(G) maximizes tr(G^T D)")
+    print("     per unit ||D||_op.  Equivalently, matching the decrease requires")
+    print("     the smallest possible ||D||_op.  Verified on square and rectangular")
+    print("     matrices, across all condition numbers, and over 50 random problems.")
+    print()
+    print("  2. SGD (G) minimizes the FROBENIUS NORM ||Delta||_F.")
+    print("     By Cauchy-Schwarz on vec(G)^T vec(D), G/||G||_F maximizes tr(G^T D)")
+    print("     per unit ||D||_F.  Verified universally.")
+    print()
+    print("  3. ADAM (G/(sqrt(G^2)+eps)) minimizes the ELEMENT-WISE MAX NORM ||Delta||_max.")
+    print("     The sign-like direction spreads the step budget evenly across entries,")
+    print("     avoiding any single large entry.  Verified universally.")
+    print()
+    print("  4. ANALYTICAL RATIO VERIFIED:")
+    print("     ||D_SGD||_op / ||D_Muon||_op = ||G||_* * sigma_1(G) / ||G||_F^2")
+    print("     exactly, to machine precision.  This is always >= 1 and captures")
+    print("     how much the spectral geometry outperforms Frobenius geometry.")
+    print()
+    print("  5. MULTI-STEP TRAJECTORIES (exact line search):")
+    print("     Over 10 steps with per-step optimal LR, Muon achieves the best")
+    print("     loss decrease per unit cumulative spectral norm.  SGD achieves the")
+    print("     best loss decrease per unit cumulative Frobenius norm.  The single-step")
+    print("     geometry advantage compounds over the trajectory.")
+    print()
+    print("  6. ACTUAL vs FIRST-ORDER LOSS DECREASE:")
+    print("     For the quadratic loss, the actual decrease includes a second-order")
+    print("     penalty ||A Delta||^2_F.  Which optimizer suffers least from this")
+    print("     penalty depends on the interaction of the step with the Hessian --")
+    print("     this is where 'matching the loss landscape' matters beyond geometry.")
+    print()
+    print("  CONCLUSION: The choice of optimizer is the choice of geometry.")
+    print("  SGD = Frobenius geometry (flat vector).")
+    print("  Muon = spectral geometry (matrix structure).")
+    print("  Adam = element-wise geometry (per-parameter).")
+    print("  Each is provably optimal under its own norm.  The question is:")
+    print("  which geometry matches the loss landscape?  For matrix-valued")
+    print("  parameters, the spectral norm is the natural choice because it")
+    print("  is invariant under orthogonal transformations and controls the")
+    print("  operator behavior of the weight matrix.")
+else:
+    print("  ============================================")
+    print("  =          SOME TESTS FAILED               =")
+    print("  ============================================")
+    print()
+    print(f"  Axiom 0.6b: {total_failures}/{total_checks} checks failed.")
+    print("  See details above for which geometry claims did not hold.")
+    print()
+    print("  Possible reasons:")
+    print("  - Numerical precision issues (tighten/loosen tolerance)")
+    print("  - Edge case where gradient is near-degenerate")
+    print("  - Bug in the matching procedure")
+
+print()

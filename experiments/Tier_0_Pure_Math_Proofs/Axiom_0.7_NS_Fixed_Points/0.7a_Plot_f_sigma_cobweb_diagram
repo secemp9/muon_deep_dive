@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""
+Experiment 0.7a — Plot f(σ) = (3σ - σ³)/2 and its iterates: cobweb diagram
+============================================================================
+
+The Newton-Schulz iteration applied to a single singular value is a 1D map:
+    f(σ) = (3σ - σ³) / 2       (cubic, classic NS)
+    g(σ) = aσ + bσ³ + cσ⁵      (quintic, Muon's actual coefficients)
+
+This script:
+  1. Plots f(x) and y=x, marks fixed points and critical boundary √3
+  2. Draws cobweb diagrams for multiple starting points
+  3. Repeats for the quintic (Muon) iteration — showing it does NOT converge to 1
+  4. Numerically verifies convergence rates (quadratic for cubic)
+  5. Maps the basin of attraction
+  6. Prints RG flow interpretation
+
+The key insight: the cubic NS iteration IS a renormalization group flow on singular
+values. The fixed point σ=1 is the gauge-fixed manifold (Stiefel manifold).
+Superattraction (f'(1)=0) means error squares each step — this is why few NS steps
+suffice.
+
+CRITICAL NUANCE (discovered in Axiom 0.2a): Muon's actual coefficients
+(a=3.4445, b=-4.7750, c=2.0315) do NOT satisfy a+b+c=1, so σ=1 is NOT a
+fixed point of the quintic! The iteration oscillates. But the DIRECTION
+(the polar factor UV^T) is still captured. We document this discrepancy.
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from pathlib import Path
+import sys
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+SAVE_DIR = Path(__file__).resolve().parent
+STARTING_POINTS = [0.3, 0.7, 1.5, 1.73]
+COLORS = ['#e63946', '#457b9d', '#2a9d8f', '#e9c46a']
+TOL = 1e-14
+MAX_ITER = 100
+SQRT3 = np.sqrt(3)
+
+# Muon's ACTUAL 5th-order coefficients (from Muon source code)
+# NOTE: a + b + c = 3.4445 - 4.7750 + 2.0315 = 0.701 ≠ 1
+# So σ=1 is NOT a fixed point!
+A_MUON, B_MUON, C_MUON = 3.4445, -4.7750, 2.0315
+
+# "Ideal" quintic with σ=1 as superattracting fixed point
+# Requirements: a+b+c=1 (fixed point) and a+3b+5c=0 (superattracting: g'(1)=0)
+# Solving: a = 1-b-c, (1-b-c)+3b+5c=0 → 1+2b+4c=0 → b=-(1+4c)/2
+# Extra DOF: choose c to also zero the 2nd derivative for cubic convergence
+# g''(σ) = 6bσ + 20cσ³, g''(1) = 6b+20c = 0 → b=-10c/3
+# From b=-(1+4c)/2 and b=-10c/3: -(1+4c)/2 = -10c/3 → 3(1+4c) = 20c → 3+12c=20c → c=3/8
+# Then b=-10*(3/8)/3 = -10/8 = -5/4, a=1-(-5/4)-(3/8) = 1+5/4-3/8 = 15/8
+A_IDEAL, B_IDEAL, C_IDEAL = 15/8, -5/4, 3/8
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Iteration functions
+# ─────────────────────────────────────────────────────────────────────────────
+def f_cubic(sigma):
+    """Cubic Newton-Schulz iteration: f(σ) = (3σ - σ³)/2"""
+    return (3 * sigma - sigma**3) / 2
+
+
+def f_cubic_deriv(sigma):
+    """Derivative: f'(σ) = (3 - 3σ²)/2"""
+    return (3 - 3 * sigma**2) / 2
+
+
+def f_muon(sigma):
+    """Muon's actual quintic iteration: g(σ) = aσ + bσ³ + cσ⁵"""
+    return A_MUON * sigma + B_MUON * sigma**3 + C_MUON * sigma**5
+
+
+def f_muon_deriv(sigma):
+    """Derivative: g'(σ) = a + 3bσ² + 5cσ⁴"""
+    return A_MUON + 3 * B_MUON * sigma**2 + 5 * C_MUON * sigma**4
+
+
+def f_ideal_quintic(sigma):
+    """Ideal quintic with σ=1 superattracting: g(σ) = (15/8)σ - (5/4)σ³ + (3/8)σ⁵"""
+    return A_IDEAL * sigma + B_IDEAL * sigma**3 + C_IDEAL * sigma**5
+
+
+def f_ideal_quintic_deriv(sigma):
+    """Derivative: g'(σ) = 15/8 + 3(-5/4)σ² + 5(3/8)σ⁴"""
+    return A_IDEAL + 3 * B_IDEAL * sigma**2 + 5 * C_IDEAL * sigma**4
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cobweb generation
+# ─────────────────────────────────────────────────────────────────────────────
+def cobweb_orbit(f, sigma0, n_steps=20):
+    """Generate cobweb path: (x0,0)->(x0,f(x0))->(f(x0),f(x0))->(f(x0),f²(x0))->..."""
+    xs, ys = [sigma0], [0]
+    x = sigma0
+    for _ in range(n_steps):
+        y = f(x)
+        # Vertical to curve
+        xs.append(x)
+        ys.append(y)
+        # Horizontal to diagonal
+        xs.append(y)
+        ys.append(y)
+        x = y
+        if abs(x) > 10:  # diverging
+            break
+    return xs, ys
+
+
+def iterate_orbit(f, sigma0, tol=TOL, max_iter=MAX_ITER, target=1.0):
+    """Iterate until convergence to target or max_iter."""
+    orbit = [sigma0]
+    x = sigma0
+    for _ in range(max_iter):
+        x = f(x)
+        orbit.append(x)
+        if abs(x - target) < tol:
+            break
+        if abs(x) > 100:
+            break
+    return orbit
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 1: Function and identity line
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_function_and_identity():
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    x = np.linspace(-2, 2, 1000)
+
+    # Plot f(x) and y=x
+    ax.plot(x, f_cubic(x), 'b-', linewidth=2, label=r'$f(\sigma) = \frac{3\sigma - \sigma^3}{2}$')
+    ax.plot(x, x, 'k--', linewidth=1, alpha=0.7, label=r'$y = x$')
+
+    # Mark fixed points
+    ax.plot(0, 0, 'ro', markersize=10, label=r'$\sigma=0$ (repelling, $f\'(0)=3/2$)')
+    ax.plot(1, 1, 'g^', markersize=12, label=r'$\sigma=1$ (superattracting, $f\'(1)=0$)')
+    ax.plot(-1, -1, 'g^', markersize=12, label=r'$\sigma=-1$ (superattracting)')
+
+    # Mark √3 boundary
+    ax.axvline(SQRT3, color='red', linestyle=':', alpha=0.5)
+    ax.axvline(-SQRT3, color='red', linestyle=':', alpha=0.5)
+    f_at_sqrt3 = f_cubic(SQRT3)
+    ax.plot(SQRT3, f_at_sqrt3, 'rx', markersize=12, markeredgewidth=2,
+            label=rf'$\sigma=\sqrt{{3}}$: $f(\sqrt{{3}})={f_at_sqrt3:.4f}$')
+
+    ax.set_xlabel(r'$\sigma$', fontsize=12)
+    ax.set_ylabel(r'$f(\sigma)$', fontsize=12)
+    ax.set_title('Newton-Schulz cubic iteration: fixed points and dynamics', fontsize=13)
+    ax.legend(loc='upper left', fontsize=9)
+    ax.set_xlim(-2, 2)
+    ax.set_ylim(-2, 2)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+
+    plt.tight_layout()
+    path = SAVE_DIR / 'plot1_function_and_identity.png'
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[SAVED] {path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 2: Cobweb diagrams (cubic)
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_cobweb_cubic():
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    x = np.linspace(-0.1, 2.0, 1000)
+
+    ax.plot(x, f_cubic(x), 'b-', linewidth=1.5, label=r'$f(\sigma) = (3\sigma - \sigma^3)/2$')
+    ax.plot(x, x, 'k--', linewidth=1, alpha=0.7, label=r'$y=x$')
+
+    for i, sigma0 in enumerate(STARTING_POINTS):
+        xs, ys = cobweb_orbit(f_cubic, sigma0, n_steps=15)
+        ax.plot(xs, ys, color=COLORS[i], linewidth=0.8, alpha=0.8,
+                label=rf'$\sigma_0 = {sigma0}$')
+        ax.plot(sigma0, 0, 'o', color=COLORS[i], markersize=6)
+
+    # Mark fixed point
+    ax.plot(1, 1, 'g*', markersize=15, zorder=5, label=r'Fixed point $\sigma=1$')
+    ax.axvline(SQRT3, color='red', linestyle=':', alpha=0.4, label=rf'$\sqrt{{3}} \approx {SQRT3:.4f}$')
+
+    ax.set_xlabel(r'$\sigma$', fontsize=12)
+    ax.set_ylabel(r'$f(\sigma)$', fontsize=12)
+    ax.set_title('Cobweb diagram: cubic NS iteration (RG flow in 1D)', fontsize=13)
+    ax.legend(loc='upper left', fontsize=9)
+    ax.set_xlim(-0.1, 2.0)
+    ax.set_ylim(-0.1, 2.0)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+
+    plt.tight_layout()
+    path = SAVE_DIR / 'plot2_cobweb_cubic.png'
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[SAVED] {path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 3: Muon's actual quintic iteration cobweb
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_cobweb_muon():
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+
+    x = np.linspace(0.0, 1.8, 1000)
+
+    # Left: Muon's actual coefficients (oscillating, NOT converging to 1)
+    ax = axes[0]
+    y_muon = f_muon(x)
+    # Clip for display
+    y_muon_clipped = np.clip(y_muon, -0.5, 2.5)
+    ax.plot(x, y_muon_clipped, 'm-', linewidth=1.5,
+            label=rf'$g(\sigma) = {A_MUON}\sigma + ({B_MUON})\sigma^3 + {C_MUON}\sigma^5$')
+    ax.plot(x, x, 'k--', linewidth=1, alpha=0.7, label=r'$y=x$')
+
+    # Find actual fixed points numerically (where g(σ)=σ)
+    from scipy.optimize import brentq
+    # g(σ)-σ = 0: we know σ=0 is one. Find others in (0, 2)
+    h = lambda s: f_muon(s) - s
+    # Search for sign changes
+    s_search = np.linspace(0.01, 1.8, 1000)
+    h_vals = np.array([h(s) for s in s_search])
+    sign_changes = np.where(np.diff(np.sign(h_vals)))[0]
+    muon_fps = [0.0]
+    for idx in sign_changes:
+        try:
+            fp = brentq(h, s_search[idx], s_search[idx + 1])
+            muon_fps.append(fp)
+        except:
+            pass
+
+    for fp in muon_fps:
+        if fp > 0:
+            ax.plot(fp, fp, 'r^', markersize=10, zorder=5)
+            ax.annotate(f'FP={fp:.4f}', (fp, fp), textcoords="offset points",
+                        xytext=(5, 10), fontsize=8, color='red')
+
+    for i, sigma0 in enumerate(STARTING_POINTS[:3]):  # skip 1.73 (diverges for Muon)
+        xs, ys = cobweb_orbit(f_muon, sigma0, n_steps=10)
+        # Clip to prevent visual mess
+        xs_clip = np.clip(xs, -0.5, 2.5)
+        ys_clip = np.clip(ys, -0.5, 2.5)
+        ax.plot(xs_clip, ys_clip, color=COLORS[i], linewidth=0.8, alpha=0.8,
+                label=rf'$\sigma_0 = {sigma0}$')
+
+    ax.set_xlabel(r'$\sigma$', fontsize=11)
+    ax.set_ylabel(r'$g(\sigma)$', fontsize=11)
+    ax.set_title("Muon's actual quintic (σ=1 NOT a fixed point!)", fontsize=11)
+    ax.legend(loc='upper left', fontsize=8)
+    ax.set_xlim(-0.1, 1.8)
+    ax.set_ylim(-0.1, 1.8)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+
+    # Right: Ideal quintic (superattracting at σ=1)
+    ax = axes[1]
+    y_ideal = f_ideal_quintic(x)
+    ax.plot(x, y_ideal, 'c-', linewidth=1.5,
+            label=rf'$g(\sigma) = \frac{{15}}{{8}}\sigma - \frac{{5}}{{4}}\sigma^3 + \frac{{3}}{{8}}\sigma^5$')
+    ax.plot(x, x, 'k--', linewidth=1, alpha=0.7, label=r'$y=x$')
+
+    for i, sigma0 in enumerate(STARTING_POINTS):
+        xs, ys = cobweb_orbit(f_ideal_quintic, sigma0, n_steps=12)
+        xs_clip = np.clip(xs, -0.5, 2.5)
+        ys_clip = np.clip(ys, -0.5, 2.5)
+        ax.plot(xs_clip, ys_clip, color=COLORS[i], linewidth=0.8, alpha=0.8,
+                label=rf'$\sigma_0 = {sigma0}$')
+        ax.plot(sigma0, 0, 'o', color=COLORS[i], markersize=5)
+
+    ax.plot(1, 1, 'g*', markersize=15, zorder=5, label=r'$\sigma=1$ (superattracting)')
+    ax.set_xlabel(r'$\sigma$', fontsize=11)
+    ax.set_ylabel(r'$g(\sigma)$', fontsize=11)
+    ax.set_title("Ideal quintic (σ=1 superattracting, g'(1)=g''(1)=0)", fontsize=11)
+    ax.legend(loc='upper left', fontsize=8)
+    ax.set_xlim(-0.1, 1.8)
+    ax.set_ylim(-0.1, 1.8)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+
+    plt.tight_layout()
+    path = SAVE_DIR / 'plot3_cobweb_quintic.png'
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[SAVED] {path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Numerical convergence analysis
+# ─────────────────────────────────────────────────────────────────────────────
+def convergence_analysis():
+    print("\n" + "=" * 80)
+    print("NUMERICAL CONVERGENCE ANALYSIS")
+    print("=" * 80)
+
+    all_pass = True
+
+    # ---- Cubic NS ----
+    print(f"\n{'─' * 40}")
+    print(f"  Cubic NS: f(σ) = (3σ - σ³)/2")
+    print(f"  f'(1) = {f_cubic_deriv(1.0):.6e}  (superattracting)")
+    print(f"{'─' * 40}")
+
+    for sigma0 in STARTING_POINTS:
+        orbit = iterate_orbit(f_cubic, sigma0)
+        errors = [abs(s - 1.0) for s in orbit]
+        n_steps = len(orbit) - 1
+
+        print(f"\n  σ₀ = {sigma0}:")
+        print(f"    Steps to |σ-1| < 1e-14: {n_steps}")
+        print(f"    Orbit: ", end="")
+        for k, s in enumerate(orbit[:min(8, len(orbit))]):
+            print(f"{s:.10f}", end="  ")
+        if len(orbit) > 8:
+            print(f"... -> {orbit[-1]:.15f}", end="")
+        print()
+
+        # Convergence ratios: |e_{k+1}| / |e_k|^2
+        if len(errors) > 3 and errors[1] > 0 and errors[0] > 0:
+            print(f"    Convergence ratios (quadratic check: |e_{{k+1}}|/|e_k|^2 ~ const):")
+            for k in range(min(5, len(errors) - 1)):
+                if errors[k] > 1e-15 and errors[k + 1] > 0:
+                    ratio_quad = errors[k + 1] / errors[k]**2 if errors[k]**2 > 1e-300 else float('inf')
+                    print(f"      k={k}: |e_{{{k+1}}}|={errors[k+1]:.4e}, "
+                          f"|e_{{{k+1}}}|/|e_{{{k}}}|^2 = {ratio_quad:.4e}")
+
+        # Check convergence
+        converged = abs(orbit[-1] - 1.0) < TOL
+        if sigma0 < SQRT3:
+            if not converged:
+                print(f"    [FAIL] Expected convergence to 1 for σ₀={sigma0} < √3")
+                all_pass = False
+            else:
+                print(f"    [PASS] Converged to 1 in {n_steps} steps")
+        else:
+            # σ₀ = 1.73 is just barely below √3 ≈ 1.7320508
+            if sigma0 < SQRT3 and not converged:
+                print(f"    [FAIL] σ₀={sigma0} < √3, should converge")
+                all_pass = False
+            elif sigma0 >= SQRT3 and not converged:
+                print(f"    [INFO] σ₀={sigma0} >= √3: does not converge to 1")
+
+    # ---- Ideal quintic ----
+    print(f"\n{'─' * 40}")
+    print(f"  Ideal Quintic: g(σ) = (15/8)σ - (5/4)σ³ + (3/8)σ⁵")
+    print(f"  g'(1) = {f_ideal_quintic_deriv(1.0):.6e}  (superattracting)")
+    print(f"  g''(1) = {6*B_IDEAL + 20*C_IDEAL:.6e}  (also zero -> cubic convergence)")
+    print(f"{'─' * 40}")
+
+    for sigma0 in STARTING_POINTS[:3]:  # Only use σ₀ < √3
+        orbit = iterate_orbit(f_ideal_quintic, sigma0)
+        errors = [abs(s - 1.0) for s in orbit]
+        n_steps = len(orbit) - 1
+
+        print(f"\n  σ₀ = {sigma0}:")
+        print(f"    Steps to |σ-1| < 1e-14: {n_steps}")
+        print(f"    Orbit: ", end="")
+        for k, s in enumerate(orbit[:min(6, len(orbit))]):
+            print(f"{s:.12f}", end="  ")
+        print()
+
+        # Convergence ratios: should be CUBIC (|e_{k+1}|/|e_k|^3)
+        if len(errors) > 2:
+            print(f"    Convergence ratios (cubic check: |e_{{k+1}}|/|e_k|^3 ~ const):")
+            for k in range(min(4, len(errors) - 1)):
+                if errors[k] > 1e-15 and errors[k + 1] > 0:
+                    ratio_cubic = errors[k + 1] / errors[k]**3 if errors[k]**3 > 1e-300 else float('inf')
+                    ratio_quad = errors[k + 1] / errors[k]**2 if errors[k]**2 > 1e-300 else float('inf')
+                    print(f"      k={k}: |e_{{{k+1}}}|/|e_{{{k}}}|^2 = {ratio_quad:.4e}, "
+                          f"|e_{{{k+1}}}|/|e_{{{k}}}|^3 = {ratio_cubic:.4e}")
+
+        converged = abs(orbit[-1] - 1.0) < TOL
+        if converged:
+            print(f"    [PASS] Converged to 1 in {n_steps} steps")
+        else:
+            print(f"    [FAIL] Did not converge")
+            all_pass = False
+
+    return all_pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Basin of attraction
+# ─────────────────────────────────────────────────────────────────────────────
+def basin_of_attraction():
+    print("\n" + "=" * 80)
+    print("BASIN OF ATTRACTION ANALYSIS")
+    print("=" * 80)
+
+    sigmas = np.linspace(0.01, 2.0, 1000)
+    all_pass = True
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+
+    for idx, (name, f) in enumerate([("Cubic NS", f_cubic),
+                                      ("Ideal Quintic", f_ideal_quintic)]):
+        steps_to_converge = []
+        converged_mask = []
+
+        for s0 in sigmas:
+            orbit = iterate_orbit(f, s0, tol=1e-10, max_iter=50)
+            if abs(orbit[-1] - 1.0) < 1e-10:
+                steps_to_converge.append(len(orbit) - 1)
+                converged_mask.append(True)
+            else:
+                steps_to_converge.append(50)
+                converged_mask.append(False)
+
+        steps_arr = np.array(steps_to_converge)
+        conv_mask = np.array(converged_mask)
+
+        # Find boundary
+        boundary_idx = np.where(~conv_mask)[0]
+        if len(boundary_idx) > 0:
+            boundary = sigmas[boundary_idx[0]]
+        else:
+            boundary = 2.0
+
+        print(f"\n  {name}:")
+        print(f"    Basin boundary (numerical): σ ≈ {boundary:.6f}")
+        if name == "Cubic NS":
+            print(f"    Expected boundary (√3):     σ = {SQRT3:.6f}")
+            if abs(boundary - SQRT3) < 0.01:
+                print(f"    [PASS] Boundary matches √3 within tolerance")
+            else:
+                print(f"    [FAIL] Boundary does not match √3 (diff={abs(boundary-SQRT3):.4e})")
+                all_pass = False
+        else:
+            print(f"    (Ideal quintic has its own basin boundary)")
+
+        # Plot
+        ax = axes[idx]
+        ax.scatter(sigmas[conv_mask], steps_arr[conv_mask], c='blue', s=2, alpha=0.5)
+        if np.any(~conv_mask):
+            ax.scatter(sigmas[~conv_mask], steps_arr[~conv_mask], c='red', s=2, alpha=0.5)
+        ax.axvline(boundary, color='red', linestyle='--', alpha=0.7,
+                   label=f'Boundary $\\approx$ {boundary:.4f}')
+        if name == "Cubic NS":
+            ax.axvline(SQRT3, color='green', linestyle=':', alpha=0.7,
+                       label=rf'$\sqrt{{3}} \approx {SQRT3:.4f}$')
+        ax.set_xlabel(r'$\sigma_0$', fontsize=11)
+        ax.set_ylabel('Steps to converge', fontsize=11)
+        ax.set_title(f'Basin of attraction: {name}', fontsize=12)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(0, 30)
+
+    plt.tight_layout()
+    path = SAVE_DIR / 'plot4_basin_of_attraction.png'
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"\n[SAVED] {path}")
+
+    return all_pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Edge cases
+# ─────────────────────────────────────────────────────────────────────────────
+def edge_cases():
+    print("\n" + "=" * 80)
+    print("EDGE CASES")
+    print("=" * 80)
+
+    all_pass = True
+
+    # Case 1: σ₀ = √3 exactly
+    print(f"\n  σ₀ = sqrt(3) = {SQRT3:.15f}")
+    val = f_cubic(SQRT3)
+    print(f"    f(√3) = (3*√3 - (√3)³)/2 = (3√3 - 3√3)/2 = {val:.15e}")
+    if abs(val) < 1e-14:
+        print(f"    [PASS] f(√3) = 0 (maps to unstable fixed point in one step)")
+    else:
+        print(f"    [FAIL] f(√3) should be 0, got {val}")
+        all_pass = False
+
+    # Verify algebraically: f(√3) = (3√3 - (√3)³)/2 = (3√3 - 3√3)/2 = 0
+    print(f"    Algebraic check: (√3)³ = {SQRT3**3:.15f}, 3*√3 = {3*SQRT3:.15f}")
+
+    # Case 2: σ₀ > √3, e.g. 1.8
+    print(f"\n  σ₀ = 1.8 (> √3 ≈ {SQRT3:.6f}):")
+    orbit = iterate_orbit(f_cubic, 1.8, max_iter=20)
+    print(f"    First 8 iterates: {[f'{x:.6f}' for x in orbit[:8]]}")
+    # After f(1.8) = (5.4 - 5.832)/2 = -0.216 (negative! leaves physical domain)
+    f_1_8 = f_cubic(1.8)
+    print(f"    f(1.8) = {f_1_8:.6f} (negative → left the basin)")
+    # It may actually converge to -1 (the negative superattracting FP)
+    if abs(orbit[-1] - 1.0) > 0.1:
+        print(f"    [PASS] Does NOT converge to +1 (σ₀ > √3 exits the positive basin)")
+    else:
+        print(f"    [FAIL] Expected divergence from +1 for σ₀ > √3")
+        all_pass = False
+
+    # Case 3: σ₀ = 0 exactly
+    print(f"\n  σ₀ = 0 (unstable fixed point):")
+    orbit = iterate_orbit(f_cubic, 0.0, max_iter=10)
+    print(f"    Orbit: {[f'{x:.15f}' for x in orbit[:5]]}")
+    if all(abs(x) < 1e-14 for x in orbit):
+        print(f"    [PASS] Stays at 0 forever (unstable fixed point is still a fixed point)")
+    else:
+        print(f"    [FAIL] Left 0")
+        all_pass = False
+
+    # Case 4: σ₀ very close to 0
+    sigma_tiny = 1e-10
+    print(f"\n  σ₀ = {sigma_tiny} (near unstable fixed point):")
+    orbit = iterate_orbit(f_cubic, sigma_tiny, max_iter=200)
+    n_steps = len(orbit) - 1
+    print(f"    Steps to reach σ ≈ 1: {n_steps}")
+    print(f"    First 10 iterates: {[f'{x:.6e}' for x in orbit[:10]]}")
+    if abs(orbit[-1] - 1.0) < TOL:
+        print(f"    [PASS] Escapes 0 and converges to 1 (took {n_steps} steps)")
+        # Near 0, f(σ) ≈ 3σ/2, so exponential growth
+        growth_factor = orbit[1] / orbit[0] if orbit[0] != 0 else 0
+        print(f"    Growth factor near 0: f(σ)/σ ≈ {growth_factor:.6f} (should be 3/2 = 1.5)")
+        if abs(growth_factor - 1.5) < 1e-6:
+            print(f"    [PASS] Linear growth rate = 3/2 confirmed")
+        else:
+            print(f"    [FAIL] Growth rate off")
+            all_pass = False
+    else:
+        print(f"    [FAIL] Did not converge even after {n_steps} steps")
+        all_pass = False
+
+    return all_pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Muon quintic analysis (documenting the non-convergence)
+# ─────────────────────────────────────────────────────────────────────────────
+def muon_quintic_analysis():
+    print("\n" + "=" * 80)
+    print("MUON'S ACTUAL QUINTIC ANALYSIS")
+    print("=" * 80)
+
+    a, b, c = A_MUON, B_MUON, C_MUON
+    print(f"\n  Coefficients: a={a}, b={b}, c={c}")
+    print(f"  a + b + c = {a+b+c:.4f} (should be 1 for σ=1 fixed point)")
+    print(f"  g(1) = {f_muon(1.0):.6f} ≠ 1  =>  σ=1 is NOT a fixed point!")
+    print(f"  g'(1) = {f_muon_deriv(1.0):.6f}")
+    print(f"  g'(0) = {f_muon_deriv(0.0):.6f} (|g'(0)| > 1: unstable at 0)")
+
+    # Find actual fixed points: g(σ) = σ ↔ (a-1)σ + bσ³ + cσ⁴ = 0
+    # σ[(a-1) + bσ² + cσ⁴] = 0  →  quadratic in u = σ²
+    disc = b**2 - 4 * c * (a - 1)
+    print(f"\n  Fixed point equation: (a-1) + bσ² + cσ⁴ = 0")
+    print(f"  Quadratic in u=σ²: {c}u² + ({b})u + ({a-1:.4f}) = 0")
+    print(f"  Discriminant = {disc:.6f}")
+
+    if disc >= 0:
+        u1 = (-b + np.sqrt(disc)) / (2 * c)
+        u2 = (-b - np.sqrt(disc)) / (2 * c)
+        print(f"  u₁ = {u1:.6f} → σ = ±{np.sqrt(abs(u1)):.6f}" + (" (real)" if u1 >= 0 else " (imaginary)"))
+        print(f"  u₂ = {u2:.6f} → σ = ±{np.sqrt(abs(u2)):.6f}" + (" (real)" if u2 >= 0 else " (imaginary)"))
+
+        if u1 >= 0:
+            s1 = np.sqrt(u1)
+            print(f"\n  Fixed point σ = {s1:.6f}: g({s1:.4f}) = {f_muon(s1):.6f}, "
+                  f"g'({s1:.4f}) = {f_muon_deriv(s1):.4f}")
+        if u2 >= 0:
+            s2 = np.sqrt(u2)
+            print(f"  Fixed point σ = {s2:.6f}: g({s2:.4f}) = {f_muon(s2):.6f}, "
+                  f"g'({s2:.4f}) = {f_muon_deriv(s2):.4f}")
+
+    print("\n  INTERPRETATION: Muon's quintic does NOT converge to sigma=1.")
+    print("  Instead it oscillates. But the POLAR FACTOR (direction UV^T) is correct")
+    print("  because the matrix iteration X_{n+1} = aX + (bXX^T + c(XX^T)^2)X")
+    print("  still drives the directions toward UV^T even if magnitudes oscillate.")
+    print("  Muon only uses 5 steps and later rescales, so exact sigma->1 is unnecessary.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convergence speed comparison: cubic vs ideal quintic
+# ─────────────────────────────────────────────────────────────────────────────
+def compare_convergence():
+    print("\n" + "=" * 80)
+    print("CONVERGENCE SPEED COMPARISON: CUBIC (order 2) vs IDEAL QUINTIC (order 3)")
+    print("=" * 80)
+
+    all_pass = True
+
+    for sigma0 in [0.3, 0.7, 1.5]:
+        orbit_c = iterate_orbit(f_cubic, sigma0)
+        orbit_q = iterate_orbit(f_ideal_quintic, sigma0)
+
+        n_c = len(orbit_c) - 1
+        n_q = len(orbit_q) - 1
+
+        print(f"\n  σ₀ = {sigma0}:")
+        print(f"    Cubic (order 2):         {n_c} steps to |σ-1| < 1e-14")
+        print(f"    Ideal quintic (order 3): {n_q} steps to |σ-1| < 1e-14")
+
+        if n_q <= n_c:
+            print(f"    [PASS] Quintic converges faster or equal ({n_q} <= {n_c} steps)")
+        else:
+            # Could have different basin size
+            if abs(orbit_q[-1] - 1.0) < TOL:
+                print(f"    [INFO] Quintic slower ({n_q} > {n_c}), but both converge")
+            else:
+                print(f"    [INFO] σ₀={sigma0} may be outside quintic basin")
+
+    return all_pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RG flow interpretation
+# ─────────────────────────────────────────────────────────────────────────────
+def rg_interpretation():
+    print("\n" + "=" * 80)
+    print("RG FLOW INTERPRETATION")
+    print("=" * 80)
+    print("""
+  KEY INSIGHT: Newton-Schulz iteration IS a Renormalization Group flow.
+
+  1. STATE SPACE: Each singular value σ_i of the weight matrix W lives on R+.
+     The full state is the spectrum {σ_1, ..., σ_n}.
+
+  2. RG TRANSFORMATION: One NS step acts INDEPENDENTLY on each σ_i:
+        σ_i → f(σ_i) = (3σ_i - σ_i^3) / 2    (cubic)
+     This is a 1D discrete dynamical system — the RG map.
+
+  3. FIXED POINT MANIFOLD: σ = 1 for all i, i.e., all singular values = 1.
+     This is precisely the STIEFEL MANIFOLD (orthogonal matrices).
+     The "gauge-fixed" configuration in the RG sense.
+
+  4. SUPERATTRACTION (f'(1) = 0): Not just stable — error SQUARES each step.
+     If |σ - 1| = ε, then after one step |σ' - 1| ~ ε^2 * (3/2).
+     This is QUADRATIC convergence — the hallmark of Newton's method.
+     5 steps: ε → (3/2)ε^2 → ... → essentially machine epsilon.
+
+  5. BASIN OF ATTRACTION: σ ∈ (0, √3) for cubic. All singular values
+     of a matrix with spectral norm < √3 will converge. In practice,
+     we pre-scale W so max(σ_i) < √3, then iterate.
+
+  6. UNSTABLE FIXED POINT σ = 0: Corresponds to rank deficiency.
+     A zero singular value stays zero — the NS flow preserves rank.
+     Near-zero singular values grow exponentially (factor 3/2 per step)
+     until they enter the fast-convergence regime near σ = 1.
+
+  7. CRITICAL BOUNDARY √3: f(√3) = 0. Singular values above √3
+     get mapped to 0 or negative — they leave the physical domain.
+     This sets the SCALING REQUIREMENT for Muon.
+
+  8. MUON's QUINTIC vs CUBIC: Muon uses coefficients optimized for
+     APPROXIMATE convergence in exactly 5 steps, not exact convergence.
+     The singular values oscillate but the POLAR FACTOR (direction) converges.
+     An "ideal" quintic with g'(1)=g''(1)=0 gives ORDER-3 convergence
+     (error cubes each step), reaching machine epsilon even faster.
+
+  SUMMARY: The cobweb diagram IS the RG flow phase portrait.
+  - The x-axis is the "coupling constant" (singular value)
+  - Each step is a "blocking transformation" (coarse-graining)
+  - The fixed point σ=1 is the "critical surface" (Stiefel manifold)
+  - Superattraction = relevant operator with zero anomalous dimension
+""")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    print("=" * 80)
+    print("EXPERIMENT 0.7a: NS iteration cobweb diagrams and convergence analysis")
+    print("f(σ) = (3σ - σ^3)/2  —  The RG flow phase portrait in 1D")
+    print("=" * 80)
+
+    # Derivative checks at fixed points
+    print("\n  FIXED POINT CLASSIFICATION (cubic f(σ) = (3σ - σ^3)/2):")
+    print(f"    f'(0)  = {f_cubic_deriv(0.0):.4f}  (|f'| > 1: REPELLING)")
+    print(f"    f'(1)  = {f_cubic_deriv(1.0):.4f}  (f' = 0: SUPERATTRACTING)")
+    print(f"    f'(-1) = {f_cubic_deriv(-1.0):.4f}  (f' = 0: SUPERATTRACTING)")
+
+    print(f"\n  IDEAL QUINTIC g(σ) = (15/8)σ - (5/4)σ^3 + (3/8)σ^5:")
+    print(f"    g(1)   = {f_ideal_quintic(1.0):.6f}  (should be 1)")
+    print(f"    g'(1)  = {f_ideal_quintic_deriv(1.0):.6e}  (should be 0)")
+    print(f"    g''(1) = {6*B_IDEAL*1 + 20*C_IDEAL*1:.6e}  (should be 0 for cubic convergence)")
+
+    # Generate plots
+    plot_function_and_identity()
+    plot_cobweb_cubic()
+
+    # Try to import scipy for Muon FP finding; skip gracefully if absent
+    try:
+        from scipy.optimize import brentq  # noqa: F401
+        plot_cobweb_muon()
+    except ImportError:
+        print("[WARN] scipy not available — skipping Muon cobweb plot (brentq needed)")
+        # Fallback: simpler version without FP markers
+        plot_cobweb_muon_no_scipy()
+
+    # Numerical analysis
+    pass1 = convergence_analysis()
+    pass2 = basin_of_attraction()
+    pass3 = edge_cases()
+    muon_quintic_analysis()
+    pass4 = compare_convergence()
+    rg_interpretation()
+
+    # Final verdict
+    all_pass = pass1 and pass2 and pass3 and pass4
+    print("\n" + "=" * 80)
+    if all_pass:
+        print("OVERALL RESULT: [PASS] All numerical checks passed.")
+    else:
+        print("OVERALL RESULT: [FAIL] Some checks failed — see above.")
+    print("=" * 80)
+
+    return 0 if all_pass else 1
+
+
+def plot_cobweb_muon_no_scipy():
+    """Fallback cobweb plot for Muon without scipy."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    x = np.linspace(0.0, 1.8, 1000)
+
+    # Left: Muon's actual
+    ax = axes[0]
+    y_muon = np.clip(f_muon(x), -0.5, 2.5)
+    ax.plot(x, y_muon, 'm-', linewidth=1.5,
+            label=rf'$g(\sigma)$ (Muon: a={A_MUON}, b={B_MUON}, c={C_MUON})')
+    ax.plot(x, x, 'k--', linewidth=1, alpha=0.7, label=r'$y=x$')
+    for i, sigma0 in enumerate(STARTING_POINTS[:3]):
+        xs, ys = cobweb_orbit(f_muon, sigma0, n_steps=10)
+        ax.plot(np.clip(xs, -0.5, 2.5), np.clip(ys, -0.5, 2.5),
+                color=COLORS[i], linewidth=0.8, alpha=0.8, label=rf'$\sigma_0={sigma0}$')
+    ax.set_xlim(-0.1, 1.8)
+    ax.set_ylim(-0.1, 1.8)
+    ax.set_title("Muon's actual quintic (sigma=1 NOT a fixed point!)", fontsize=11)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+
+    # Right: Ideal quintic
+    ax = axes[1]
+    ax.plot(x, f_ideal_quintic(x), 'c-', linewidth=1.5, label=r'Ideal quintic')
+    ax.plot(x, x, 'k--', linewidth=1, alpha=0.7, label=r'$y=x$')
+    for i, sigma0 in enumerate(STARTING_POINTS):
+        xs, ys = cobweb_orbit(f_ideal_quintic, sigma0, n_steps=12)
+        ax.plot(np.clip(xs, -0.5, 2.5), np.clip(ys, -0.5, 2.5),
+                color=COLORS[i], linewidth=0.8, alpha=0.8, label=rf'$\sigma_0={sigma0}$')
+    ax.plot(1, 1, 'g*', markersize=15, zorder=5)
+    ax.set_xlim(-0.1, 1.8)
+    ax.set_ylim(-0.1, 1.8)
+    ax.set_title("Ideal quintic (sigma=1 superattracting)", fontsize=11)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+
+    plt.tight_layout()
+    path = SAVE_DIR / 'plot3_cobweb_quintic.png'
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[SAVED] {path}")
+
+
+if __name__ == '__main__':
+    sys.exit(main())

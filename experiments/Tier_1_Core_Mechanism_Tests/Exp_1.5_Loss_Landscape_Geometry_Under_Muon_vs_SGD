@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""
+Experiment 1.5 -- Loss Landscape Geometry Under Muon vs SGD
+
+Quadratic loss f(W) = ||AW - B||^2_F with 10x10 random A, B.
+From a random W0, take 50 steps with SGD, Adam, and Muon.
+
+At each point we compute:
+  - Loss value
+  - Gradient norm ||nabla f||_F
+  - Hessian spectral radius (for quadratic: 2 * sigma_max(A)^2)
+  - Condition number of effective Hessian seen by each optimizer
+  - Sharpness (max eigenvalue of Hessian along trajectory)
+  - Trace of Hessian projected onto update direction
+
+Key predictions:
+  - SGD follows high-curvature directions (gradient proportional to curvature)
+  - Muon equalizes across directions (ortho removes magnitude information)
+  - Muon should have smoother loss decrease (less oscillation)
+    because it does not over-step in high-curvature directions
+
+Output: saves plot to Exp_1.5_loss_landscape_geometry.png
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+def sep(title: str) -> None:
+    print(f"\n{'=' * 76}")
+    print(f"  {title}")
+    print(f"{'=' * 76}\n")
+
+
+def subsep(title: str) -> None:
+    print(f"\n  {'-' * 70}")
+    print(f"    {title}")
+    print(f"  {'-' * 70}\n")
+
+
+def ortho(M: np.ndarray) -> np.ndarray:
+    """Polar factor Q = U V^T via thin SVD."""
+    U, _s, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def pf(ok: bool) -> str:
+    return "PASS" if ok else "FAIL"
+
+
+# Global tracking
+all_pass = True
+total_checks = 0
+total_failures = 0
+
+
+def check(condition: bool, label: str) -> bool:
+    global all_pass, total_checks, total_failures
+    total_checks += 1
+    if not condition:
+        all_pass = False
+        total_failures += 1
+    print(f"    [{pf(condition)}]  {label}")
+    return condition
+
+
+rng = np.random.default_rng(1337)
+
+# ---------------------------------------------------------------------------
+#  Problem setup: quadratic loss f(W) = ||AW - B||^2_F
+# ---------------------------------------------------------------------------
+
+sep("SETUP: Quadratic loss landscape f(W) = ||AW - B||^2_F")
+
+n = 10
+A = rng.standard_normal((n, n))
+B = rng.standard_normal((n, n))
+W0 = rng.standard_normal((n, n))
+
+# Hessian structure for this quadratic:
+#   The loss can be written as f(vec(W)) = vec(W)^T H vec(W) + linear + const
+#   where H = I_n kron (A^T A).
+#   Eigenvalues of H are the singular values of A^T A = sigma_i(A)^2, each with multiplicity n.
+#   The gradient is G = 2 A^T (AW - B).
+#   Hessian spectral radius = 2 * sigma_max(A)^2
+
+sv_A = np.linalg.svd(A, compute_uv=False)
+hessian_spectral_radius = 2.0 * sv_A[0] ** 2
+hessian_min_eigenvalue = 2.0 * sv_A[-1] ** 2
+hessian_condition_number = (sv_A[0] / sv_A[-1]) ** 2
+
+print(f"  Matrix A: {n}x{n}")
+print(f"  Singular values of A (top 5): {sv_A[:5]}")
+print(f"  Hessian spectral radius (2*sigma_max^2): {hessian_spectral_radius:.6f}")
+print(f"  Hessian min eigenvalue (2*sigma_min^2):  {hessian_min_eigenvalue:.6f}")
+print(f"  Hessian condition number (kappa^2):      {hessian_condition_number:.6f}")
+print()
+
+
+def loss_fn(W):
+    R = A @ W - B
+    return np.sum(R ** 2)
+
+
+def grad_fn(W):
+    return 2.0 * A.T @ (A @ W - B)
+
+
+# ---------------------------------------------------------------------------
+#  Optimizer implementations
+# ---------------------------------------------------------------------------
+
+def sgd_step(W, lr):
+    G = grad_fn(W)
+    return W - lr * G, G
+
+
+def adam_step(W, lr, m, v, t, beta1=0.9, beta2=0.999, eps=1e-8):
+    G = grad_fn(W)
+    m_new = beta1 * m + (1 - beta1) * G
+    v_new = beta2 * v + (1 - beta2) * G ** 2
+    m_hat = m_new / (1 - beta1 ** t)
+    v_hat = v_new / (1 - beta2 ** t)
+    W_new = W - lr * m_hat / (np.sqrt(v_hat) + eps)
+    return W_new, G, m_new, v_new
+
+
+def muon_step(W, lr):
+    G = grad_fn(W)
+    G_ortho = ortho(G)
+    return W - lr * G_ortho, G
+
+
+# ---------------------------------------------------------------------------
+#  Hessian-direction projection
+# ---------------------------------------------------------------------------
+
+def hessian_project_trace(W, direction):
+    """Compute trace of Hessian projected onto update direction.
+
+    For f(W) = ||AW - B||^2_F, the Hessian action on a direction D is:
+      H[D] = 2 A^T A D
+    The "sharpness along direction" is:
+      tr(D^T H[D]) / tr(D^T D) = 2 * ||AD||^2_F / ||D||^2_F
+
+    This measures the curvature the optimizer "sees" along its update.
+    """
+    D_norm = np.linalg.norm(direction, 'fro')
+    if D_norm < 1e-30:
+        return 0.0
+    D_hat = direction / D_norm
+    # Hessian action: H[D_hat] = 2 A^T A D_hat
+    HD = 2.0 * A.T @ (A @ D_hat)
+    return np.sum(D_hat * HD)
+
+
+# ---------------------------------------------------------------------------
+#  SECTION 1: Run 50 steps with each optimizer
+# ---------------------------------------------------------------------------
+
+sep("SECTION 1: Optimization trajectories (50 steps)")
+
+n_steps = 50
+
+# Learning rates chosen to be stable (below 1/L where L = hessian_spectral_radius)
+lr_sgd = 0.8 / hessian_spectral_radius   # just under optimal for quadratic
+lr_adam = 0.01
+lr_muon = 0.05
+
+print(f"  Learning rates:")
+print(f"    SGD:  {lr_sgd:.6f}  (0.8 / L_max)")
+print(f"    Adam: {lr_adam:.6f}")
+print(f"    Muon: {lr_muon:.6f}")
+print()
+
+# Storage for trajectories
+losses = {"sgd": np.zeros(n_steps + 1),
+           "adam": np.zeros(n_steps + 1),
+           "muon": np.zeros(n_steps + 1)}
+grad_norms = {"sgd": np.zeros(n_steps),
+               "adam": np.zeros(n_steps),
+               "muon": np.zeros(n_steps)}
+hessian_proj = {"sgd": np.zeros(n_steps),
+                 "adam": np.zeros(n_steps),
+                 "muon": np.zeros(n_steps)}
+update_spectral_norms = {"sgd": np.zeros(n_steps),
+                          "adam": np.zeros(n_steps),
+                          "muon": np.zeros(n_steps)}
+
+# Initialize
+W_sgd = W0.copy()
+W_adam = W0.copy()
+W_muon = W0.copy()
+m_adam = np.zeros_like(W0)
+v_adam = np.zeros_like(W0)
+
+losses["sgd"][0] = loss_fn(W_sgd)
+losses["adam"][0] = loss_fn(W_adam)
+losses["muon"][0] = loss_fn(W_muon)
+
+for step in range(n_steps):
+    # SGD
+    G_sgd = grad_fn(W_sgd)
+    direction_sgd = lr_sgd * G_sgd
+    hessian_proj["sgd"][step] = hessian_project_trace(W_sgd, G_sgd)
+    grad_norms["sgd"][step] = np.linalg.norm(G_sgd, 'fro')
+    update_spectral_norms["sgd"][step] = np.linalg.svd(direction_sgd, compute_uv=False)[0]
+    W_sgd = W_sgd - direction_sgd
+    losses["sgd"][step + 1] = loss_fn(W_sgd)
+
+    # Adam
+    G_adam = grad_fn(W_adam)
+    m_adam = 0.9 * m_adam + 0.1 * G_adam
+    v_adam = 0.999 * v_adam + 0.001 * G_adam ** 2
+    m_hat = m_adam / (1 - 0.9 ** (step + 1))
+    v_hat = v_adam / (1 - 0.999 ** (step + 1))
+    direction_adam = lr_adam * m_hat / (np.sqrt(v_hat) + 1e-8)
+    hessian_proj["adam"][step] = hessian_project_trace(W_adam, m_hat / (np.sqrt(v_hat) + 1e-8))
+    grad_norms["adam"][step] = np.linalg.norm(G_adam, 'fro')
+    update_spectral_norms["adam"][step] = np.linalg.svd(direction_adam, compute_uv=False)[0]
+    W_adam = W_adam - direction_adam
+    losses["adam"][step + 1] = loss_fn(W_adam)
+
+    # Muon
+    G_muon = grad_fn(W_muon)
+    G_ortho = ortho(G_muon)
+    direction_muon = lr_muon * G_ortho
+    hessian_proj["muon"][step] = hessian_project_trace(W_muon, G_ortho)
+    grad_norms["muon"][step] = np.linalg.norm(G_muon, 'fro')
+    update_spectral_norms["muon"][step] = np.linalg.svd(direction_muon, compute_uv=False)[0]
+    W_muon = W_muon - direction_muon
+    losses["muon"][step + 1] = loss_fn(W_muon)
+
+
+# Print loss at key steps
+subsep("Loss values at steps 0, 10, 20, 30, 40, 50")
+print(f"  {'Step':>6s}  {'SGD':>14s}  {'Adam':>14s}  {'Muon':>14s}")
+print(f"  {'-' * 6}  {'-' * 14}  {'-' * 14}  {'-' * 14}")
+for s in [0, 10, 20, 30, 40, 50]:
+    print(f"  {s:>6d}  {losses['sgd'][s]:>14.4f}  {losses['adam'][s]:>14.4f}  {losses['muon'][s]:>14.4f}")
+print()
+
+
+# ---------------------------------------------------------------------------
+#  SECTION 2: Curvature analysis
+# ---------------------------------------------------------------------------
+
+sep("SECTION 2: Curvature seen by each optimizer (Hessian projection)")
+
+print("  The trace of Hessian projected onto update direction measures")
+print("  the curvature the optimizer 'sees' along its step.")
+print()
+print("  For SGD:  direction = G = 2 A^T(AW-B)")
+print("    Hessian projection = 2 ||AG||^2 / ||G||^2")
+print("    This is HIGH when G aligns with high-curvature directions of A.")
+print()
+print("  For Muon: direction = ortho(G) = UV^T")
+print("    Hessian projection = 2 ||A UV^T||^2 / ||UV^T||^2 = 2 ||A UV^T||^2 / n")
+print("    This EQUALIZES across directions because UV^T has all singular values = 1.")
+print()
+
+subsep("Average Hessian projection along trajectory")
+avg_hproj_sgd = np.mean(hessian_proj["sgd"])
+avg_hproj_adam = np.mean(hessian_proj["adam"])
+avg_hproj_muon = np.mean(hessian_proj["muon"])
+
+print(f"  SGD  average Hessian projection: {avg_hproj_sgd:.6f}")
+print(f"  Adam average Hessian projection: {avg_hproj_adam:.6f}")
+print(f"  Muon average Hessian projection: {avg_hproj_muon:.6f}")
+print()
+print(f"  Hessian spectral radius:         {hessian_spectral_radius:.6f}")
+print(f"  Hessian min eigenvalue:          {hessian_min_eigenvalue:.6f}")
+print(f"  Hessian mean eigenvalue:         {np.mean(2.0 * sv_A**2):.6f}")
+print()
+
+# Muon sees the MEAN Hessian eigenvalue because ortho(G) spreads uniformly
+# across all eigenvalue directions. Its projection should be close to mean(2*sigma_i^2).
+hessian_mean_eig = np.mean(2.0 * sv_A**2)
+muon_near_mean = abs(avg_hproj_muon - hessian_mean_eig) / hessian_mean_eig < 0.01
+check(muon_near_mean,
+      f"Muon sees mean Hessian eigenvalue ({avg_hproj_muon:.4f} ~ {hessian_mean_eig:.4f})")
+print()
+
+# SGD's curvature varies wildly (high early, low later) while Muon is CONSTANT
+# The key insight: Muon ALWAYS sees the same curvature (mean eigenvalue)
+# SGD curvature is trajectory-dependent -- high initially, drops as it solves
+# the high-curvature components first.
+hproj_muon_std = np.std(hessian_proj["muon"])
+hproj_sgd_std = np.std(hessian_proj["sgd"])
+check(hproj_muon_std < hproj_sgd_std,
+      f"Muon curvature is more constant (std={hproj_muon_std:.4f}) vs SGD (std={hproj_sgd_std:.4f})")
+print()
+print("  Interpretation: Muon's ortho direction equalizes singular values,")
+print("  so it ALWAYS sees the mean Hessian eigenvalue -- constant curvature.")
+print("  SGD's gradient aligns with the residual error, which initially points")
+print("  toward high-curvature directions (solved first) then rotates to")
+print("  low-curvature directions (slow to converge). This causes variable")
+print("  effective curvature along the SGD trajectory.")
+print()
+
+
+# ---------------------------------------------------------------------------
+#  SECTION 3: Loss smoothness analysis
+# ---------------------------------------------------------------------------
+
+sep("SECTION 3: Loss smoothness (oscillation analysis)")
+
+print("  Prediction: Muon should have SMOOTHER loss decrease because it does not")
+print("  over-step in high-curvature directions (where SGD takes too-large steps).")
+print()
+print("  Measure: standard deviation of step-to-step loss CHANGES (smaller = smoother)")
+print()
+
+# Compute step-to-step loss changes
+loss_changes = {}
+for opt in ["sgd", "adam", "muon"]:
+    loss_changes[opt] = np.diff(losses[opt])
+
+# Loss change statistics
+subsep("Step-to-step loss change statistics")
+print(f"  {'Optimizer':>10s}  {'Mean change':>14s}  {'Std change':>14s}  {'Max increase':>14s}  {'# increases':>12s}")
+print(f"  {'-' * 10}  {'-' * 14}  {'-' * 14}  {'-' * 14}  {'-' * 12}")
+for opt in ["sgd", "adam", "muon"]:
+    changes = loss_changes[opt]
+    mean_c = np.mean(changes)
+    std_c = np.std(changes)
+    max_inc = np.max(changes)  # max increase (positive = loss went up)
+    n_inc = np.sum(changes > 0)
+    print(f"  {opt.upper():>10s}  {mean_c:>14.4f}  {std_c:>14.4f}  {max_inc:>14.4f}  {n_inc:>12d}")
+print()
+
+# Check relative smoothness: Muon should have lower std of loss changes than SGD
+# (Muon equalizes step sizes across eigenvalue directions, preventing oscillation)
+std_sgd = np.std(loss_changes["sgd"])
+std_muon = np.std(loss_changes["muon"])
+
+check(std_muon < std_sgd,
+      f"Muon loss changes smoother (std={std_muon:.4f}) than SGD (std={std_sgd:.4f})")
+
+# Also check: fewer loss increases (oscillations) for Muon
+n_inc_sgd = np.sum(loss_changes["sgd"] > 0)
+n_inc_muon = np.sum(loss_changes["muon"] > 0)
+check(n_inc_muon <= n_inc_sgd,
+      f"Muon has fewer loss increases ({n_inc_muon}) vs SGD ({n_inc_sgd})")
+print()
+
+
+# ---------------------------------------------------------------------------
+#  SECTION 4: Effective condition number seen by each optimizer
+# ---------------------------------------------------------------------------
+
+sep("SECTION 4: Effective condition number")
+
+print("  The 'effective condition number' is the ratio of max to min Hessian")
+print("  projection values along the trajectory. A well-conditioned optimizer")
+print("  sees similar curvature at every step.")
+print()
+
+for opt in ["sgd", "adam", "muon"]:
+    hp = hessian_proj[opt]
+    hp_pos = hp[hp > 0]
+    if len(hp_pos) > 1:
+        eff_kappa = np.max(hp_pos) / np.min(hp_pos)
+    else:
+        eff_kappa = 1.0
+    print(f"  {opt.upper():>6s}: effective kappa = {eff_kappa:.4f}  "
+          f"(range [{np.min(hp):.4f}, {np.max(hp):.4f}])")
+print()
+
+# Muon should have lower effective condition number
+hp_sgd_pos = hessian_proj["sgd"][hessian_proj["sgd"] > 0]
+hp_muon_pos = hessian_proj["muon"][hessian_proj["muon"] > 0]
+if len(hp_sgd_pos) > 1 and len(hp_muon_pos) > 1:
+    eff_kappa_sgd = np.max(hp_sgd_pos) / np.min(hp_sgd_pos)
+    eff_kappa_muon = np.max(hp_muon_pos) / np.min(hp_muon_pos)
+    check(eff_kappa_muon < eff_kappa_sgd,
+          f"Muon effective kappa ({eff_kappa_muon:.4f}) < SGD effective kappa ({eff_kappa_sgd:.4f})")
+print()
+
+print("  Interpretation: Muon sees more UNIFORM curvature along its trajectory")
+print("  because ortho(G) removes the magnitude bias toward high-eigenvalue directions.")
+print("  This is the geometric reason Muon has smoother convergence.")
+print()
+
+
+# ---------------------------------------------------------------------------
+#  SECTION 5: Update spectral norm analysis
+# ---------------------------------------------------------------------------
+
+sep("SECTION 5: Update spectral norms (step size control)")
+
+print("  Muon's update has CONSTANT spectral norm (= lr_muon) because")
+print("  ||lr * ortho(G)||_op = lr * 1 = lr for any G.")
+print("  SGD's update spectral norm varies with ||G||_op, causing over-stepping")
+print("  when the gradient is large.")
+print()
+
+subsep("Spectral norm statistics of updates")
+print(f"  {'Optimizer':>10s}  {'Mean':>12s}  {'Std':>12s}  {'Max':>12s}  {'Min':>12s}  {'Max/Min':>12s}")
+print(f"  {'-' * 10}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}")
+for opt in ["sgd", "adam", "muon"]:
+    norms = update_spectral_norms[opt]
+    mn = np.mean(norms)
+    sd = np.std(norms)
+    mx = np.max(norms)
+    mi = np.min(norms)
+    ratio = mx / mi if mi > 1e-30 else float('inf')
+    print(f"  {opt.upper():>10s}  {mn:>12.6f}  {sd:>12.6f}  {mx:>12.6f}  {mi:>12.6f}  {ratio:>12.4f}")
+print()
+
+# Muon should have near-constant spectral norm
+std_spec_muon = np.std(update_spectral_norms["muon"])
+std_spec_sgd = np.std(update_spectral_norms["sgd"])
+check(std_spec_muon < 1e-10,
+      f"Muon update spectral norm is CONSTANT (std = {std_spec_muon:.2e})")
+check(std_spec_sgd > std_spec_muon,
+      f"SGD update spectral norm VARIES more (std = {std_spec_sgd:.6f})")
+print()
+
+
+# ---------------------------------------------------------------------------
+#  SECTION 6: Gradient norm evolution
+# ---------------------------------------------------------------------------
+
+sep("SECTION 6: Gradient norm evolution")
+
+subsep("Gradient norms at steps 0, 10, 20, 30, 40, 49")
+print(f"  {'Step':>6s}  {'SGD':>14s}  {'Adam':>14s}  {'Muon':>14s}")
+print(f"  {'-' * 6}  {'-' * 14}  {'-' * 14}  {'-' * 14}")
+for s in [0, 10, 20, 30, 40, 49]:
+    if s < n_steps:
+        print(f"  {s:>6d}  {grad_norms['sgd'][s]:>14.4f}  {grad_norms['adam'][s]:>14.4f}  {grad_norms['muon'][s]:>14.4f}")
+print()
+
+# Check convergence: gradient norms should decrease
+final_gn_sgd = grad_norms["sgd"][-1]
+final_gn_muon = grad_norms["muon"][-1]
+initial_gn = grad_norms["sgd"][0]
+
+check(final_gn_sgd < initial_gn,
+      f"SGD gradient norm decreases ({initial_gn:.4f} -> {final_gn_sgd:.4f})")
+check(final_gn_muon < initial_gn,
+      f"Muon gradient norm decreases ({initial_gn:.4f} -> {final_gn_muon:.4f})")
+print()
+
+
+# ---------------------------------------------------------------------------
+#  SECTION 7: Visualization (save plot)
+# ---------------------------------------------------------------------------
+
+sep("SECTION 7: Visualization")
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle("Exp 1.5: Loss Landscape Geometry Under Muon vs SGD", fontsize=14)
+
+    steps_arr = np.arange(n_steps + 1)
+    steps_arr_inner = np.arange(n_steps)
+
+    # Plot 1: Loss curves
+    ax = axes[0, 0]
+    ax.semilogy(steps_arr, losses["sgd"], 'b-', label='SGD', linewidth=1.5)
+    ax.semilogy(steps_arr, losses["adam"], 'g-', label='Adam', linewidth=1.5)
+    ax.semilogy(steps_arr, losses["muon"], 'r-', label='Muon', linewidth=1.5)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss (log scale)")
+    ax.set_title("Loss Curves")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Plot 2: Gradient norms
+    ax = axes[0, 1]
+    ax.semilogy(steps_arr_inner, grad_norms["sgd"], 'b-', label='SGD', linewidth=1.5)
+    ax.semilogy(steps_arr_inner, grad_norms["adam"], 'g-', label='Adam', linewidth=1.5)
+    ax.semilogy(steps_arr_inner, grad_norms["muon"], 'r-', label='Muon', linewidth=1.5)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("||grad||_F (log scale)")
+    ax.set_title("Gradient Norms")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Plot 3: Hessian projection (curvature seen by optimizer)
+    ax = axes[0, 2]
+    ax.plot(steps_arr_inner, hessian_proj["sgd"], 'b-', label='SGD', linewidth=1.5)
+    ax.plot(steps_arr_inner, hessian_proj["adam"], 'g-', label='Adam', linewidth=1.5)
+    ax.plot(steps_arr_inner, hessian_proj["muon"], 'r-', label='Muon', linewidth=1.5)
+    ax.axhline(y=hessian_spectral_radius, color='k', linestyle='--', alpha=0.5, label='H max eigenvalue')
+    ax.axhline(y=hessian_min_eigenvalue, color='k', linestyle=':', alpha=0.5, label='H min eigenvalue')
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Hessian projection")
+    ax.set_title("Curvature Along Update Direction")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # Plot 4: Update spectral norms
+    ax = axes[1, 0]
+    ax.plot(steps_arr_inner, update_spectral_norms["sgd"], 'b-', label='SGD', linewidth=1.5)
+    ax.plot(steps_arr_inner, update_spectral_norms["adam"], 'g-', label='Adam', linewidth=1.5)
+    ax.plot(steps_arr_inner, update_spectral_norms["muon"], 'r-', label='Muon', linewidth=1.5)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("||update||_op")
+    ax.set_title("Update Spectral Norms")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Plot 5: Step-to-step loss changes
+    ax = axes[1, 1]
+    ax.plot(np.arange(n_steps), loss_changes["sgd"], 'b-', label='SGD', alpha=0.7, linewidth=1.2)
+    ax.plot(np.arange(n_steps), loss_changes["adam"], 'g-', label='Adam', alpha=0.7, linewidth=1.2)
+    ax.plot(np.arange(n_steps), loss_changes["muon"], 'r-', label='Muon', alpha=0.7, linewidth=1.2)
+    ax.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss change (negative = decrease)")
+    ax.set_title("Loss Changes per Step (smoothness)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Plot 6: Summary text
+    ax = axes[1, 2]
+    ax.axis('off')
+    summary_text = (
+        f"Hessian condition number: {hessian_condition_number:.2f}\n"
+        f"Hessian spectral radius: {hessian_spectral_radius:.2f}\n\n"
+        f"Final losses (step 50):\n"
+        f"  SGD:  {losses['sgd'][-1]:.4f}\n"
+        f"  Adam: {losses['adam'][-1]:.4f}\n"
+        f"  Muon: {losses['muon'][-1]:.4f}\n\n"
+        f"Loss change std (smoothness):\n"
+        f"  SGD:  {np.std(loss_changes['sgd']):.4f}\n"
+        f"  Adam: {np.std(loss_changes['adam']):.4f}\n"
+        f"  Muon: {np.std(loss_changes['muon']):.4f}\n\n"
+        f"Avg curvature seen:\n"
+        f"  SGD:  {avg_hproj_sgd:.4f}\n"
+        f"  Adam: {avg_hproj_adam:.4f}\n"
+        f"  Muon: {avg_hproj_muon:.4f}"
+    )
+    ax.text(0.05, 0.95, summary_text, transform=ax.transAxes,
+            fontsize=10, verticalalignment='top', fontfamily='monospace')
+
+    plt.tight_layout()
+    plot_path = "/home/secemp9/Muon_as_RG_Gauge_Fixing/experiments/Tier_1_Core_Mechanism_Tests/Exp_1.5_loss_landscape_geometry.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Plot saved to: {plot_path}")
+except ImportError:
+    print("  matplotlib not available -- skipping plot generation")
+    print("  (All numerical results above are still valid)")
+print()
+
+
+# ---------------------------------------------------------------------------
+#  SECTION 8: Quantitative convergence comparison
+# ---------------------------------------------------------------------------
+
+sep("SECTION 8: Convergence rate comparison")
+
+print("  For a quadratic with Hessian condition number kappa, the optimal")
+print("  convergence rate is (kappa-1)/(kappa+1) per step.")
+print()
+print(f"  Our Hessian kappa = {hessian_condition_number:.2f}")
+print(f"  Theoretical optimal rate: {(hessian_condition_number - 1) / (hessian_condition_number + 1):.6f}")
+print()
+
+# Measure empirical convergence rates (ratio of successive losses)
+subsep("Empirical convergence rates (last 10 steps)")
+print(f"  {'Optimizer':>10s}  {'Avg ratio L(t+1)/L(t)':>24s}  {'Effective rate':>16s}")
+print(f"  {'-' * 10}  {'-' * 24}  {'-' * 16}")
+for opt in ["sgd", "adam", "muon"]:
+    ratios = losses[opt][-11:-1] / losses[opt][-12:-2]
+    ratios = ratios[ratios > 0]  # filter out any divide issues
+    if len(ratios) > 0:
+        avg_ratio = np.mean(ratios)
+    else:
+        avg_ratio = 1.0
+    print(f"  {opt.upper():>10s}  {avg_ratio:>24.6f}  {avg_ratio:>16.6f}")
+print()
+
+
+# ---------------------------------------------------------------------------
+#  FINAL VERDICT
+# ---------------------------------------------------------------------------
+
+sep("FINAL VERDICT")
+
+print(f"  Total checks:   {total_checks}")
+print(f"  Total failures: {total_failures}")
+print()
+
+if all_pass:
+    print("  ============================================")
+    print("  =            ALL TESTS PASSED              =")
+    print("  ============================================")
+    print()
+    print("  Experiment 1.5 CONFIRMED:")
+    print()
+    print("  1. CURVATURE ALIGNMENT: SGD's gradient direction is biased toward")
+    print("     high-curvature directions of the Hessian. Muon's ortho direction")
+    print("     equalizes across all curvature directions.")
+    print()
+    print("  2. SMOOTHNESS: Muon achieves smoother loss decrease (lower std of")
+    print("     step-to-step loss changes) because it does not over-step in")
+    print("     high-curvature directions.")
+    print()
+    print("  3. CONSTANT SPECTRAL NORM: Muon's update always has spectral norm = lr,")
+    print("     regardless of gradient magnitude. SGD's step norm varies wildly")
+    print("     with gradient size, causing oscillation in high-curvature regions.")
+    print()
+    print("  4. EFFECTIVE CONDITIONING: Muon sees a lower effective condition number")
+    print("     along its trajectory, meaning it navigates a more 'isotropic' version")
+    print("     of the loss landscape.")
+    print()
+    print("  GEOMETRIC INSIGHT: Muon's orthogonalization acts as an automatic")
+    print("  preconditioner that removes the magnitude bias of the gradient.")
+    print("  This is equivalent to 'gauge fixing' in the RG sense -- removing")
+    print("  redundant scale information to expose the true geometric structure.")
+else:
+    print("  ============================================")
+    print("  =          SOME TESTS FAILED               =")
+    print("  ============================================")
+    print()
+    print(f"  {total_failures}/{total_checks} checks failed.")
+    print("  The loss landscape geometry predictions may need parameter tuning.")
+    print("  See individual check failures above for details.")
+
+print()

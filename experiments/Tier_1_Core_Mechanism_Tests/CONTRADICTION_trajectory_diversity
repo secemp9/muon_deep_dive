@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+CONTRADICTION: Trajectory Diversity Under Muon vs SGD
+=====================================================
+CONFLICTING PREDICTIONS:
+  INFO THEORY: Muon gives LESS diverse trajectories (gauge-fixing removes noise,
+               making optimization more deterministic -> higher cosine similarity)
+  EVOLUTION:   Muon gives MORE diverse trajectories (gauge-fixing enables
+               exploration of more distinct minima -> lower cosine similarity)
+
+Setup: 2-layer MLP (20->20->10), MSE on random regression, 50 samples.
+Run 30 independent training runs per optimizer (same init, different mini-batch seeds).
+After 200 steps, compare final weight distributions.
+
+KEY RESULT:
+  Muon HIGHER mean cosine sim -> INFO THEORY wins
+  Muon LOWER mean cosine sim  -> EVOLUTION wins
+"""
+
+import numpy as np
+
+# =============================================================================
+# SETUP
+# =============================================================================
+
+INPUT_DIM = 20
+HIDDEN_DIM = 20
+OUTPUT_DIM = 10
+NUM_SAMPLES = 50
+BATCH_SIZE = 16
+NUM_STEPS = 200
+NUM_RUNS = 30
+LR_SGD = 0.01
+LR_MUON = 0.01
+
+# Fixed random data
+np.random.seed(0)
+X_data = np.random.randn(NUM_SAMPLES, INPUT_DIM) * 0.5
+Y_data = np.random.randn(NUM_SAMPLES, OUTPUT_DIM) * 0.3
+
+# Fixed initial weights (all runs start from same point)
+W1_init = np.random.randn(INPUT_DIM, HIDDEN_DIM) * 0.3
+W2_init = np.random.randn(HIDDEN_DIM, OUTPUT_DIM) * 0.3
+b1_init = np.zeros(HIDDEN_DIM)
+b2_init = np.zeros(OUTPUT_DIM)
+
+
+def relu(x):
+    return np.maximum(0, x)
+
+
+def relu_grad(x):
+    return (x > 0).astype(float)
+
+
+def forward_mlp(X, W1, b1, W2, b2):
+    """Forward: X @ W1 + b1 -> ReLU -> @ W2 + b2."""
+    z1 = X @ W1 + b1  # (batch, hidden)
+    a1 = relu(z1)
+    z2 = a1 @ W2 + b2  # (batch, output)
+    return z1, a1, z2
+
+
+def compute_loss_mlp(X, Y, W1, b1, W2, b2):
+    """MSE loss."""
+    _, _, pred = forward_mlp(X, W1, b1, W2, b2)
+    return 0.5 * np.mean(np.sum((pred - Y)**2, axis=1))
+
+
+def compute_grads_mlp(X, Y, W1, b1, W2, b2):
+    """Backprop for 2-layer MLP."""
+    batch = X.shape[0]
+    z1, a1, pred = forward_mlp(X, W1, b1, W2, b2)
+
+    # Output gradient
+    d_out = (pred - Y) / batch  # (batch, output)
+
+    # Gradients for W2, b2
+    dW2 = a1.T @ d_out  # (hidden, output)
+    db2 = np.sum(d_out, axis=0)  # (output,)
+
+    # Backprop through ReLU
+    d_hidden = (d_out @ W2.T) * relu_grad(z1)  # (batch, hidden)
+
+    # Gradients for W1, b1
+    dW1 = X.T @ d_hidden  # (input, hidden)
+    db1 = np.sum(d_hidden, axis=0)  # (hidden,)
+
+    return dW1, db1, dW2, db2
+
+
+def newton_schulz_orthogonalize(G, num_iters=5):
+    """
+    Muon-style Newton-Schulz iteration to orthogonalize gradient.
+    Works for non-square matrices by padding or using polar decomposition approach.
+    """
+    rows, cols = G.shape
+    if rows == cols:
+        norm = np.linalg.norm(G, ord='fro')
+        if norm < 1e-12:
+            return G
+        X = G / norm
+        for _ in range(num_iters):
+            A = X.T @ X
+            X = 1.5 * X - 0.5 * X @ A
+        return X
+    else:
+        # For non-square: use SVD-based orthogonalization (what Muon actually does)
+        U, S, Vt = np.linalg.svd(G, full_matrices=False)
+        return U @ Vt
+
+
+def flatten_weights(W1, b1, W2, b2):
+    """Flatten all weights into a single vector."""
+    return np.concatenate([W1.ravel(), b1.ravel(), W2.ravel(), b2.ravel()])
+
+
+def train_single_run(optimizer='sgd', seed=0):
+    """
+    Train one run with given optimizer and random seed (for mini-batch sampling).
+    Returns: final flattened weights, final loss.
+    """
+    rng = np.random.RandomState(seed)
+
+    W1 = W1_init.copy()
+    b1 = b1_init.copy()
+    W2 = W2_init.copy()
+    b2 = b2_init.copy()
+
+    for step in range(NUM_STEPS):
+        # Random mini-batch
+        idx = rng.choice(NUM_SAMPLES, BATCH_SIZE, replace=False)
+        X_batch = X_data[idx]
+        Y_batch = Y_data[idx]
+
+        # Compute gradients
+        dW1, db1, dW2, db2 = compute_grads_mlp(X_batch, Y_batch, W1, b1, W2, b2)
+
+        if optimizer == 'sgd':
+            W1 -= LR_SGD * dW1
+            b1 -= LR_SGD * db1
+            W2 -= LR_SGD * dW2
+            b2 -= LR_SGD * db2
+        elif optimizer == 'muon':
+            # Apply Newton-Schulz orthogonalization to weight matrix gradients
+            # Biases are updated with plain SGD (as in real Muon)
+            W1 -= LR_MUON * newton_schulz_orthogonalize(dW1)
+            b1 -= LR_MUON * db1
+            W2 -= LR_MUON * newton_schulz_orthogonalize(dW2)
+            b2 -= LR_MUON * db2
+
+    final_loss = compute_loss_mlp(X_data, Y_data, W1, b1, W2, b2)
+    final_weights = flatten_weights(W1, b1, W2, b2)
+    return final_weights, final_loss
+
+
+# =============================================================================
+# RUN EXPERIMENTS
+# =============================================================================
+
+print("=" * 80)
+print("CONTRADICTION TEST: TRAJECTORY DIVERSITY (INFO THEORY vs EVOLUTION)")
+print("=" * 80)
+print(f"Setup: 2-layer MLP ({INPUT_DIM}->{HIDDEN_DIM}->{OUTPUT_DIM}), "
+      f"MSE, {NUM_SAMPLES} samples, {NUM_STEPS} steps")
+print(f"Running {NUM_RUNS} independent runs per optimizer...")
+print(f"LR_SGD={LR_SGD}, LR_Muon={LR_MUON}, batch_size={BATCH_SIZE}")
+print("-" * 80)
+
+# Run SGD experiments
+print("\nTraining SGD runs...", end=" ", flush=True)
+sgd_weights = []
+sgd_losses = []
+for run in range(NUM_RUNS):
+    w, loss = train_single_run('sgd', seed=run + 100)
+    sgd_weights.append(w)
+    sgd_losses.append(loss)
+print("done.")
+
+# Run Muon experiments
+print("Training Muon runs...", end=" ", flush=True)
+muon_weights = []
+muon_losses = []
+for run in range(NUM_RUNS):
+    w, loss = train_single_run('muon', seed=run + 100)  # Same seeds!
+    muon_weights.append(w)
+    muon_losses.append(loss)
+print("done.")
+
+sgd_weights = np.array(sgd_weights)   # (30, D)
+muon_weights = np.array(muon_weights)  # (30, D)
+sgd_losses = np.array(sgd_losses)
+muon_losses = np.array(muon_losses)
+
+# =============================================================================
+# METRIC 1: Pairwise Cosine Similarity Within Each Group
+# =============================================================================
+
+def pairwise_cosine_similarity(weight_matrix):
+    """Compute mean pairwise cosine similarity between all pairs of weight vectors."""
+    n = weight_matrix.shape[0]
+    # Normalize each vector
+    norms = np.linalg.norm(weight_matrix, axis=1, keepdims=True)
+    normed = weight_matrix / (norms + 1e-12)
+    # Cosine similarity matrix
+    cos_sim = normed @ normed.T
+    # Extract upper triangle (exclude diagonal)
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    similarities = cos_sim[mask]
+    return np.mean(similarities), np.std(similarities), similarities
+
+
+sgd_mean_cos, sgd_std_cos, sgd_sims = pairwise_cosine_similarity(sgd_weights)
+muon_mean_cos, muon_std_cos, muon_sims = pairwise_cosine_similarity(muon_weights)
+
+# =============================================================================
+# METRIC 2: PCA Dimensionality (PCs needed for 80% variance)
+# =============================================================================
+
+def pca_dimensionality(weight_matrix, threshold=0.80):
+    """How many principal components needed to explain threshold% of variance."""
+    # Center the data
+    centered = weight_matrix - weight_matrix.mean(axis=0, keepdims=True)
+    # SVD
+    _, S, _ = np.linalg.svd(centered, full_matrices=False)
+    # Variance explained
+    var_explained = S**2
+    var_ratio = var_explained / (var_explained.sum() + 1e-12)
+    cumulative = np.cumsum(var_ratio)
+    # Number of PCs for threshold
+    n_pcs = np.searchsorted(cumulative, threshold) + 1
+    return n_pcs, cumulative, var_ratio
+
+
+sgd_pcs, sgd_cumvar, sgd_varatio = pca_dimensionality(sgd_weights)
+muon_pcs, muon_cumvar, muon_varatio = pca_dimensionality(muon_weights)
+
+# =============================================================================
+# METRIC 3: Loss Variance Across Runs
+# =============================================================================
+
+sgd_loss_mean = np.mean(sgd_losses)
+sgd_loss_std = np.std(sgd_losses)
+muon_loss_mean = np.mean(muon_losses)
+muon_loss_std = np.std(muon_losses)
+
+# =============================================================================
+# METRIC 4: Weight Euclidean Distance From Init
+# =============================================================================
+
+init_weights_flat = flatten_weights(W1_init, b1_init, W2_init, b2_init)
+sgd_dist_from_init = np.mean(np.linalg.norm(sgd_weights - init_weights_flat, axis=1))
+muon_dist_from_init = np.mean(np.linalg.norm(muon_weights - init_weights_flat, axis=1))
+
+# Spread of distances
+sgd_spread = np.std(np.linalg.norm(sgd_weights - sgd_weights.mean(axis=0), axis=1))
+muon_spread = np.std(np.linalg.norm(muon_weights - muon_weights.mean(axis=0), axis=1))
+
+# =============================================================================
+# RESULTS TABLE
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("RESULTS")
+print("=" * 80)
+
+print(f"\n{'Metric':<40} | {'SGD':>12} | {'Muon':>12} | {'Winner':>12}")
+print("-" * 80)
+print(f"{'Mean pairwise cosine similarity':<40} | {sgd_mean_cos:12.6f} | {muon_mean_cos:12.6f} | "
+      f"{'Muon MORE similar' if muon_mean_cos > sgd_mean_cos else 'SGD MORE similar'}")
+print(f"{'Std of cosine similarity':<40} | {sgd_std_cos:12.6f} | {muon_std_cos:12.6f} | ")
+print(f"{'PCs for 80% variance':<40} | {sgd_pcs:12d} | {muon_pcs:12d} | "
+      f"{'Muon MORE diverse' if muon_pcs > sgd_pcs else 'SGD MORE diverse'}")
+print(f"{'Mean final loss':<40} | {sgd_loss_mean:12.6f} | {muon_loss_mean:12.6f} | "
+      f"{'Muon' if muon_loss_mean < sgd_loss_mean else 'SGD'}")
+print(f"{'Loss std across runs':<40} | {sgd_loss_std:12.6f} | {muon_loss_std:12.6f} | "
+      f"{'Muon MORE variable' if muon_loss_std > sgd_loss_std else 'Muon LESS variable'}")
+print(f"{'Mean distance from init':<40} | {sgd_dist_from_init:12.4f} | {muon_dist_from_init:12.4f} | ")
+print(f"{'Spread (std of dist from centroid)':<40} | {sgd_spread:12.6f} | {muon_spread:12.6f} | "
+      f"{'Muon MORE spread' if muon_spread > sgd_spread else 'SGD MORE spread'}")
+
+# =============================================================================
+# PCA VARIANCE BREAKDOWN
+# =============================================================================
+
+print(f"\n{'PCA Cumulative Variance (first 10 PCs)':}")
+print(f"{'PC':>4} | {'SGD cum var':>12} | {'Muon cum var':>12}")
+print("-" * 40)
+for i in range(min(10, len(sgd_cumvar), len(muon_cumvar))):
+    print(f"{i+1:4d} | {sgd_cumvar[i]:12.4f} | {muon_cumvar[i]:12.4f}")
+
+# =============================================================================
+# STATISTICAL SIGNIFICANCE
+# =============================================================================
+
+print("\n" + "-" * 80)
+print("STATISTICAL TEST (permutation test for mean cosine similarity)")
+print("-" * 80)
+
+# Permutation test: is the difference in mean cosine sim significant?
+observed_diff = muon_mean_cos - sgd_mean_cos
+all_sims = np.concatenate([sgd_sims, muon_sims])
+n_sgd_sims = len(sgd_sims)
+n_perms = 10000
+count_extreme = 0
+
+rng_perm = np.random.RandomState(999)
+for _ in range(n_perms):
+    perm = rng_perm.permutation(len(all_sims))
+    perm_sgd = all_sims[perm[:n_sgd_sims]]
+    perm_muon = all_sims[perm[n_sgd_sims:]]
+    perm_diff = np.mean(perm_muon) - np.mean(perm_sgd)
+    if abs(perm_diff) >= abs(observed_diff):
+        count_extreme += 1
+
+p_value = count_extreme / n_perms
+print(f"Observed difference (Muon - SGD): {observed_diff:.6f}")
+print(f"P-value (two-tailed): {p_value:.4f}")
+print(f"Significant at 0.05? {'YES' if p_value < 0.05 else 'NO'}")
+
+# =============================================================================
+# VERDICT
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("VERDICT")
+print("=" * 80)
+
+# Primary criterion: cosine similarity
+if muon_mean_cos > sgd_mean_cos and p_value < 0.05:
+    print("\nMuon has HIGHER cosine similarity (LESS diverse trajectories)")
+    print("  -> INFO THEORY WINS")
+    print("  -> Gauge-fixing removes stochastic gauge noise")
+    print("  -> Optimization becomes MORE deterministic")
+    print("  -> Different random seeds lead to MORE SIMILAR final weights")
+    primary = "INFO_THEORY"
+elif muon_mean_cos < sgd_mean_cos and p_value < 0.05:
+    print("\nMuon has LOWER cosine similarity (MORE diverse trajectories)")
+    print("  -> EVOLUTION MODEL WINS")
+    print("  -> Gauge-fixing enables exploration of distinct minima")
+    print("  -> Optimization explores MORE of the loss landscape")
+    print("  -> Different random seeds lead to MORE DIFFERENT final weights")
+    primary = "EVOLUTION"
+else:
+    print("\nNo significant difference in trajectory diversity")
+    print("  -> NEITHER model's prediction is clearly supported")
+    print("  -> The contradiction may be a false dichotomy")
+    print(f"  -> Difference: {observed_diff:.6f}, p-value: {p_value:.4f}")
+    primary = "INCONCLUSIVE"
+
+# Secondary: loss variance
+print(f"\nSecondary evidence (loss variance):")
+if muon_loss_std < sgd_loss_std:
+    print(f"  Muon loss std ({muon_loss_std:.6f}) < SGD loss std ({sgd_loss_std:.6f})")
+    print("  -> Supports INFO THEORY (more deterministic outcomes)")
+    secondary = "INFO_THEORY"
+else:
+    print(f"  Muon loss std ({muon_loss_std:.6f}) >= SGD loss std ({sgd_loss_std:.6f})")
+    print("  -> Supports EVOLUTION (more variable outcomes)")
+    secondary = "EVOLUTION"
+
+# Final combined verdict
+print(f"\nCOMBINED VERDICT:")
+if primary == secondary:
+    print(f"  Both metrics agree: {primary}")
+elif primary == "INCONCLUSIVE":
+    print(f"  Primary inconclusive, secondary suggests: {secondary}")
+else:
+    print(f"  MIXED SIGNAL: cosine sim says {primary}, loss variance says {secondary}")
+    print("  -> May indicate different aspects of each model are correct")
+
+print("\n" + "=" * 80)

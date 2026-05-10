@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""
+1.3c-ii-A: Compare Eigenvalue DISTRIBUTIONS at Matched Steps (SGD vs Muon)
+===========================================================================
+
+CONTEXT from 1.3c-i:
+  - Muon alpha decreases to 0.76 (flatter), SGD alpha increases to 1.12 (heavier tail)
+  - SGD's heavy tail is WHOLE-SPECTRUM, not just lambda_max
+  - They may never both reach alpha~2, so we compare at MATCHED TRAINING STEPS
+
+GOAL: At step 500 (after convergence), compare the FULL eigenvalue distribution
+shape for SGD vs Muon.  Plot log(lambda) vs log(rank), compute KS test,
+Wasserstein distance, and compare with Marchenko-Pastur baseline.
+
+QUESTION: How different are the spectral shapes beyond just alpha?
+
+Setup: 4-layer deep linear net, 32x32, 1000 steps, SGD vs Muon.
+       Snapshot at step 500 for detailed comparison.
+"""
+
+import numpy as np
+import os
+
+np.random.seed(42)
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+DIM = 32
+NUM_LAYERS = 4
+NUM_STEPS = 1000
+BATCH_SIZE = 64
+LR_MUON = 0.005
+MOMENTUM = 0.9
+NS_ITERS = 5
+MEASURE_EVERY = 25
+SNAPSHOT_STEP = 500
+
+W_target = np.random.randn(DIM, DIM) * 0.5
+X_data = np.random.randn(DIM, BATCH_SIZE) * 0.3
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# =============================================================================
+# CORE FUNCTIONS (shared with 1.3c-i)
+# =============================================================================
+
+def init_weights(num_layers, seed=42):
+    rng = np.random.RandomState(seed)
+    weights = []
+    for _ in range(num_layers):
+        W = np.eye(DIM) + rng.randn(DIM, DIM) * 0.1
+        weights.append(W.copy())
+    return weights
+
+
+def forward(weights, X):
+    out = X.copy()
+    for W in weights:
+        out = W @ out
+    return out
+
+
+def compute_loss(weights, X, target):
+    pred = forward(weights, X)
+    target_out = target @ X
+    diff = pred - target_out
+    return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
+
+
+def compute_gradients(weights, X, target):
+    num_layers = len(weights)
+    N = X.shape[1]
+    activations = [X.copy()]
+    out = X.copy()
+    for W in weights:
+        out = W @ out
+        activations.append(out.copy())
+    target_out = target @ X
+    delta = (activations[-1] - target_out) / N
+    grads = []
+    for i in range(num_layers - 1, -1, -1):
+        G = delta @ activations[i].T
+        grads.insert(0, G)
+        if i > 0:
+            delta = weights[i].T @ delta
+    return grads
+
+
+def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
+    norm = np.linalg.norm(G, ord='fro')
+    if norm < 1e-12:
+        return G
+    X = G / norm
+    for _ in range(num_iters):
+        A = X.T @ X
+        X = 1.5 * X - 0.5 * X @ A
+    return X
+
+
+def find_stable_lr_sgd():
+    candidates = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001]
+    for lr in candidates:
+        np.random.seed(42)
+        weights = init_weights(NUM_LAYERS)
+        velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
+        initial_loss = compute_loss(weights, X_data, W_target)
+        stable = True
+        for step in range(200):
+            grads = compute_gradients(weights, X_data, W_target)
+            for i in range(NUM_LAYERS):
+                velocities[i] = MOMENTUM * velocities[i] + grads[i]
+                weights[i] -= lr * velocities[i]
+            loss = compute_loss(weights, X_data, W_target)
+            if np.isnan(loss) or loss > initial_loss * 50:
+                stable = False
+                break
+        if stable:
+            return lr
+    return 0.001
+
+
+def sgd_step(weights, velocities, lr):
+    grads = compute_gradients(weights, X_data, W_target)
+    for i in range(len(weights)):
+        velocities[i] = MOMENTUM * velocities[i] + grads[i]
+        weights[i] = weights[i] - lr * velocities[i]
+    return weights, velocities
+
+
+def muon_step(weights, velocities, lr):
+    grads = compute_gradients(weights, X_data, W_target)
+    for i in range(len(weights)):
+        ortho_grad = newton_schulz_orthogonalize(grads[i])
+        velocities[i] = MOMENTUM * velocities[i] + ortho_grad
+        weights[i] = weights[i] - lr * velocities[i]
+    return weights, velocities
+
+
+def fit_power_law_alpha(eigenvalues):
+    eigs = np.sort(eigenvalues)[::-1]
+    eigs = eigs[eigs > 1e-30]
+    n = len(eigs)
+    if n < 3:
+        return np.nan
+    ranks = np.arange(1, n + 1).astype(float)
+    log_rank = np.log(ranks)
+    log_eig = np.log(eigs)
+    A = np.vstack([log_rank, np.ones(n)]).T
+    result = np.linalg.lstsq(A, log_eig, rcond=None)
+    slope = result[0][0]
+    return -slope
+
+
+# =============================================================================
+# STATISTICAL TESTS (numpy-only implementations)
+# =============================================================================
+
+def ks_test_two_sample(x, y):
+    """
+    Two-sample Kolmogorov-Smirnov test.
+    Returns (D_statistic, approximate_p_value).
+    """
+    n1 = len(x)
+    n2 = len(y)
+    combined = np.concatenate([x, y])
+    combined_sorted = np.sort(combined)
+
+    cdf1 = np.searchsorted(np.sort(x), combined_sorted, side='right') / n1
+    cdf2 = np.searchsorted(np.sort(y), combined_sorted, side='right') / n2
+
+    D = np.max(np.abs(cdf1 - cdf2))
+
+    # Approximate p-value using asymptotic formula
+    n_eff = np.sqrt(n1 * n2 / (n1 + n2))
+    lam = (n_eff + 0.12 + 0.11 / n_eff) * D
+    # Kolmogorov distribution approximation (first terms)
+    j = np.arange(1, 101)
+    p_val = 2.0 * np.sum((-1.0) ** (j - 1) * np.exp(-2.0 * j ** 2 * lam ** 2))
+    p_val = max(0.0, min(1.0, p_val))
+
+    return D, p_val
+
+
+def wasserstein_distance_1d(x, y):
+    """
+    1D Wasserstein (Earth Mover's) distance between two distributions.
+    = integral of |CDF_x - CDF_y|
+    """
+    xs = np.sort(x)
+    ys = np.sort(y)
+    # If same length, simple:
+    if len(xs) == len(ys):
+        return np.mean(np.abs(xs - ys))
+    # General case: merge sorted values, compute CDF difference area
+    all_vals = np.sort(np.concatenate([xs, ys]))
+    cdf_x = np.searchsorted(xs, all_vals, side='right') / len(xs)
+    cdf_y = np.searchsorted(ys, all_vals, side='right') / len(ys)
+    # Trapezoidal integration of |CDF_x - CDF_y|
+    diffs = np.abs(cdf_x - cdf_y)
+    deltas = np.diff(all_vals)
+    return np.sum(0.5 * (diffs[:-1] + diffs[1:]) * deltas)
+
+
+def marchenko_pastur_eigenvalues(n, gamma=1.0, sigma=1.0):
+    """
+    Generate eigenvalues from the Marchenko-Pastur distribution.
+    For a random matrix W of shape (n, n) (gamma=1), the eigenvalues of
+    W^T W / n follow MP.  We generate n samples.
+
+    For gamma=1: lambda_+ = (1+1)^2 * sigma^2 = 4*sigma^2
+                 lambda_- = (1-1)^2 * sigma^2 = 0
+    Density: f(x) = sqrt(4*sigma^2 - x) * sqrt(x) / (2*pi*sigma^2*x)
+    """
+    # Use inverse CDF sampling via sorted uniform
+    # For gamma=1, MP simplifies.  We'll just use a random Gaussian matrix.
+    rng = np.random.RandomState(999)
+    W_rand = rng.randn(n, n) / np.sqrt(n)
+    eigs = np.linalg.eigvalsh(W_rand.T @ W_rand)
+    return np.sort(eigs)[::-1]
+
+
+def shannon_entropy(eigenvalues):
+    """Shannon entropy of normalized eigenvalue distribution."""
+    eigs = np.maximum(eigenvalues, 0.0)
+    total = np.sum(eigs)
+    if total < 1e-30:
+        return 0.0
+    p = eigs / total
+    p = p[p > 1e-30]
+    return -np.sum(p * np.log(p))
+
+
+# =============================================================================
+# TRAINING RUN
+# =============================================================================
+
+print("=" * 100)
+print("1.3c-ii-A: COMPARE EIGENVALUE DISTRIBUTIONS AT MATCHED STEPS (SGD vs Muon)")
+print("=" * 100)
+print(f"Setup: {NUM_LAYERS}-layer deep linear net (dim={DIM}), quadratic loss, {NUM_STEPS} steps")
+print(f"Snapshot at step {SNAPSHOT_STEP} for detailed spectral comparison")
+print(f"Measures: KS test, Wasserstein distance, Marchenko-Pastur comparison")
+print(f"LR_Muon={LR_MUON}, Momentum={MOMENTUM}")
+print("=" * 100)
+
+lr_sgd = find_stable_lr_sgd()
+print(f"\nSGD learning rate (max stable): {lr_sgd}")
+print(f"Muon learning rate (fixed):     {LR_MUON}")
+
+
+def run_training(optimizer_name, optimizer_fn, lr, num_steps, snapshot_steps):
+    """
+    Run training and return weight snapshots at specified steps.
+    Returns: dict of step -> list of weight matrices (one per layer).
+    """
+    np.random.seed(42)
+    weights = init_weights(NUM_LAYERS)
+    velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
+
+    snapshots = {}
+    losses = {}
+
+    # Step 0
+    if 0 in snapshot_steps:
+        snapshots[0] = [W.copy() for W in weights]
+        losses[0] = compute_loss(weights, X_data, W_target)
+
+    for step in range(1, num_steps + 1):
+        weights, velocities = optimizer_fn(weights, velocities, lr)
+        loss = compute_loss(weights, X_data, W_target)
+        if np.isnan(loss) or loss > 1e10:
+            print(f"    WARNING: {optimizer_name} diverged at step {step}!")
+            break
+        if step in snapshot_steps:
+            snapshots[step] = [W.copy() for W in weights]
+            losses[step] = loss
+
+    return snapshots, losses
+
+
+snapshot_steps = {0, SNAPSHOT_STEP, NUM_STEPS}
+
+print("\n  Running SGD...", flush=True)
+sgd_snapshots, sgd_losses = run_training('SGD', sgd_step, lr_sgd, NUM_STEPS, snapshot_steps)
+print(f"    SGD final loss: {sgd_losses.get(NUM_STEPS, float('nan')):.6e}")
+
+print("  Running Muon...", flush=True)
+muon_snapshots, muon_losses = run_training('Muon', muon_step, LR_MUON, NUM_STEPS, snapshot_steps)
+print(f"    Muon final loss: {muon_losses.get(NUM_STEPS, float('nan')):.6e}")
+
+
+# =============================================================================
+# SNAPSHOT ANALYSIS AT STEP 500
+# =============================================================================
+
+print(f"\n\n{'=' * 100}")
+print(f"SPECTRAL ANALYSIS AT STEP {SNAPSHOT_STEP}")
+print("=" * 100)
+
+# Get eigenvalues of W^TW for each layer at snapshot step
+sgd_eigs_per_layer = []
+muon_eigs_per_layer = []
+
+for layer_idx in range(NUM_LAYERS):
+    W_sgd = sgd_snapshots[SNAPSHOT_STEP][layer_idx]
+    W_muon = muon_snapshots[SNAPSHOT_STEP][layer_idx]
+
+    eigs_sgd = np.linalg.eigvalsh(W_sgd.T @ W_sgd)[::-1]
+    eigs_muon = np.linalg.eigvalsh(W_muon.T @ W_muon)[::-1]
+    eigs_sgd = np.maximum(eigs_sgd, 0.0)
+    eigs_muon = np.maximum(eigs_muon, 0.0)
+
+    sgd_eigs_per_layer.append(eigs_sgd)
+    muon_eigs_per_layer.append(eigs_muon)
+
+# Concatenate all layers for aggregate comparison
+sgd_eigs_all = np.concatenate(sgd_eigs_per_layer)
+muon_eigs_all = np.concatenate(muon_eigs_per_layer)
+
+# Marchenko-Pastur reference
+mp_eigs = marchenko_pastur_eigenvalues(DIM)
+
+# Per-layer alpha
+print(f"\n  Per-layer alpha at step {SNAPSHOT_STEP}:")
+print(f"  {'Layer':>6} | {'SGD alpha':>10} | {'Muon alpha':>11} | {'Diff':>10}")
+print("  " + "-" * 50)
+
+sgd_alphas = []
+muon_alphas = []
+for layer_idx in range(NUM_LAYERS):
+    a_sgd = fit_power_law_alpha(sgd_eigs_per_layer[layer_idx])
+    a_muon = fit_power_law_alpha(muon_eigs_per_layer[layer_idx])
+    sgd_alphas.append(a_sgd)
+    muon_alphas.append(a_muon)
+    print(f"  {layer_idx:6d} | {a_sgd:10.4f} | {a_muon:11.4f} | {a_sgd - a_muon:+10.4f}")
+
+print(f"  {'mean':>6} | {np.mean(sgd_alphas):10.4f} | {np.mean(muon_alphas):11.4f} | {np.mean(sgd_alphas) - np.mean(muon_alphas):+10.4f}")
+
+
+# =============================================================================
+# TABLE 1: PER-LAYER KS TEST AND WASSERSTEIN DISTANCE
+# =============================================================================
+
+print(f"\n\n{'=' * 100}")
+print("TABLE 1: PER-LAYER STATISTICAL COMPARISON (SGD vs Muon at step {})".format(SNAPSHOT_STEP))
+print("  KS = Kolmogorov-Smirnov statistic (0=identical, 1=maximally different)")
+print("  W_dist = Wasserstein distance between normalized spectra")
+print("=" * 100)
+
+print(f"\n  {'Layer':>6} | {'KS stat':>8} | {'KS p-val':>10} | {'W_dist':>10} | {'SGD H':>8} | {'Muon H':>8} | {'H_max':>8}")
+print("  " + "-" * 80)
+
+ks_stats = []
+ks_pvals = []
+w_dists = []
+H_max = np.log(DIM)
+
+for layer_idx in range(NUM_LAYERS):
+    eigs_sgd = sgd_eigs_per_layer[layer_idx]
+    eigs_muon = muon_eigs_per_layer[layer_idx]
+
+    # Normalize for distribution comparison
+    norm_sgd = eigs_sgd / np.sum(eigs_sgd) if np.sum(eigs_sgd) > 0 else eigs_sgd
+    norm_muon = eigs_muon / np.sum(eigs_muon) if np.sum(eigs_muon) > 0 else eigs_muon
+
+    # KS test on normalized spectra
+    D, p = ks_test_two_sample(norm_sgd, norm_muon)
+    ks_stats.append(D)
+    ks_pvals.append(p)
+
+    # Wasserstein distance on normalized spectra
+    wd = wasserstein_distance_1d(norm_sgd, norm_muon)
+    w_dists.append(wd)
+
+    # Shannon entropy
+    H_sgd = shannon_entropy(eigs_sgd)
+    H_muon = shannon_entropy(eigs_muon)
+
+    print(f"  {layer_idx:6d} | {D:8.4f} | {p:10.4e} | {wd:10.6f} | {H_sgd:8.4f} | {H_muon:8.4f} | {H_max:8.4f}")
+
+# Aggregate
+D_all, p_all = ks_test_two_sample(
+    sgd_eigs_all / np.sum(sgd_eigs_all),
+    muon_eigs_all / np.sum(muon_eigs_all)
+)
+wd_all = wasserstein_distance_1d(
+    sgd_eigs_all / np.sum(sgd_eigs_all),
+    muon_eigs_all / np.sum(muon_eigs_all)
+)
+H_sgd_all = shannon_entropy(sgd_eigs_all)
+H_muon_all = shannon_entropy(muon_eigs_all)
+H_max_all = np.log(DIM * NUM_LAYERS)
+
+print("  " + "-" * 80)
+print(f"  {'ALL':>6} | {D_all:8.4f} | {p_all:10.4e} | {wd_all:10.6f} | {H_sgd_all:8.4f} | {H_muon_all:8.4f} | {H_max_all:8.4f}")
+
+
+# =============================================================================
+# TABLE 2: COMPARISON WITH MARCHENKO-PASTUR BASELINE
+# =============================================================================
+
+print(f"\n\n{'=' * 100}")
+print("TABLE 2: DISTANCE FROM MARCHENKO-PASTUR BASELINE (RANDOM MATRIX)")
+print("  Closer to MP = more random-like spectrum")
+print("  Farther from MP = more structured / training-induced")
+print("=" * 100)
+
+norm_mp = mp_eigs / np.sum(mp_eigs) if np.sum(mp_eigs) > 0 else mp_eigs
+alpha_mp = fit_power_law_alpha(mp_eigs)
+H_mp = shannon_entropy(mp_eigs)
+
+print(f"\n  Marchenko-Pastur reference: alpha={alpha_mp:.4f}, H={H_mp:.4f}")
+
+print(f"\n  {'Layer':>6} | {'KS(SGD,MP)':>11} | {'KS(Muon,MP)':>12} | {'W(SGD,MP)':>10} | {'W(Muon,MP)':>11}")
+print("  " + "-" * 65)
+
+ks_sgd_mp_list = []
+ks_muon_mp_list = []
+
+for layer_idx in range(NUM_LAYERS):
+    norm_sgd = sgd_eigs_per_layer[layer_idx] / np.sum(sgd_eigs_per_layer[layer_idx])
+    norm_muon = muon_eigs_per_layer[layer_idx] / np.sum(muon_eigs_per_layer[layer_idx])
+
+    D_sgd_mp, _ = ks_test_two_sample(norm_sgd, norm_mp)
+    D_muon_mp, _ = ks_test_two_sample(norm_muon, norm_mp)
+    ks_sgd_mp_list.append(D_sgd_mp)
+    ks_muon_mp_list.append(D_muon_mp)
+
+    wd_sgd_mp = wasserstein_distance_1d(norm_sgd, norm_mp)
+    wd_muon_mp = wasserstein_distance_1d(norm_muon, norm_mp)
+
+    print(f"  {layer_idx:6d} | {D_sgd_mp:11.4f} | {D_muon_mp:12.4f} | {wd_sgd_mp:10.6f} | {wd_muon_mp:11.6f}")
+
+
+# =============================================================================
+# TABLE 3: DETAILED SPECTRAL SHAPE COMPARISON
+# =============================================================================
+
+print(f"\n\n{'=' * 100}")
+print("TABLE 3: SPECTRAL SHAPE METRICS AT STEP {}".format(SNAPSHOT_STEP))
+print("  Beyond alpha: coefficient of variation, skewness, kurtosis of eigenvalues")
+print("=" * 100)
+
+print(f"\n  {'Layer':>6} | {'':>5} | {'Mean':>10} | {'Std':>10} | {'CV':>8} | {'Skew':>8} | {'Kurt':>8} | {'Max/Min':>10}")
+print("  " + "-" * 85)
+
+for layer_idx in range(NUM_LAYERS):
+    for opt_name, eigs in [('SGD', sgd_eigs_per_layer[layer_idx]), ('Muon', muon_eigs_per_layer[layer_idx])]:
+        mu = np.mean(eigs)
+        std = np.std(eigs)
+        cv = std / mu if mu > 1e-30 else np.inf
+        # Skewness
+        skew = np.mean(((eigs - mu) / std) ** 3) if std > 1e-30 else 0.0
+        # Kurtosis (excess)
+        kurt = np.mean(((eigs - mu) / std) ** 4) - 3.0 if std > 1e-30 else 0.0
+        maxmin = eigs[0] / eigs[-1] if eigs[-1] > 1e-30 else np.inf
+
+        print(f"  {layer_idx:6d} | {opt_name:>5} | {mu:10.4f} | {std:10.4f} | {cv:8.4f} | {skew:8.4f} | {kurt:8.4f} | {maxmin:10.2f}")
+    print("  " + "-" * 85)
+
+
+# =============================================================================
+# PLOT: log(lambda) vs log(rank) overlaid
+# =============================================================================
+
+print(f"\n{'=' * 100}")
+print("GENERATING PLOTS")
+print("=" * 100)
+
+plot_path = None
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+    fig.suptitle('1.3c-ii-A: Eigenvalue Distribution Comparison (SGD vs Muon)\n'
+                 f'Step {SNAPSHOT_STEP}, {NUM_LAYERS}-layer linear net, dim={DIM}',
+                 fontsize=14, fontweight='bold')
+
+    # --- Panel (a): log(lambda) vs log(rank) per layer ---
+    ax = axes[0, 0]
+    ax.set_title(f'(a) log(eigenvalue) vs log(rank) at step {SNAPSHOT_STEP}')
+    colors_sgd = ['#1f77b4', '#2ca02c', '#9467bd', '#8c564b']
+    colors_muon = ['#ff7f0e', '#d62728', '#e377c2', '#7f7f7f']
+
+    for layer_idx in range(NUM_LAYERS):
+        eigs_sgd = sgd_eigs_per_layer[layer_idx]
+        eigs_muon = muon_eigs_per_layer[layer_idx]
+        eigs_sgd_pos = eigs_sgd[eigs_sgd > 1e-30]
+        eigs_muon_pos = eigs_muon[eigs_muon > 1e-30]
+
+        ranks_s = np.arange(1, len(eigs_sgd_pos) + 1)
+        ranks_m = np.arange(1, len(eigs_muon_pos) + 1)
+
+        ax.plot(np.log(ranks_s), np.log(eigs_sgd_pos), 'o-', color=colors_sgd[layer_idx],
+                markersize=3, linewidth=1.5, label=f'SGD L{layer_idx}', alpha=0.7)
+        ax.plot(np.log(ranks_m), np.log(eigs_muon_pos), 's--', color=colors_muon[layer_idx],
+                markersize=3, linewidth=1.5, label=f'Muon L{layer_idx}', alpha=0.7)
+
+    # MP reference
+    mp_pos = mp_eigs[mp_eigs > 1e-30]
+    ranks_mp = np.arange(1, len(mp_pos) + 1)
+    ax.plot(np.log(ranks_mp), np.log(mp_pos), 'k:', linewidth=2, label='MP baseline', alpha=0.5)
+
+    ax.set_xlabel('log(rank)')
+    ax.set_ylabel('log(eigenvalue)')
+    ax.legend(fontsize=7, ncol=3)
+    ax.grid(True, alpha=0.3)
+
+    # --- Panel (b): Aggregated comparison (all layers combined) ---
+    ax = axes[0, 1]
+    ax.set_title(f'(b) Aggregated: log(eigenvalue) vs log(rank)')
+
+    sgd_sorted = np.sort(sgd_eigs_all)[::-1]
+    muon_sorted = np.sort(muon_eigs_all)[::-1]
+    sgd_pos = sgd_sorted[sgd_sorted > 1e-30]
+    muon_pos = muon_sorted[muon_sorted > 1e-30]
+
+    ax.plot(np.log(np.arange(1, len(sgd_pos) + 1)), np.log(sgd_pos),
+            'b-o', markersize=2, linewidth=2, label=f'SGD (alpha={np.mean(sgd_alphas):.3f})')
+    ax.plot(np.log(np.arange(1, len(muon_pos) + 1)), np.log(muon_pos),
+            'r--s', markersize=2, linewidth=2, label=f'Muon (alpha={np.mean(muon_alphas):.3f})')
+
+    ax.set_xlabel('log(rank)')
+    ax.set_ylabel('log(eigenvalue)')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    # --- Panel (c): Normalized CDF comparison ---
+    ax = axes[1, 0]
+    ax.set_title('(c) Empirical CDF of Normalized Eigenvalues')
+
+    for layer_idx in range(NUM_LAYERS):
+        norm_sgd = sgd_eigs_per_layer[layer_idx] / np.sum(sgd_eigs_per_layer[layer_idx])
+        norm_muon = muon_eigs_per_layer[layer_idx] / np.sum(muon_eigs_per_layer[layer_idx])
+
+        xs = np.sort(norm_sgd)
+        xm = np.sort(norm_muon)
+
+        ax.step(xs, np.arange(1, len(xs) + 1) / len(xs),
+                color=colors_sgd[layer_idx], linewidth=1.5, alpha=0.7,
+                label=f'SGD L{layer_idx}' if layer_idx == 0 else '')
+        ax.step(xm, np.arange(1, len(xm) + 1) / len(xm),
+                color=colors_muon[layer_idx], linewidth=1.5, linestyle='--', alpha=0.7,
+                label=f'Muon L{layer_idx}' if layer_idx == 0 else '')
+
+    ax.set_xlabel('Normalized eigenvalue (p_i = lambda_i / sum)')
+    ax.set_ylabel('CDF')
+    ax.legend(['SGD (all layers)', 'Muon (all layers)'], fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    # --- Panel (d): Difference plot log(lambda_SGD) - log(lambda_Muon) vs rank ---
+    ax = axes[1, 1]
+    ax.set_title('(d) Spectral Difference: log(lambda_SGD) - log(lambda_Muon) vs rank')
+
+    for layer_idx in range(NUM_LAYERS):
+        eigs_sgd = sgd_eigs_per_layer[layer_idx]
+        eigs_muon = muon_eigs_per_layer[layer_idx]
+        n = min(len(eigs_sgd), len(eigs_muon))
+        mask = (eigs_sgd[:n] > 1e-30) & (eigs_muon[:n] > 1e-30)
+        diff = np.log(eigs_sgd[:n][mask]) - np.log(eigs_muon[:n][mask])
+        ranks = np.arange(1, np.sum(mask) + 1)
+        ax.plot(ranks, diff, 'o-', markersize=3, linewidth=1.5,
+                label=f'Layer {layer_idx}', alpha=0.7)
+
+    ax.axhline(y=0, color='k', linestyle=':', linewidth=1)
+    ax.set_xlabel('Rank')
+    ax.set_ylabel('log(lambda_SGD) - log(lambda_Muon)')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(SCRIPT_DIR, 'eigenvalue_distribution_comparison.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\n  Plot saved to: {plot_path}")
+
+except ImportError:
+    print("\n  WARNING: matplotlib not available, skipping plots.")
+
+
+# =============================================================================
+# KEY TESTS
+# =============================================================================
+
+print(f"\n\n{'=' * 100}")
+print("KEY TESTS")
+print("=" * 100)
+
+# T1: KS test -- distributions are significantly different
+mean_ks = np.mean(ks_stats)
+mean_ks_p = np.mean(ks_pvals)
+test1_different = mean_ks > 0.15  # KS > 0.15 is substantial difference
+
+# T2: Wasserstein distance is non-trivial
+mean_wd = np.mean(w_dists)
+test2_wasserstein = mean_wd > 0.001  # non-trivial distance
+
+# T3: Muon spectrum is flatter (lower alpha, higher entropy)
+mean_alpha_sgd = np.mean(sgd_alphas)
+mean_alpha_muon = np.mean(muon_alphas)
+test3_muon_flatter = mean_alpha_muon < mean_alpha_sgd
+
+# T4: Muon is closer to MP baseline (more random-like) OR both deviate similarly
+# (Either outcome is informative)
+mean_ks_sgd_mp = np.mean(ks_sgd_mp_list)
+mean_ks_muon_mp = np.mean(ks_muon_mp_list)
+# We just report this -- both optimizers should deviate from MP since they're trained
+test4_muon_closer_mp = mean_ks_muon_mp < mean_ks_sgd_mp
+
+# T5: Spectral shape differs beyond just scale (log-eigenvalue difference varies with rank)
+log_diffs_std = []
+for layer_idx in range(NUM_LAYERS):
+    eigs_sgd = sgd_eigs_per_layer[layer_idx]
+    eigs_muon = muon_eigs_per_layer[layer_idx]
+    n = min(len(eigs_sgd), len(eigs_muon))
+    mask = (eigs_sgd[:n] > 1e-30) & (eigs_muon[:n] > 1e-30)
+    diff = np.log(eigs_sgd[:n][mask]) - np.log(eigs_muon[:n][mask])
+    log_diffs_std.append(np.std(diff))
+mean_log_diff_std = np.mean(log_diffs_std)
+test5_shape_differs = mean_log_diff_std > 0.05  # non-uniform difference = shape difference
+
+print(f"""
+  T1: DISTRIBUTIONS ARE SIGNIFICANTLY DIFFERENT (KS test)
+      Mean KS statistic: {mean_ks:.4f}  (threshold: 0.15)
+      Mean KS p-value:   {mean_ks_p:.4e}
+      -> {"CONFIRMED" if test1_different else "REJECTED"}: SGD and Muon spectra are {'significantly' if test1_different else 'NOT significantly'} different
+
+  T2: WASSERSTEIN DISTANCE IS NON-TRIVIAL
+      Mean Wasserstein distance (normalized spectra): {mean_wd:.6f}  (threshold: 0.001)
+      -> {"CONFIRMED" if test2_wasserstein else "REJECTED"}: Distributions are {'well-separated' if test2_wasserstein else 'close'}
+
+  T3: MUON SPECTRUM IS FLATTER (lower alpha)
+      SGD  mean alpha: {mean_alpha_sgd:.4f}
+      Muon mean alpha: {mean_alpha_muon:.4f}
+      -> {"CONFIRMED" if test3_muon_flatter else "REJECTED"}: Muon spectrum is {'flatter' if test3_muon_flatter else 'steeper'} than SGD
+
+  T4: MUON IS CLOSER TO MARCHENKO-PASTUR (more random-like bulk)
+      SGD  mean KS from MP: {mean_ks_sgd_mp:.4f}
+      Muon mean KS from MP: {mean_ks_muon_mp:.4f}
+      -> {"CONFIRMED" if test4_muon_closer_mp else "REJECTED"}: Muon is {'closer' if test4_muon_closer_mp else 'farther'} from MP than SGD
+
+  T5: SPECTRAL SHAPE DIFFERS BEYOND SCALE (rank-dependent difference)
+      Mean std of log(lambda_SGD)-log(lambda_Muon) across rank: {mean_log_diff_std:.4f}  (threshold: 0.05)
+      -> {"CONFIRMED" if test5_shape_differs else "REJECTED"}: Shape difference is {'non-trivial' if test5_shape_differs else 'mostly uniform scaling'}
+""")
+
+tests = [test1_different, test2_wasserstein, test3_muon_flatter, test4_muon_closer_mp, test5_shape_differs]
+tests_passed = sum(tests)
+tests_total = len(tests)
+
+
+# =============================================================================
+# FINAL VERDICT
+# =============================================================================
+
+print(f"\n{'=' * 100}")
+print("FINAL VERDICT: EIGENVALUE DISTRIBUTION COMPARISON")
+print("=" * 100)
+
+if tests_passed >= 4:
+    overall = "PASS"
+    detail = (
+        f"  {tests_passed}/{tests_total} tests pass.\n"
+        "  SGD and Muon produce QUALITATIVELY DIFFERENT spectral shapes.\n"
+        "  The difference goes beyond just alpha -- the full distribution shape,\n"
+        "  its distance from random-matrix theory, and rank-dependent structure\n"
+        "  all confirm that Muon's orthogonal gradient projection creates a\n"
+        "  fundamentally different eigenvalue geometry."
+    )
+elif tests_passed >= 3:
+    overall = "PARTIAL PASS"
+    detail = (
+        f"  {tests_passed}/{tests_total} tests pass.\n"
+        f"  T1 (KS significant):        {'PASS' if test1_different else 'FAIL'}\n"
+        f"  T2 (Wasserstein non-trivial): {'PASS' if test2_wasserstein else 'FAIL'}\n"
+        f"  T3 (Muon flatter):           {'PASS' if test3_muon_flatter else 'FAIL'}\n"
+        f"  T4 (Muon closer to MP):      {'PASS' if test4_muon_closer_mp else 'FAIL'}\n"
+        f"  T5 (Shape differs):          {'PASS' if test5_shape_differs else 'FAIL'}"
+    )
+else:
+    overall = "FAIL"
+    detail = (
+        f"  Only {tests_passed}/{tests_total} tests pass.\n"
+        f"  T1 (KS significant):        {'PASS' if test1_different else 'FAIL'}\n"
+        f"  T2 (Wasserstein non-trivial): {'PASS' if test2_wasserstein else 'FAIL'}\n"
+        f"  T3 (Muon flatter):           {'PASS' if test3_muon_flatter else 'FAIL'}\n"
+        f"  T4 (Muon closer to MP):      {'PASS' if test4_muon_closer_mp else 'FAIL'}\n"
+        f"  T5 (Shape differs):          {'PASS' if test5_shape_differs else 'FAIL'}"
+    )
+
+print(f"""
+  +========================================================================+
+  |  VERDICT: {overall:<63}|
+  +========================================================================+
+  |                                                                        |""")
+for line in detail.split('\n'):
+    print(f"  |  {line:<70}|")
+print(f"""  |                                                                        |
+  +========================================================================+
+""")
+
+print("=" * 100)
+print(f"  Tests passed: {tests_passed}/{tests_total}")
+print(f"  Overall: {overall}")
+print("=" * 100)

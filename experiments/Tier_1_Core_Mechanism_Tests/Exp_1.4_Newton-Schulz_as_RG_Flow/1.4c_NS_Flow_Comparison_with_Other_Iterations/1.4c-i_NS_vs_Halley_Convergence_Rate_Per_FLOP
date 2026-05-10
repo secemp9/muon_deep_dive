@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+Experiment 1.4c-i: NS vs Halley -- Convergence Rate Per FLOP
+
+Compare three iterations for approximating the matrix polar factor:
+
+1. Cubic NS:    X_{k+1} = X_k (3I - X_k^T X_k) / 2
+   - Scalar map: f(s) = (3s - s^3)/2, fixed point s=1
+   - Convergence order: 2 (quadratic), cost: 2 matmuls/step
+
+2. Quintic NS (Muon's actual iteration):
+   - A = X @ X^T, B = b*A + c*A@A, X_new = a*X + B@X
+   - Coefficients: a=3.4445, b=-4.7750, c=2.0315
+   - Scalar map: g(s) = a*s + b*s^3 + c*s^5
+   - NOTE: g(1) = 0.701 != 1, so s=1 is NOT a fixed point!
+   - This is an APPROXIMATE orthogonalization, not exact.
+   - Cost: 3 matmuls/step (X@X^T, A@A, B@X)
+
+3. Halley iteration:  X_{k+1} = X (3I + X^TX)(I + 3 X^TX)^{-1}
+   - Convergence order: 3 (cubic), cost: ~4 matmuls/step
+
+Measure: ||X_k X_k^T - I||_F (how close to orthogonal) AND
+         ||X_k - UV^T||_F (how close to true polar factor)
+versus cumulative FLOP count.
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def cubic_ns(W, n_iters=30):
+    """Cubic NS: X_{k+1} = X_k (3I - X_k^T X_k) / 2. Cost: 2 matmuls/step."""
+    m, n = W.shape
+    X = W.copy()
+    # Ground truth
+    U, S, Vt = np.linalg.svd(W, full_matrices=False)
+    UV_true = U @ Vt
+
+    errors_ortho = []
+    errors_polar = []
+    flops_list = []
+    cum_flops = 0
+
+    for step in range(n_iters + 1):
+        XtX = X.T @ X
+        err_ortho = np.linalg.norm(XtX - np.eye(n), 'fro')
+        err_polar = np.linalg.norm(X - UV_true, 'fro')
+        errors_ortho.append(err_ortho)
+        errors_polar.append(err_polar)
+        flops_list.append(cum_flops)
+
+        if step < n_iters:
+            XtX = X.T @ X             # n x m @ m x n = 2*n*m*n
+            cum_flops += 2 * n * m * n
+            X = X @ (3 * np.eye(n) - XtX) / 2  # m x n @ n x n = 2*m*n*n
+            cum_flops += 2 * m * n * n
+
+    return errors_ortho, errors_polar, flops_list
+
+def quintic_ns_muon(W, n_iters=15):
+    """
+    Muon's quintic NS: A=X@X^T, B=b*A+c*A@A, X=a*X+B@X.
+    Scalar map: g(s) = 3.4445s - 4.7750s^3 + 2.0315s^5.
+    NOTE: this does NOT converge to polar factor (g(1)=0.701).
+    Cost: 3 matmuls/step (X@X^T is m*n*m, A@A is m*m*m, B@X is m*m*n)
+    """
+    m, n = W.shape
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = W.copy()
+
+    U, S, Vt = np.linalg.svd(W, full_matrices=False)
+    UV_true = U @ Vt
+
+    errors_ortho = []
+    errors_polar = []
+    flops_list = []
+    cum_flops = 0
+
+    for step in range(n_iters + 1):
+        XtX = X.T @ X
+        err_ortho = np.linalg.norm(XtX - np.eye(n), 'fro')
+        err_polar = np.linalg.norm(X - UV_true, 'fro')
+        errors_ortho.append(err_ortho)
+        errors_polar.append(err_polar)
+        flops_list.append(cum_flops)
+
+        if step < n_iters:
+            A = X @ X.T                  # m x n @ n x m = 2*m*n*m
+            cum_flops += 2 * m * n * m
+            AA = A @ A                   # m x m @ m x m = 2*m*m*m
+            cum_flops += 2 * m * m * m
+            B = b * A + c * AA
+            X = a * X + B @ X           # m x m @ m x n = 2*m*m*n
+            cum_flops += 2 * m * m * n
+
+    return errors_ortho, errors_polar, flops_list
+
+def halley(W, n_iters=15):
+    """Halley: X_{k+1} = X (3I + X^TX)(I + 3 X^TX)^{-1}. Order 3. Cost ~4 matmuls/step."""
+    m, n = W.shape
+    X = W.copy()
+
+    U, S, Vt = np.linalg.svd(W, full_matrices=False)
+    UV_true = U @ Vt
+
+    errors_ortho = []
+    errors_polar = []
+    flops_list = []
+    cum_flops = 0
+
+    for step in range(n_iters + 1):
+        XtX = X.T @ X
+        err_ortho = np.linalg.norm(XtX - np.eye(n), 'fro')
+        err_polar = np.linalg.norm(X - UV_true, 'fro')
+        errors_ortho.append(err_ortho)
+        errors_polar.append(err_polar)
+        flops_list.append(cum_flops)
+
+        if step < n_iters:
+            XtX = X.T @ X              # 2*n*m*n
+            cum_flops += 2 * n * m * n
+            numer = 3 * np.eye(n) + XtX
+            denom = np.eye(n) + 3 * XtX
+            ratio = np.linalg.solve(denom, numer)  # ~2*n^3
+            cum_flops += 2 * n * n * n
+            cum_flops += 2 * n * n * n  # extra cost for solve
+            X = X @ ratio              # 2*m*n*n
+            cum_flops += 2 * m * n * n
+
+    return errors_ortho, errors_polar, flops_list
+
+def main():
+    np.random.seed(42)
+    print("=" * 70)
+    print("Experiment 1.4c-i: NS vs Halley -- Convergence Rate Per FLOP")
+    print("=" * 70)
+    print()
+
+    # Verify scalar maps first
+    print("Scalar map verification:")
+    a, b, c = 3.4445, -4.7750, 2.0315
+    print(f"  Cubic f(s) = (3s-s^3)/2:  f(1) = {(3-1)/2:.4f}  (fixed point)")
+    print(f"  Quintic g(s) = as+bs^3+cs^5:  g(1) = {a+b+c:.4f}  (NOT fixed point!)")
+    print(f"  Halley h(s) = s(3+s^2)/(1+3s^2):  h(1) = {1*(3+1)/(1+3):.4f}  (fixed point)")
+
+    # Find fixed point of quintic
+    s = 0.5
+    for _ in range(100):
+        s = a*s + b*s**3 + c*s**5
+    print(f"  Quintic fixed point: g^inf(0.5) -> {s:.6f}")
+    print()
+
+    sizes = [(32, 32), (64, 64)]
+    all_results = {}
+
+    for (m, n) in sizes:
+        print(f"{'='*70}")
+        print(f"Matrix size: {m}x{n}")
+        print(f"{'='*70}")
+
+        W = np.random.randn(m, n)
+        W = W / np.linalg.norm(W, 'fro')  # Frobenius normalize (as Muon does)
+
+        sv = np.linalg.svd(W, compute_uv=False)
+        print(f"  After Frobenius norm: sigma range = [{sv[-1]:.6f}, {sv[0]:.6f}]")
+        print()
+
+        # Run methods
+        eo_c, ep_c, fl_c = cubic_ns(W.copy(), n_iters=30)
+        eo_q, ep_q, fl_q = quintic_ns_muon(W.copy(), n_iters=15)
+        eo_h, ep_h, fl_h = halley(W.copy(), n_iters=15)
+
+        all_results[(m, n)] = {
+            'cubic': (eo_c, ep_c, fl_c),
+            'quintic': (eo_q, ep_q, fl_q),
+            'halley': (eo_h, ep_h, fl_h)
+        }
+
+        # Print tables
+        for name, (eo, ep, fl) in [('Cubic NS (order 2)', (eo_c, ep_c, fl_c)),
+                                    ('Quintic NS/Muon', (eo_q, ep_q, fl_q)),
+                                    ('Halley (order 3)', (eo_h, ep_h, fl_h))]:
+            print(f"  {name}:")
+            print(f"    {'Step':>4s}  {'||X^TX-I||':>12s}  {'||X-UV^T||':>12s}  {'Cum FLOPs':>14s}")
+            max_step = len(eo) - 1
+            for step in [0, 1, 2, 3, 5, 7, 10, 15, 20, 25, 30]:
+                if step <= max_step:
+                    print(f"    {step:>4d}  {eo[step]:12.6e}  {ep[step]:12.6e}  {fl[step]:14.0f}")
+            print()
+
+    # ── Convergence order analysis ──────────────────────────────────────
+    print("=" * 70)
+    print("CONVERGENCE ORDER ANALYSIS (32x32, based on ortho error)")
+    print("=" * 70)
+    r = all_results[(32, 32)]
+
+    for name, (eo, _, _) in [('cubic', r['cubic']), ('halley', r['halley'])]:
+        rates = []
+        print(f"\n  {name}:")
+        print(f"    {'Step':>4s}  {'Error':>12s}  {'Order est':>12s}")
+        for i in range(1, len(eo)):
+            if 1e-14 < eo[i] < 0.5 and eo[i-1] > 1e-14:
+                ratio = np.log(eo[i]) / np.log(eo[i-1])
+                rates.append(ratio)
+                print(f"    {i:>4d}  {eo[i]:12.6e}  {ratio:12.4f}")
+        if rates:
+            print(f"    Average convergence order: {np.mean(rates):.2f}")
+    print()
+
+    # ── FLOPs to reach target ───────────────────────────────────────────
+    print("=" * 70)
+    print("FLOPS TO REACH TARGET (ortho error)")
+    print("=" * 70)
+
+    targets = [1e-1, 1e-3, 1e-6, 1e-10]
+
+    for (m, n) in sizes:
+        r = all_results[(m, n)]
+        print(f"\n  {m}x{n}:")
+        print(f"    {'Target':>10s}  {'Cubic':>14s}  {'Quintic':>14s}  {'Halley':>14s}  {'Winner':>10s}")
+        for target in targets:
+            flops_to_target = {}
+            for method in ['cubic', 'quintic', 'halley']:
+                eo, _, fl = r[method]
+                flops_needed = None
+                for i, e in enumerate(eo):
+                    if e < target:
+                        flops_needed = fl[i]
+                        break
+                flops_to_target[method] = flops_needed
+
+            valid = {k: v for k, v in flops_to_target.items() if v is not None}
+            winner = min(valid, key=valid.get) if valid else "N/A"
+
+            vals = []
+            for method in ['cubic', 'quintic', 'halley']:
+                f = flops_to_target[method]
+                vals.append(f"{f:14.0f}" if f is not None else f"{'N/A':>14s}")
+            print(f"    {target:10.0e}  {'  '.join(vals)}  {winner:>10s}")
+    print()
+
+    # ── What quintic actually achieves ──────────────────────────────────
+    print("=" * 70)
+    print("WHAT MUON'S QUINTIC ACTUALLY ACHIEVES")
+    print("=" * 70)
+    for (m, n) in sizes:
+        eo_q, ep_q, fl_q = all_results[(m, n)]['quintic']
+        # Find the minimum ortho error achieved
+        min_eo = min(eo_q)
+        min_ep = min(ep_q)
+        best_step_o = eo_q.index(min_eo)
+        best_step_p = ep_q.index(min_ep)
+        print(f"  {m}x{n}: Best ortho err = {min_eo:.6e} at step {best_step_o}")
+        print(f"         Best polar err = {min_ep:.6e} at step {best_step_p}")
+        print(f"         (Quintic oscillates, doesn't converge to exact orthogonal)")
+    print()
+
+    # ── Plot ────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Exp 1.4c-i: NS vs Halley -- Convergence Per FLOP",
+                 fontsize=14, fontweight='bold')
+
+    styles = {
+        'cubic': ('blue', 'o-', 'Cubic NS (order 2)'),
+        'quintic': ('red', 's-', 'Quintic NS/Muon'),
+        'halley': ('green', '^-', 'Halley (order 3)')
+    }
+
+    for idx, (m, n) in enumerate(sizes):
+        r = all_results[(m, n)]
+
+        # Top: ortho error vs FLOPs
+        ax = axes[0, idx]
+        for method in ['cubic', 'quintic', 'halley']:
+            eo, _, fl = r[method]
+            color, style, label = styles[method]
+            valid = [(f, e) for f, e in zip(fl, eo) if e > 1e-16]
+            if valid:
+                ff, ee = zip(*valid)
+                ax.semilogy(np.array(ff)/1e6, ee, style, color=color,
+                           markersize=3, linewidth=1.5, label=label)
+        ax.set_xlabel('Cumulative MFLOPs')
+        ax.set_ylabel('$||X^TX - I||_F$')
+        ax.set_title(f'{m}x{n}: Orthogonality error vs FLOPs')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # Bottom: polar error vs FLOPs
+        ax = axes[1, idx]
+        for method in ['cubic', 'quintic', 'halley']:
+            _, ep, fl = r[method]
+            color, style, label = styles[method]
+            valid = [(f, e) for f, e in zip(fl, ep) if e > 1e-16]
+            if valid:
+                ff, ee = zip(*valid)
+                ax.semilogy(np.array(ff)/1e6, ee, style, color=color,
+                           markersize=3, linewidth=1.5, label=label)
+        ax.set_xlabel('Cumulative MFLOPs')
+        ax.set_ylabel('$||X - UV^T||_F$')
+        ax.set_title(f'{m}x{n}: Polar factor error vs FLOPs')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(SCRIPT_DIR, "ns_vs_halley_per_flop.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"Plot saved: {plot_path}")
+
+    # Per-iteration plot
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Convergence Per Iteration", fontsize=14, fontweight='bold')
+    for idx, (m, n) in enumerate(sizes):
+        ax = axes[idx]
+        r = all_results[(m, n)]
+        for method in ['cubic', 'quintic', 'halley']:
+            eo, _, _ = r[method]
+            color, _, label = styles[method]
+            valid = [(i, e) for i, e in enumerate(eo) if e > 1e-16]
+            if valid:
+                ii, ee = zip(*valid)
+                ax.semilogy(ii, ee, 'o-', color=color, markersize=3,
+                           linewidth=1.5, label=label)
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('$||X^TX - I||_F$')
+        ax.set_title(f'{m}x{n}')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plot_path2 = os.path.join(SCRIPT_DIR, "ns_vs_halley_per_iteration.png")
+    plt.savefig(plot_path2, dpi=150)
+    plt.close()
+    print(f"Plot saved: {plot_path2}")
+    print()
+
+    # ── PASS/FAIL ───────────────────────────────────────────────────────
+    print("=" * 70)
+    test_results = []
+    r32 = all_results[(32, 32)]
+
+    # Test 1: Cubic and Halley both converge to orthogonal (err < 1e-10 for 32x32)
+    t1 = (r32['cubic'][0][-1] < 1e-10 and r32['halley'][0][-1] < 1e-10)
+    test_results.append(t1)
+    print(f"TEST 1 - Cubic & Halley converge (32x32):      {'PASS' if t1 else 'FAIL'}  (cubic={r32['cubic'][0][-1]:.2e}, halley={r32['halley'][0][-1]:.2e})")
+
+    # Test 2: Quintic does NOT converge to exact orthogonal (different goal)
+    min_quintic_err = min(r32['quintic'][0])
+    t2 = min_quintic_err > 0.1  # quintic doesn't reach true orthogonality
+    test_results.append(t2)
+    print(f"TEST 2 - Quintic is approximate (not exact):   {'PASS' if t2 else 'FAIL'}  (min ortho err={min_quintic_err:.2e})")
+
+    # Test 3: Halley has higher convergence order than cubic
+    cubic_rates = []
+    halley_rates = []
+    for i in range(1, len(r32['cubic'][0])):
+        e, e_prev = r32['cubic'][0][i], r32['cubic'][0][i-1]
+        if 1e-14 < e < 0.3 and e_prev > 1e-14:
+            cubic_rates.append(np.log(e)/np.log(e_prev))
+    for i in range(1, len(r32['halley'][0])):
+        e, e_prev = r32['halley'][0][i], r32['halley'][0][i-1]
+        if 1e-14 < e < 0.3 and e_prev > 1e-14:
+            halley_rates.append(np.log(e)/np.log(e_prev))
+    avg_cubic_order = np.mean(cubic_rates) if cubic_rates else 0
+    avg_halley_order = np.mean(halley_rates) if halley_rates else 0
+    t3 = avg_halley_order > avg_cubic_order
+    test_results.append(t3)
+    print(f"TEST 3 - Halley order > Cubic order:           {'PASS' if t3 else 'FAIL'}  (halley={avg_halley_order:.2f}, cubic={avg_cubic_order:.2f})")
+
+    # Test 4: Halley converges in fewer FLOPs than cubic to 1e-6
+    c_flops = h_flops = None
+    for i, e in enumerate(r32['cubic'][0]):
+        if e < 1e-6:
+            c_flops = r32['cubic'][2][i]
+            break
+    for i, e in enumerate(r32['halley'][0]):
+        if e < 1e-6:
+            h_flops = r32['halley'][2][i]
+            break
+    if c_flops is not None and h_flops is not None:
+        t4 = h_flops <= c_flops
+        test_results.append(t4)
+        print(f"TEST 4 - Halley FLOP-efficient to 1e-6:        {'PASS' if t4 else 'FAIL'}  (halley={h_flops:.0f}, cubic={c_flops:.0f})")
+    else:
+        t4 = False
+        test_results.append(t4)
+        print(f"TEST 4 - Halley FLOP-efficient to 1e-6:        FAIL  (didn't converge)")
+
+    # Test 5: Cubic convergence order is approximately 2
+    t5 = 1.7 < avg_cubic_order < 2.3
+    test_results.append(t5)
+    print(f"TEST 5 - Cubic has quadratic convergence:      {'PASS' if t5 else 'FAIL'}  (order={avg_cubic_order:.2f}, expect ~2)")
+
+    print("=" * 70)
+    all_tests = all(test_results)
+    print(f"\nOVERALL: {'PASS' if all_tests else 'FAIL'} ({sum(test_results)}/{len(test_results)} tests passed)")
+
+if __name__ == "__main__":
+    main()

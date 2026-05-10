@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""
+Experiment 1.2a-i — Pure Math: ortho(M) = ortho(MP) for PSD P
+
+Prove that if M = USV^T and P = VDV^T (PSD in M's right singular basis),
+then MP = U(SD)V^T, so ortho(MP) = UV^T = ortho(M).
+
+Characterize EXACTLY when invariance holds and when it breaks.
+
+Key result: ortho(MP) = ortho(M) iff [P, V Sigma^2 V^T] = 0,
+i.e., P commutes with M^T M.
+"""
+
+import numpy as np
+
+np.random.seed(42)
+
+SEP = "=" * 72
+
+
+def ortho(M):
+    """Orthogonal Procrustes factor: M = U S V^T -> ortho(M) = U V^T."""
+    U, S, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def random_orthogonal(n):
+    """Random orthogonal matrix via QR of Gaussian."""
+    H = np.random.randn(n, n)
+    Q, R = np.linalg.qr(H)
+    # Ensure det(Q) = +1 by flipping sign if needed
+    Q = Q @ np.diag(np.sign(np.diag(R)))
+    return Q
+
+
+def random_psd(n, eigvals=None):
+    """Random PSD matrix with given eigenvalues (or random positive ones)."""
+    R = random_orthogonal(n)
+    if eigvals is None:
+        eigvals = np.abs(np.random.randn(n)) + 0.1  # strictly positive
+    return R @ np.diag(eigvals) @ R.T, R, eigvals
+
+
+# ============================================================
+# PART 1: The 3-line proof (numerical verification)
+# ============================================================
+print(SEP)
+print("PART 1: The 3-line proof — ortho(MP) = ortho(M) for V-aligned PSD P")
+print(SEP)
+
+n = 5
+M = np.random.randn(n, n)
+U, S, Vt = np.linalg.svd(M, full_matrices=False)
+V = Vt.T
+
+print(f"\nM is {n}x{n} random, singular values: {S}")
+
+# Construct P = V @ diag(d) @ V^T — PSD in M's right singular basis
+d = np.abs(np.random.randn(n)) + 0.1  # strictly positive
+P_aligned = V @ np.diag(d) @ V.T
+
+print(f"P eigenvalues (in V-basis): {d}")
+
+# The proof chain:
+# MP = (U S V^T)(V D V^T) = U S (V^T V) D V^T = U (S D) V^T
+# ortho(U (SD) V^T) = U V^T   [since SD is diagonal with positive entries]
+# ortho(M) = U V^T
+# Therefore ortho(MP) = ortho(M).  QED.
+
+MP = M @ P_aligned
+ortho_M = ortho(M)
+ortho_MP = ortho(MP)
+
+diff = np.linalg.norm(ortho_MP - ortho_M, 'fro')
+print(f"\n--- Proof chain ---")
+print(f"M  = U Sigma V^T")
+print(f"P  = V D V^T         (D = diag(d), d > 0)")
+print(f"MP = U Sigma V^T V D V^T = U (Sigma D) V^T")
+print(f"Since Sigma D is diagonal with positive entries:")
+print(f"  ortho(MP) = U V^T = ortho(M)")
+print(f"\nNumerical verification:")
+print(f"  ||ortho(MP) - ortho(M)||_F = {diff:.2e}")
+print(f"  Machine epsilon             = {np.finfo(float).eps:.2e}")
+
+part1_pass = diff < 1e-12
+print(f"\n  PART 1 RESULT: {'PASS' if part1_pass else 'FAIL'} (diff < 1e-12)")
+
+
+# ============================================================
+# PART 2: When it BREAKS — general PSD P not aligned with V
+# ============================================================
+print(f"\n{SEP}")
+print("PART 2: When invariance BREAKS — general PSD P (not V-aligned)")
+print(SEP)
+
+# Random PSD P with eigenbasis R != V
+P_general, R, eigvals_gen = random_psd(n)
+MP_gen = M @ P_general
+ortho_MP_gen = ortho(MP_gen)
+
+diff_general = np.linalg.norm(ortho_MP_gen - ortho_M, 'fro')
+
+# Measure misalignment between R and V
+# Perfect alignment: R^T V is a permutation matrix (|entries| in {0,1})
+# Misalignment: ||R^T V - nearest_permutation||_F
+RtV = R.T @ V
+misalignment = np.linalg.norm(np.abs(RtV) - np.eye(n), 'fro')
+
+print(f"\nGeneral PSD P (random eigenbasis R):")
+print(f"  ||ortho(MP) - ortho(M)||_F = {diff_general:.6f}")
+print(f"  Misalignment ||abs(R^T V) - I||_F = {misalignment:.6f}")
+print(f"  Deviation is {'> 0 (BREAKS as expected)' if diff_general > 1e-10 else 'unexpectedly small'}")
+
+# Sweep: vary interpolation between V-aligned and random eigenbasis
+print(f"\n  Deviation as a function of misalignment (interpolating R -> V):")
+print(f"  {'theta':>8s}  {'misalign':>10s}  {'||ortho diff||':>14s}")
+print(f"  {'-'*8}  {'-'*10}  {'-'*14}")
+
+for theta_deg in [0, 5, 10, 20, 30, 45, 60, 90]:
+    theta = np.radians(theta_deg)
+    # Geodesic interpolation on SO(n): V -> R
+    # Use V @ expm(theta * log(V^T R)) as interpolation
+    # Simpler: rotate one axis by theta
+    # Use Cayley-like: R_theta = V @ (cos(theta) I + sin(theta) A) where A is skew
+    A_skew = np.random.randn(n, n)
+    A_skew = (A_skew - A_skew.T) / 2  # skew-symmetric
+    A_skew /= np.linalg.norm(A_skew, 'fro')  # normalize
+    from scipy.linalg import expm
+    R_theta = V @ expm(theta * A_skew)
+    # Make sure it's orthogonal (it should be since exp of skew is orthogonal)
+
+    d_pos = np.abs(np.random.randn(n)) + 0.1
+    P_theta = R_theta @ np.diag(d_pos) @ R_theta.T
+    MP_theta = M @ P_theta
+    ortho_diff = np.linalg.norm(ortho(MP_theta) - ortho_M, 'fro')
+    misalign = np.linalg.norm(np.abs(R_theta.T @ V) - np.eye(n), 'fro')
+    print(f"  {theta_deg:>6d} deg  {misalign:>10.4f}  {ortho_diff:>14.2e}")
+
+part2_pass = diff_general > 1e-10
+print(f"\n  PART 2 RESULT: {'PASS' if part2_pass else 'FAIL'} (general PSD breaks invariance)")
+
+
+# ============================================================
+# PART 3: The exact characterization — commutator condition
+# ============================================================
+print(f"\n{SEP}")
+print("PART 3: Exact characterization — [P, M^T M] = 0")
+print(SEP)
+
+print("""
+THEOREM: ortho(MP) = ortho(M) if and only if [P, M^T M] = 0.
+
+Proof sketch:
+  M = U Sigma V^T,  so  M^T M = V Sigma^2 V^T.
+
+  MP = U Sigma V^T P.  The SVD of MP determines ortho(MP).
+  Write Q = V^T P V  (P expressed in V-basis).
+  Then  V^T (MP) = Sigma Q V^T  ... hmm, let's be more careful.
+
+  MP = U Sigma (V^T P V) V^T  [inserting VV^T = I]
+     = U (Sigma Q) V^T   where Q = V^T P V.
+
+  For ortho(MP) = U V^T, we need the SVD of Sigma Q to have the form
+  Sigma' I (i.e., left and right singular vectors of Sigma Q must be I).
+
+  Since Sigma is diagonal with positive entries and Q = V^T P V is PSD:
+    Sigma Q has SVD = A D_new B^T
+    where A, B depend on how Sigma and Q interact.
+
+  ortho(Sigma Q) = I  iff  Sigma Q is itself symmetric PSD
+    iff  Sigma Q = Q Sigma
+    iff  [Sigma, Q] = 0
+    iff  Q = V^T P V commutes with Sigma
+    iff  P commutes with V Sigma V^T ... but we want M^T M = V Sigma^2 V^T.
+
+  Actually, [Sigma, Q] = 0  iff  Q is block-diagonal in the eigenspaces of Sigma.
+  And [Sigma^2, Q] = 0  iff  Q is block-diagonal in the eigenspaces of Sigma^2.
+  Since Sigma has non-negative entries, eigenspaces of Sigma and Sigma^2 coincide.
+  So [Sigma, Q] = 0  iff  [Sigma^2, Q] = 0  iff  [P, M^T M] = 0.
+
+  QED.
+""")
+
+# Numerical verification of the commutator condition
+MtM = M.T @ M
+
+# V-aligned P: should commute with M^T M
+comm_aligned = np.linalg.norm(P_aligned @ MtM - MtM @ P_aligned, 'fro')
+print(f"V-aligned P:  ||[P, M^T M]||_F = {comm_aligned:.2e}  (should be ~0)")
+
+# General P: should NOT commute with M^T M
+comm_general = np.linalg.norm(P_general @ MtM - MtM @ P_general, 'fro')
+print(f"General P:    ||[P, M^T M]||_F = {comm_general:.6f}  (should be > 0)")
+
+# Verify: ortho deviation correlates with commutator norm
+print(f"\n  Commutator norm vs ortho deviation across random P matrices:")
+print(f"  {'||[P, M^TM]||':>14s}  {'||ortho diff||':>14s}")
+print(f"  {'-'*14}  {'-'*14}")
+
+comms = []
+diffs = []
+for _ in range(20):
+    P_rand, _, _ = random_psd(n)
+    comm = np.linalg.norm(P_rand @ MtM - MtM @ P_rand, 'fro')
+    MP_r = M @ P_rand
+    od = np.linalg.norm(ortho(MP_r) - ortho_M, 'fro')
+    comms.append(comm)
+    diffs.append(od)
+    print(f"  {comm:>14.6f}  {od:>14.6f}")
+
+correlation = np.corrcoef(comms, diffs)[0, 1]
+print(f"\n  Pearson correlation(||[P, M^TM]||, ||ortho diff||) = {correlation:.4f}")
+
+part3_pass = comm_aligned < 1e-12 and comm_general > 1e-6 and correlation > 0.3
+print(f"\n  PART 3 RESULT: {'PASS' if part3_pass else 'FAIL'}")
+print(f"    V-aligned commutes:  {'YES' if comm_aligned < 1e-12 else 'NO'}")
+print(f"    General doesn't:     {'YES' if comm_general > 1e-6 else 'NO'}")
+print(f"    Correlation > 0.3:   {'YES' if correlation > 0.3 else 'NO'}")
+print(f"    (Note: relationship is monotone but non-linear; Pearson underestimates)")
+
+
+# ============================================================
+# PART 4: Statistical verification — 500 trials
+# ============================================================
+print(f"\n{SEP}")
+print("PART 4: Statistical verification — 500 random (M, P_aligned, P_general) triples")
+print(SEP)
+
+N_TRIALS = 500
+aligned_diffs = []
+general_diffs = []
+aligned_comms = []
+general_comms = []
+
+for trial in range(N_TRIALS):
+    # Random M
+    M_t = np.random.randn(n, n)
+    U_t, S_t, Vt_t = np.linalg.svd(M_t, full_matrices=False)
+    V_t = Vt_t.T
+    MtM_t = M_t.T @ M_t
+    ortho_M_t = U_t @ Vt_t
+
+    # V-aligned PSD P
+    d_t = np.abs(np.random.randn(n)) + 0.1
+    P_al = V_t @ np.diag(d_t) @ V_t.T
+    MP_al = M_t @ P_al
+    diff_al = np.linalg.norm(ortho(MP_al) - ortho_M_t, 'fro')
+    comm_al = np.linalg.norm(P_al @ MtM_t - MtM_t @ P_al, 'fro')
+    aligned_diffs.append(diff_al)
+    aligned_comms.append(comm_al)
+
+    # General PSD P (random eigenbasis)
+    P_gen, _, _ = random_psd(n)
+    MP_g = M_t @ P_gen
+    diff_g = np.linalg.norm(ortho(MP_g) - ortho_M_t, 'fro')
+    comm_g = np.linalg.norm(P_gen @ MtM_t - MtM_t @ P_gen, 'fro')
+    general_diffs.append(diff_g)
+    general_comms.append(comm_g)
+
+aligned_diffs = np.array(aligned_diffs)
+general_diffs = np.array(general_diffs)
+aligned_comms = np.array(aligned_comms)
+general_comms = np.array(general_comms)
+
+print(f"\nV-aligned PSD P (should preserve ortho):")
+print(f"  ||ortho(MP) - ortho(M)||_F:  mean = {aligned_diffs.mean():.2e}, max = {aligned_diffs.max():.2e}")
+print(f"  ||[P, M^TM]||_F:            mean = {aligned_comms.mean():.2e}, max = {aligned_comms.max():.2e}")
+all_aligned_pass = aligned_diffs.max() < 1e-10
+print(f"  All {N_TRIALS} trials exact:          {'YES' if all_aligned_pass else 'NO'}")
+
+print(f"\nGeneral PSD P (should break ortho):")
+print(f"  ||ortho(MP) - ortho(M)||_F:  mean = {general_diffs.mean():.4f}, max = {general_diffs.max():.4f}, min = {general_diffs.min():.4f}")
+print(f"  ||[P, M^TM]||_F:            mean = {general_comms.mean():.4f}, max = {general_comms.max():.4f}")
+frac_broken = np.mean(general_diffs > 1e-10)
+print(f"  Fraction with deviation > 1e-10: {frac_broken:.4f}")
+
+overall_corr = np.corrcoef(general_comms, general_diffs)[0, 1]
+print(f"\n  Overall correlation(||[P, M^TM]||, ||ortho diff||) over {N_TRIALS} general trials = {overall_corr:.4f}")
+
+part4_pass = all_aligned_pass and frac_broken > 0.95 and overall_corr > 0.3
+print(f"\n  PART 4 RESULT: {'PASS' if part4_pass else 'FAIL'}")
+print(f"    All aligned exact:       {'YES' if all_aligned_pass else 'NO'}")
+print(f"    Most general break:      {'YES' if frac_broken > 0.95 else 'NO'} ({frac_broken*100:.1f}%)")
+print(f"    Positive correlation:    {'YES' if overall_corr > 0.3 else 'NO'} (r={overall_corr:.4f})")
+
+
+# ============================================================
+# PART 5: Connection to gauge theory — dimension of invariance group
+# ============================================================
+print(f"\n{SEP}")
+print("PART 5: Gauge theory — dimension of the invariance group Sym+(n) ∩ C(Sigma^2)")
+print(SEP)
+
+print("""
+The set of PSD P for which ortho(MP) = ortho(M) is:
+  G_M = { P in Sym+(n) : [P, M^T M] = 0 }
+      = { P in Sym+(n) : P is diagonal in the eigenbasis of M^T M }
+      = { P in Sym+(n) : P = V diag(d) V^T, d > 0 }
+
+when M has distinct singular values.
+
+Dimension of G_M = n  (the n positive diagonal entries).
+
+When M has repeated singular values with multiplicities m_1, ..., m_k:
+  P can be any PSD matrix within each degenerate block.
+  dim(G_M) = sum_i m_i(m_i+1)/2  (symmetric matrices within each block).
+""")
+
+spectra_configs = [
+    ("All distinct: [5,4,3,2,1]", [5, 4, 3, 2, 1]),
+    ("One pair: [5,3,3,2,1]", [5, 3, 3, 2, 1]),
+    ("One triple: [5,3,3,3,1]", [5, 3, 3, 3, 1]),
+    ("All equal: [3,3,3,3,3]", [3, 3, 3, 3, 3]),
+    ("Two pairs: [5,5,2,2,1]", [5, 5, 2, 2, 1]),
+]
+
+
+def detect_multiplicities(eigvals, tol=1e-6):
+    """Detect multiplicity structure from sorted eigenvalues."""
+    mults = []
+    i = 0
+    while i < len(eigvals):
+        j = i + 1
+        while j < len(eigvals) and abs(eigvals[j] - eigvals[i]) < tol:
+            j += 1
+        mults.append(j - i)
+        i = j
+    return mults
+
+
+print(f"  {'Spectrum':>35s}  {'Multiplicities':>20s}  {'dim(G_M)':>8s}  {'comm':>10s}  {'odiff':>10s}  {'Verified':>8s}")
+print(f"  {'-'*35}  {'-'*20}  {'-'*8}  {'-'*10}  {'-'*10}  {'-'*8}")
+
+part5_all_pass = True
+
+for desc, svals in spectra_configs:
+    # Numerical verification: construct M with given singular values
+    U_g = random_orthogonal(n)
+    V_g = random_orthogonal(n)
+    M_g = U_g @ np.diag(svals) @ V_g.T
+    MtM_g = M_g.T @ M_g
+    ortho_M_g = ortho(M_g)
+
+    # Get eigenbasis of M^T M (eigenvalues returned in ascending order by eigh)
+    eigvals_MtM, eigvecs_MtM = np.linalg.eigh(MtM_g)
+
+    # Detect multiplicity structure from the actual sorted eigenvalues
+    mults = detect_multiplicities(eigvals_MtM)
+
+    # Theoretical dimension
+    dim_theory = sum(m * (m + 1) // 2 for m in mults)
+
+    # Construct P that is block-diagonal in eigenbasis, with random PSD blocks
+    # for each degenerate subspace (matching the detected multiplicity structure)
+    D_block = np.zeros((n, n))
+    idx = 0
+    for m in mults:
+        # Random PSD block of size m x m
+        block = np.random.randn(m, m)
+        block = block @ block.T + 0.1 * np.eye(m)  # ensure PSD
+        D_block[idx:idx+m, idx:idx+m] = block
+        idx += m
+
+    P_commuting = eigvecs_MtM @ D_block @ eigvecs_MtM.T
+
+    # Verify it commutes with MtM
+    comm_check = np.linalg.norm(P_commuting @ MtM_g - MtM_g @ P_commuting, 'fro')
+    # Verify ortho invariance
+    MP_comm = M_g @ P_commuting
+    diff_comm = np.linalg.norm(ortho(MP_comm) - ortho_M_g, 'fro')
+
+    verified = comm_check < 1e-9 and diff_comm < 1e-9
+    if not verified:
+        part5_all_pass = False
+    print(f"  {desc:>35s}  {str(mults):>20s}  {dim_theory:>8d}  {comm_check:>10.2e}  {diff_comm:>10.2e}  {'YES' if verified else 'NO':>8s}")
+
+# Additional: show that a non-commuting P in degenerate case still breaks invariance
+# (unless it happens to commute by accident)
+print(f"\n  Degenerate spectrum test: Sigma = [3,3,3,3,3] (all equal)")
+print(f"  In this case, ALL PSD P commute with M^TM = 9 I, so ALL P preserve ortho.")
+svals_degen = [3, 3, 3, 3, 3]
+U_d = random_orthogonal(n)
+V_d = random_orthogonal(n)
+M_d = U_d @ np.diag(svals_degen) @ V_d.T
+ortho_M_d = ortho(M_d)
+
+n_degen_tests = 100
+degen_diffs = []
+for _ in range(n_degen_tests):
+    P_any, _, _ = random_psd(n)
+    MP_any = M_d @ P_any
+    diff_any = np.linalg.norm(ortho(MP_any) - ortho_M_d, 'fro')
+    degen_diffs.append(diff_any)
+
+degen_diffs = np.array(degen_diffs)
+all_degen_pass = degen_diffs.max() < 1e-9
+print(f"  Tested {n_degen_tests} random PSD P: max deviation = {degen_diffs.max():.2e}")
+print(f"  All preserve ortho: {'YES' if all_degen_pass else 'NO'}")
+print(f"  (Expected: YES, because M^TM = 9I commutes with everything)")
+
+if not all_degen_pass:
+    part5_all_pass = False
+
+print(f"\n  Distinct spectrum test: Sigma = [5,4,3,2,1]")
+print(f"  Only P diagonal in V-basis should preserve ortho. Random P should break it.")
+
+svals_dist = [5, 4, 3, 2, 1]
+U_dist = random_orthogonal(n)
+V_dist = random_orthogonal(n)
+M_dist = U_dist @ np.diag(svals_dist) @ V_dist.T
+ortho_M_dist = ortho(M_dist)
+
+n_dist_tests = 100
+dist_diffs = []
+for _ in range(n_dist_tests):
+    P_any2, _, _ = random_psd(n)
+    MP_any2 = M_dist @ P_any2
+    diff_any2 = np.linalg.norm(ortho(MP_any2) - ortho_M_dist, 'fro')
+    dist_diffs.append(diff_any2)
+
+dist_diffs = np.array(dist_diffs)
+frac_broken_dist = np.mean(np.array(dist_diffs) > 1e-6)
+print(f"  Tested {n_dist_tests} random PSD P: fraction breaking ortho = {frac_broken_dist:.2f}")
+print(f"  Mean deviation = {np.mean(dist_diffs):.4f}, max = {np.max(dist_diffs):.4f}")
+print(f"  (Expected: nearly all break it, since random P won't be V-diagonal)")
+
+if frac_broken_dist < 0.9:
+    part5_all_pass = False
+
+print(f"\n  PART 5 RESULT: {'PASS' if part5_all_pass else 'FAIL'}")
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+print(f"\n{SEP}")
+print("FINAL SUMMARY")
+print(SEP)
+
+all_pass = part1_pass and part2_pass and part3_pass and part4_pass and part5_all_pass
+
+results = [
+    ("Part 1: 3-line proof (V-aligned P preserves ortho)", part1_pass),
+    ("Part 2: General PSD P breaks invariance", part2_pass),
+    ("Part 3: Exact characterization [P, M^TM] = 0", part3_pass),
+    ("Part 4: Statistical verification (500 trials)", part4_pass),
+    ("Part 5: Gauge group dimension & degenerate spectra", part5_all_pass),
+]
+
+for desc, passed in results:
+    print(f"  {'PASS' if passed else 'FAIL'}  {desc}")
+
+print(f"\n  OVERALL: {'PASS' if all_pass else 'FAIL'}")
+print(f"\nKey findings:")
+print(f"  1. ortho(MP) = ortho(M) iff [P, M^T M] = 0  (P commutes with M^T M)")
+print(f"  2. For V-aligned PSD P = V diag(d) V^T: always preserves ortho")
+print(f"  3. For general PSD P: breaks ortho unless it happens to commute with M^T M")
+print(f"  4. The gauge group G_M = Sym+(n) ∩ centralizer(M^T M)")
+print(f"     dim(G_M) = sum_i m_i(m_i+1)/2 where m_i are singular value multiplicities")
+print(f"  5. All distinct singular values: dim(G_M) = n (only V-diagonal P)")
+print(f"     All equal singular values: dim(G_M) = n(n+1)/2 (any PSD P works)")

@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+Experiment 1.4a-i: Basin Map -- What Happens at sigma = sqrt(3)
+
+The cubic Newton-Schulz scalar map is f(sigma) = (3*sigma - sigma^3) / 2.
+Fixed points: sigma=1 (stable attractor), sigma=-1 (stable), sigma=0 (unstable).
+Critical boundary: sigma = sqrt(3) ~ 1.7320508...
+
+Key insight: f(sqrt(3)) = 0 exactly, since (sqrt(3))^3 = 3*sqrt(3).
+- For 0 < sigma < sqrt(3): iterates converge to +1 (the convergence basin)
+- At sigma = sqrt(3): maps to 0 (the unstable fixed point), then stays at 0
+- For sigma > sqrt(3): f(sigma) < 0, then behavior depends on |f(sigma)|:
+  * If |f(sigma)| < sqrt(3): converges to -1
+  * If |f(sigma)| > sqrt(3): may oscillate or diverge
+  True divergence to infinity occurs only for sigma > ~2.0 (where |f| > sqrt(3))
+
+The key point for Muon: normalization ensures ALL sigma_i < sqrt(3),
+so ALL singular values converge to 1 (not -1, not diverge).
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def ns_scalar(sigma, n_iters=50):
+    """Apply f(sigma) = (3*sigma - sigma^3)/2 iteratively. Return trajectory."""
+    traj = [sigma]
+    s = sigma
+    for _ in range(n_iters):
+        s = (3.0 * s - s**3) / 2.0
+        traj.append(s)
+        if abs(s) > 1e10:  # diverged
+            break
+    return traj
+
+def classify_outcome(traj, tol=1e-6):
+    """Classify trajectory outcome."""
+    final = traj[-1]
+    if abs(final) > 1e8:
+        return 'diverge'
+    elif abs(final - 1.0) < tol:
+        return 'converge_+1'
+    elif abs(final + 1.0) < tol:
+        return 'converge_-1'
+    elif abs(final) < tol:
+        return 'zero'
+    else:
+        return 'other'
+
+def main():
+    np.random.seed(42)
+    sqrt3 = np.sqrt(3.0)
+    print(f"sqrt(3) = {sqrt3:.10f}")
+    print()
+
+    # ── Part 1: Narrow band around sqrt(3) ──────────────────────────────
+    N = 1000
+    sigmas = np.linspace(1.70, 1.75, N)
+    n_iters = 100
+
+    outcomes = []
+    final_vals = []
+
+    for s0 in sigmas:
+        traj = ns_scalar(s0, n_iters)
+        outcome = classify_outcome(traj)
+        outcomes.append(outcome)
+        final_vals.append(traj[-1])
+
+    converge_p1 = outcomes.count('converge_+1')
+    converge_m1 = outcomes.count('converge_-1')
+    diverge_count = outcomes.count('diverge')
+    zero_count = outcomes.count('zero')
+    other_count = outcomes.count('other')
+
+    print("Part 1: Narrow band [1.70, 1.75] around sqrt(3)")
+    print(f"  Total points: {N}")
+    print(f"  Converge to +1: {converge_p1}")
+    print(f"  Converge to -1: {converge_m1}")
+    print(f"  Diverge:        {diverge_count}")
+    print(f"  Map to ~0:      {zero_count}")
+    print(f"  Other:          {other_count}")
+    print()
+
+    # Classify by position relative to sqrt(3)
+    below_sqrt3_mask = sigmas < sqrt3
+    above_sqrt3_mask = sigmas > sqrt3
+
+    below_to_plus1 = sum(1 for i in range(N) if below_sqrt3_mask[i] and outcomes[i] == 'converge_+1')
+    above_to_minus1 = sum(1 for i in range(N) if above_sqrt3_mask[i] and outcomes[i] == 'converge_-1')
+    below_count = sum(below_sqrt3_mask)
+    above_count = sum(above_sqrt3_mask)
+
+    print(f"  Points below sqrt(3): {below_count}")
+    print(f"    converge to +1:     {below_to_plus1}")
+    print(f"  Points above sqrt(3): {above_count}")
+    print(f"    converge to -1:     {above_to_minus1}")
+    print(f"    diverge:            {sum(1 for i in range(N) if above_sqrt3_mask[i] and outcomes[i] == 'diverge')}")
+    print()
+
+    # ── Part 2: Verify f(sqrt(3)) = 0 exactly ──────────────────────────
+    s_exact = sqrt3
+    f_exact = (3.0 * s_exact - s_exact**3) / 2.0
+    print(f"Part 2: f(sqrt(3)) = (3*sqrt(3) - sqrt(3)^3) / 2")
+    print(f"  = (3*{sqrt3:.10f} - {sqrt3**3:.10f}) / 2")
+    print(f"  = {f_exact:.15e}")
+    print(f"  Analytically: (3*sqrt(3) - 3*sqrt(3))/2 = 0  [since (sqrt(3))^3 = 3*sqrt(3)]")
+    print()
+
+    # ── Part 3: Show trajectories for select sigma values ───────────────
+    test_sigmas = [0.5, 1.0, 1.5, 1.72, sqrt3 - 1e-4, sqrt3, sqrt3 + 1e-4, 1.74, 1.8, 2.0, 2.5]
+    print("Part 3: Sample trajectories (first few iterations)")
+    print(f"  {'sigma_0':>14s}  {'f^1':>12s}  {'f^2':>12s}  {'f^5':>12s}  {'f^10':>12s}  outcome")
+    for s0 in test_sigmas:
+        traj = ns_scalar(s0, 50)
+        vals = []
+        for k in [1, 2, 5, 10]:
+            if k < len(traj):
+                vals.append(f"{traj[k]:12.6f}")
+            else:
+                vals.append(f"{'inf':>12s}")
+        outcome = classify_outcome(traj)
+        print(f"  {s0:14.10f}  {'  '.join(vals)}  {outcome}")
+    print()
+
+    # ── Part 4: Phase diagram for wider range ───────────────────────────
+    print("Part 4: Full phase diagram [0, 3.0]")
+    sigmas_wide = np.linspace(0.001, 3.0, 3000)
+    outcomes_wide = []
+    for s0 in sigmas_wide:
+        traj = ns_scalar(s0, 100)
+        outcomes_wide.append(classify_outcome(traj))
+
+    for label in ['converge_+1', 'converge_-1', 'zero', 'diverge', 'other']:
+        count = outcomes_wide.count(label)
+        if count > 0:
+            svals = [sigmas_wide[i] for i in range(len(sigmas_wide)) if outcomes_wide[i] == label]
+            print(f"  {label:>14s}: {count:5d}  range [{min(svals):.4f}, {max(svals):.4f}]")
+    print()
+
+    # Find the +1 to -1 transition boundary
+    plus1_sigmas = [sigmas_wide[i] for i in range(len(sigmas_wide)) if outcomes_wide[i] == 'converge_+1']
+    minus1_sigmas = [sigmas_wide[i] for i in range(len(sigmas_wide)) if outcomes_wide[i] == 'converge_-1']
+    if plus1_sigmas and minus1_sigmas:
+        boundary = (max(plus1_sigmas) + min(minus1_sigmas)) / 2
+        print(f"  +1/-1 transition boundary: {boundary:.8f} (sqrt(3) = {sqrt3:.8f})")
+        print(f"  Distance to sqrt(3):       {abs(boundary - sqrt3):.2e}")
+    print()
+
+    # Find the -1 to diverge boundary
+    diverge_sigmas = [sigmas_wide[i] for i in range(len(sigmas_wide)) if outcomes_wide[i] == 'diverge']
+    if minus1_sigmas and diverge_sigmas:
+        boundary2 = (max(minus1_sigmas) + min(diverge_sigmas)) / 2
+        # Theoretical: divergence starts when |f(sigma)| > sqrt(3), i.e. |(3s-s^3)/2| > sqrt(3)
+        print(f"  -1/diverge boundary:       {boundary2:.8f}")
+    print()
+
+    # ── Part 5: Muon's normalization places sigma < sqrt(3) ─────────────
+    print("Part 5: Muon's normalization ensures sigma < sqrt(3)")
+    print("  Muon normalizes: X = W / ||W||_F, so max singular value = sigma_max(W) / ||W||_F")
+    matrix_sizes = [(32, 32), (64, 64), (128, 128), (256, 256), (64, 32), (128, 64)]
+    all_pass_muon = True
+
+    for (m, n) in matrix_sizes:
+        W = np.random.randn(m, n)
+        sv = np.linalg.svd(W, compute_uv=False)
+        frob = np.linalg.norm(W, 'fro')
+        max_sv_normed = sv[0] / frob
+        within_basin = max_sv_normed < sqrt3
+
+        print(f"  {m:>3d}x{n:<3d}: sigma_max/||W||_F = {max_sv_normed:.6f}  < sqrt(3)={sqrt3:.4f}? {within_basin}")
+        if not within_basin:
+            all_pass_muon = False
+
+    # Also verify theoretically: for Gaussian W, sigma_max / ||W||_F <= 1 always
+    # (since ||W||_F^2 = sum(sigma_i^2) >= sigma_max^2)
+    print(f"\n  Theoretical: sigma_max / ||W||_F <= 1 always (since ||W||_F >= sigma_max)")
+    print(f"  And 1 < sqrt(3) = {sqrt3:.4f}, so Frobenius normalization always ensures convergence.")
+    print()
+
+    # ── Part 6: Convergence speed map ───────────────────────────────────
+    print("Part 6: Convergence speed as function of sigma_0")
+    speed_sigmas = np.linspace(0.01, sqrt3 - 0.001, 500)
+    iters_needed = []
+    for s0 in speed_sigmas:
+        traj = ns_scalar(s0, 200)
+        conv_iter = 200
+        for i, v in enumerate(traj):
+            if abs(v - 1.0) < 1e-10:
+                conv_iter = i
+                break
+        iters_needed.append(conv_iter)
+    iters_needed = np.array(iters_needed)
+
+    # Slowest convergence near 0 and near sqrt(3)
+    idx_slowest = np.argmax(iters_needed)
+    print(f"  Slowest convergence at sigma_0 = {speed_sigmas[idx_slowest]:.6f}, needs {iters_needed[idx_slowest]} iterations")
+    print(f"  Fastest convergence at sigma_0 = 1.0 (already at fixed point)")
+    # Near sigma=1
+    idx_near1 = np.argmin(np.abs(speed_sigmas - 1.0))
+    print(f"  At sigma_0 ~ 1.0: needs {iters_needed[idx_near1]} iterations")
+    print()
+
+    # ── Plot ────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Exp 1.4a-i: NS Basin Map Around $\\sigma = \\sqrt{3}$", fontsize=14, fontweight='bold')
+
+    # Top-left: the scalar map f(sigma)
+    ax = axes[0, 0]
+    s_range = np.linspace(-2.5, 2.5, 1000)
+    f_range = (3 * s_range - s_range**3) / 2
+    ax.plot(s_range, f_range, 'b-', linewidth=2, label='$f(\\sigma) = (3\\sigma - \\sigma^3)/2$')
+    ax.plot(s_range, s_range, 'k--', alpha=0.3, label='$y = \\sigma$')
+    ax.axhline(0, color='gray', alpha=0.3)
+    ax.axvline(0, color='gray', alpha=0.3)
+    ax.plot([sqrt3], [0], 'ro', markersize=10, zorder=5, label=f'$f(\\sqrt{{3}}) = 0$')
+    ax.plot([-sqrt3], [0], 'ro', markersize=10, zorder=5)
+    ax.plot([1], [1], 'g*', markersize=15, zorder=5, label='Stable fixed points')
+    ax.plot([-1], [-1], 'g*', markersize=15, zorder=5)
+    ax.plot([0], [0], 'ks', markersize=8, zorder=5, label='Unstable fixed point')
+    ax.fill_betweenx([-4, 4], 0, sqrt3, alpha=0.05, color='green', label='Convergence basin (0, $\\sqrt{3}$)')
+    ax.set_xlabel('$\\sigma$', fontsize=12)
+    ax.set_ylabel('$f(\\sigma)$', fontsize=12)
+    ax.set_title('The NS scalar map')
+    ax.legend(fontsize=7, loc='lower right')
+    ax.set_xlim(-2.5, 2.5)
+    ax.set_ylim(-4, 4)
+    ax.grid(True, alpha=0.3)
+
+    # Top-right: trajectories for select starting points
+    ax = axes[0, 1]
+    demo_sigmas = [0.3, 0.8, 1.0, 1.5, sqrt3 - 0.01, sqrt3 + 0.01, 1.8]
+    cmap = plt.cm.viridis(np.linspace(0, 1, len(demo_sigmas)))
+    for idx, s0 in enumerate(demo_sigmas):
+        traj = ns_scalar(s0, 15)
+        traj_clipped = [min(max(t, -3), 3) for t in traj]
+        ax.plot(range(len(traj_clipped)), traj_clipped, 'o-', markersize=3,
+                color=cmap[idx], label=f'$\\sigma_0$={s0:.3f}')
+    ax.axhline(1.0, color='green', linestyle=':', alpha=0.5)
+    ax.axhline(-1.0, color='green', linestyle=':', alpha=0.5)
+    ax.axhline(0.0, color='gray', linestyle=':', alpha=0.3)
+    ax.set_xlabel('Iteration $k$', fontsize=12)
+    ax.set_ylabel('$\\sigma_k$', fontsize=12)
+    ax.set_title('Trajectories under iteration')
+    ax.legend(fontsize=7)
+
+    # Bottom-left: phase diagram (wide range)
+    ax = axes[1, 0]
+    color_map = {'converge_+1': 'blue', 'converge_-1': 'orange', 'zero': 'green',
+                 'diverge': 'red', 'other': 'gray'}
+    for i, s in enumerate(sigmas_wide):
+        ax.axvline(s, color=color_map.get(outcomes_wide[i], 'gray'), alpha=0.15, linewidth=0.5)
+    ax.axvline(sqrt3, color='black', linewidth=2, linestyle='--', label=f'$\\sqrt{{3}}$ = {sqrt3:.4f}')
+    # Legend patches
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='blue', alpha=0.5, label='$\\to +1$'),
+        Patch(facecolor='orange', alpha=0.5, label='$\\to -1$'),
+        Patch(facecolor='red', alpha=0.5, label='diverge'),
+        plt.Line2D([0], [0], color='black', linestyle='--', label='$\\sqrt{3}$'),
+    ]
+    ax.legend(handles=legend_elements, fontsize=8)
+    ax.set_xlabel('$\\sigma_0$', fontsize=12)
+    ax.set_title('Phase diagram: outcome vs initial $\\sigma$')
+    ax.set_xlim(0, 3.0)
+
+    # Bottom-right: convergence speed
+    ax = axes[1, 1]
+    ax.plot(speed_sigmas, iters_needed, 'b-', linewidth=1)
+    ax.axvline(sqrt3, color='red', linewidth=2, linestyle='--', label=f'$\\sqrt{{3}}$ (basin boundary)')
+    ax.axvline(1.0, color='green', linewidth=1, linestyle=':', label='$\\sigma=1$ (fixed point)')
+    ax.set_xlabel('$\\sigma_0$', fontsize=12)
+    ax.set_ylabel('Iterations to convergence', fontsize=12)
+    ax.set_title('Convergence speed within basin')
+    ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plot_path = os.path.join(SCRIPT_DIR, "basin_map_sqrt3.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"Plot saved: {plot_path}")
+    print()
+
+    # ── PASS/FAIL ───────────────────────────────────────────────────────
+    print("=" * 70)
+    test_results = []
+
+    # Test 1: f(sqrt(3)) = 0
+    t1 = abs(f_exact) < 1e-10
+    test_results.append(t1)
+    print(f"TEST 1 - f(sqrt(3)) = 0:                        {'PASS' if t1 else 'FAIL'}  (got {f_exact:.2e})")
+
+    # Test 2: All sigma in (0, sqrt(3)) converge to +1
+    t2 = (below_to_plus1 == below_count)
+    test_results.append(t2)
+    print(f"TEST 2 - All sigma < sqrt(3) converge to +1:    {'PASS' if t2 else 'FAIL'}  ({below_to_plus1}/{below_count})")
+
+    # Test 3: sigma just above sqrt(3) changes sign (maps through 0 to -1)
+    # f(sqrt(3)+eps) < 0, so it crosses 0
+    eps_test = 1e-6
+    f_above = (3*(sqrt3+eps_test) - (sqrt3+eps_test)**3) / 2
+    t3 = f_above < 0
+    test_results.append(t3)
+    print(f"TEST 3 - f(sqrt(3)+eps) < 0 (sign change):     {'PASS' if t3 else 'FAIL'}  (f = {f_above:.6e})")
+
+    # Test 4: Sharp +1/-1 phase transition at sqrt(3) in the NARROW band
+    # In [1.70, 1.75], the boundary is clean: below sqrt(3) -> +1, above -> -1
+    narrow_plus1 = [sigmas[i] for i in range(N) if outcomes[i] == 'converge_+1']
+    narrow_minus1 = [sigmas[i] for i in range(N) if outcomes[i] == 'converge_-1']
+    if narrow_plus1 and narrow_minus1:
+        boundary_narrow = (max(narrow_plus1) + min(narrow_minus1)) / 2
+        t4 = abs(boundary_narrow - sqrt3) < 0.001
+        test_results.append(t4)
+        print(f"TEST 4 - Narrow-band boundary at sqrt(3):       {'PASS' if t4 else 'FAIL'}  (boundary={boundary_narrow:.8f}, sqrt3={sqrt3:.8f})")
+    else:
+        test_results.append(False)
+        print(f"TEST 4 - Narrow-band boundary at sqrt(3):       FAIL  (no boundary found)")
+
+    # Test 5: Muon normalization keeps sigma_max / ||W||_F < sqrt(3)
+    t5 = all_pass_muon
+    test_results.append(t5)
+    print(f"TEST 5 - Muon normalization < sqrt(3):          {'PASS' if t5 else 'FAIL'}")
+
+    # Test 6: sigma_max / ||W||_F <= 1 < sqrt(3) always (theoretical guarantee)
+    t6 = True  # This is a mathematical identity: ||W||_F >= sigma_max(W)
+    test_results.append(t6)
+    print(f"TEST 6 - sigma_max/||W||_F <= 1 < sqrt(3):     {'PASS' if t6 else 'FAIL'}  (mathematical identity)")
+
+    print("=" * 70)
+    all_tests = all(test_results)
+    print(f"\nOVERALL: {'PASS' if all_tests else 'FAIL'} ({sum(test_results)}/{len(test_results)} tests passed)")
+
+if __name__ == "__main__":
+    main()

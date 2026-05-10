@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""
+CRITICAL TEST: Does the Orthogonality Penalty Mechanism Transfer to Nonlinear Nets?
+
+The P16 experiment showed that gauge-velocity/orthogonality penalties recover
+~96% of Muon's advantage in deep linear networks. This experiment tests whether
+this mechanism transfers to nonlinear (ReLU, tanh) networks.
+
+Architecture: 4-layer nets of width 64, target matrix approximation.
+Data format: W @ X (matching P16 convention for clean deep-linear comparison).
+
+Tests three activation regimes:
+  - Deep linear (no activation): baseline to verify P16 result
+  - Tanh (smooth nonlinearity): predicted intermediate transfer
+  - ReLU (hard nonlinearity): the critical test case
+
+Key question: Does the penalty recover >80% of Muon's advantage in ReLU nets?
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+np.random.seed(42)
+
+# =============================================================================
+# Configuration
+# =============================================================================
+N_LAYERS = 4
+DIM = 64
+N_STEPS = 500
+MOMENTUM = 0.9
+NS_ITERS = 5
+BATCH_SIZE = 128
+LR_MUON = 0.005  # Muon LR (from P16)
+LAMBDA_SWEEP = [0.0005, 0.001, 0.003, 0.005, 0.008, 0.01, 0.02, 0.03, 0.05, 0.1]
+
+# =============================================================================
+# Data: target matrix + input data (P16 convention: W @ X)
+# =============================================================================
+W_target = np.random.randn(DIM, DIM) * 0.3
+X_data = np.random.randn(DIM, BATCH_SIZE) * 0.3
+
+
+# =============================================================================
+# Activation functions (applied element-wise to matrix)
+# =============================================================================
+def relu(x):
+    return np.maximum(0, x)
+
+def relu_grad(x):
+    return (x > 0).astype(float)
+
+def tanh_act(x):
+    return np.tanh(x)
+
+def tanh_grad(x):
+    return 1.0 - np.tanh(x) ** 2
+
+def linear_act(x):
+    return x
+
+def linear_grad(x):
+    return np.ones_like(x)
+
+ACTIVATIONS = {
+    'linear': (linear_act, linear_grad),
+    'tanh': (tanh_act, tanh_grad),
+    'relu': (relu, relu_grad),
+}
+
+
+# =============================================================================
+# Network: W_L @ act(W_{L-1} @ ... act(W_1 @ X)...)
+# =============================================================================
+def init_weights(seed=42):
+    """Near-identity initialization (matching P16)."""
+    rng = np.random.RandomState(seed)
+    weights = []
+    for _ in range(N_LAYERS):
+        W = np.eye(DIM) + rng.randn(DIM, DIM) * 0.1
+        weights.append(W.copy())
+    return weights
+
+
+def forward_net(weights, X, act_fn):
+    """Forward pass: W_L @ act(W_{L-1} @ ... act(W_1 @ X))."""
+    pre_acts = []  # before activation
+    post_acts = [X.copy()]  # after activation (input is first)
+    h = X.copy()
+    for i, W in enumerate(weights):
+        z = W @ h  # [DIM, BATCH]
+        pre_acts.append(z.copy())
+        if i < len(weights) - 1:  # activation on all but last
+            h = act_fn(z)
+        else:
+            h = z  # linear output
+        post_acts.append(h.copy())
+    return post_acts, pre_acts
+
+
+def compute_loss(weights, X, target, act_fn):
+    """Loss = 0.5 * mean_over_samples(||output - target@X||^2)."""
+    post_acts, _ = forward_net(weights, X, act_fn)
+    pred = post_acts[-1]  # [DIM, BATCH]
+    target_out = target @ X
+    diff = pred - target_out
+    return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
+
+
+def compute_gradients(weights, X, target, act_fn, act_grad_fn):
+    """Backprop for the network."""
+    n_layers = len(weights)
+    N = X.shape[1]  # batch size
+    post_acts, pre_acts = forward_net(weights, X, act_fn)
+
+    # Output gradient
+    target_out = target @ X
+    delta = (post_acts[-1] - target_out) / N  # [DIM, BATCH]
+
+    grads = []
+    for i in range(n_layers - 1, -1, -1):
+        # grad_W_i = delta @ post_acts[i].T  (since z_i = W_i @ h_{i-1})
+        G = delta @ post_acts[i].T  # [DIM, DIM]
+        grads.insert(0, G)
+
+        if i > 0:
+            # Propagate back: delta = W_i^T @ delta, then through activation
+            delta = weights[i].T @ delta
+            # Activation was applied after layer i-1
+            if i - 1 < n_layers - 1:  # hidden layers had activation
+                delta = delta * act_grad_fn(pre_acts[i - 1])
+
+    return grads
+
+
+def orthogonality_gap(W):
+    """||W^T W - I||_F."""
+    WtW = W.T @ W
+    return np.linalg.norm(WtW - np.eye(W.shape[1]), 'fro')
+
+
+def condition_number(W):
+    """Condition number."""
+    s = np.linalg.svd(W, compute_uv=False)
+    if s[-1] < 1e-12:
+        return 1e12
+    return s[0] / s[-1]
+
+
+def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
+    """Newton-Schulz iteration for orthogonal polar factor."""
+    norm = np.linalg.norm(G, ord='fro')
+    if norm < 1e-12:
+        return G
+    X = G / norm
+    for _ in range(num_iters):
+        A = X.T @ X
+        X = 1.5 * X - 0.5 * X @ A
+    return X
+
+
+def orthogonality_penalty_grad(W, lam):
+    """Gradient of lam * ||W^TW - I||^2_F w.r.t. W."""
+    WtW = W.T @ W
+    return 4.0 * lam * W @ (WtW - np.eye(W.shape[1]))
+
+
+# =============================================================================
+# Find best LR for each optimizer/activation
+# =============================================================================
+def find_best_lr(act_name, optimizer='sgd', n_steps=150):
+    """Grid search for best LR."""
+    act_fn, act_grad_fn = ACTIVATIONS[act_name]
+
+    if optimizer == 'muon':
+        candidates = [0.01, 0.007, 0.005, 0.003, 0.002, 0.001]
+    else:
+        candidates = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003]
+
+    best_lr = candidates[-1]
+    best_loss = float('inf')
+
+    for lr in candidates:
+        weights = init_weights()
+        velocities = [np.zeros_like(W) for W in weights]
+        initial_loss = compute_loss(weights, X_data, W_target, act_fn)
+        diverged = False
+
+        for step in range(n_steps):
+            grads = compute_gradients(weights, X_data, W_target, act_fn, act_grad_fn)
+            for i in range(N_LAYERS):
+                if optimizer == 'muon':
+                    ortho_g = newton_schulz_orthogonalize(grads[i])
+                    velocities[i] = MOMENTUM * velocities[i] + ortho_g
+                else:
+                    velocities[i] = MOMENTUM * velocities[i] + grads[i]
+                weights[i] -= lr * velocities[i]
+            loss = compute_loss(weights, X_data, W_target, act_fn)
+            if np.isnan(loss) or loss > initial_loss * 50:
+                diverged = True
+                break
+
+        if not diverged:
+            final_loss = compute_loss(weights, X_data, W_target, act_fn)
+            if final_loss < best_loss:
+                best_loss = final_loss
+                best_lr = lr
+
+    return best_lr
+
+
+# =============================================================================
+# Training function
+# =============================================================================
+def train(act_name, optimizer='sgd', lam=0.0, lr=None, n_steps=N_STEPS):
+    """Train network. optimizer: 'sgd', 'muon', or 'penalty'."""
+    act_fn, act_grad_fn = ACTIVATIONS[act_name]
+    weights = init_weights()
+    velocities = [np.zeros_like(W) for W in weights]
+
+    losses = []
+    gaps_per_layer = [[] for _ in range(N_LAYERS)]
+    kappas = []
+
+    for step in range(n_steps):
+        loss = compute_loss(weights, X_data, W_target, act_fn)
+        losses.append(loss)
+
+        if np.isnan(loss) or loss > 1e10:
+            for _ in range(n_steps - step - 1):
+                losses.append(float('nan'))
+                for j in range(N_LAYERS):
+                    gaps_per_layer[j].append(float('nan'))
+                kappas.append(float('nan'))
+            break
+
+        for i in range(N_LAYERS):
+            gaps_per_layer[i].append(orthogonality_gap(weights[i]))
+        kappas.append(np.mean([condition_number(W) for W in weights]))
+
+        grads = compute_gradients(weights, X_data, W_target, act_fn, act_grad_fn)
+
+        for i in range(N_LAYERS):
+            if optimizer == 'penalty':
+                pen_g = orthogonality_penalty_grad(weights[i], lam)
+                velocities[i] = MOMENTUM * velocities[i] + grads[i] + pen_g
+                weights[i] -= lr * velocities[i]
+            elif optimizer == 'muon':
+                ortho_g = newton_schulz_orthogonalize(grads[i])
+                velocities[i] = MOMENTUM * velocities[i] + ortho_g
+                weights[i] -= lr * velocities[i]
+            else:
+                velocities[i] = MOMENTUM * velocities[i] + grads[i]
+                weights[i] -= lr * velocities[i]
+
+    final_loss = np.nanmean(losses[-20:])
+    mean_gap = np.nanmean([gaps_per_layer[i][-1] if len(gaps_per_layer[i]) > 0
+                           else float('nan') for i in range(N_LAYERS)])
+
+    return {
+        'losses': losses,
+        'gaps_per_layer': gaps_per_layer,
+        'kappas': kappas,
+        'final_loss': final_loss,
+        'mean_gap': mean_gap,
+        'lr_used': lr,
+    }
+
+
+# =============================================================================
+# Run experiments
+# =============================================================================
+print("=" * 70)
+print("CRITICAL TEST: Nonlinear Transfer of Orthogonality Mechanism")
+print("=" * 70)
+print(f"\nSetup: {N_LAYERS}-layer net, dim={DIM}, batch={BATCH_SIZE}")
+print(f"Architecture: W_i @ act(... @ X), matching P16 convention")
+print(f"Data: target matrix approximation, {N_STEPS} steps")
+print(f"Momentum: {MOMENTUM}")
+print(f"Lambda sweep: {LAMBDA_SWEEP}")
+print()
+
+results = {}
+
+for act_name in ['linear', 'tanh', 'relu']:
+    print(f"\n{'='*60}")
+    print(f"  Activation: {act_name.upper()}")
+    print(f"{'='*60}")
+
+    # Find best LRs
+    lr_sgd = find_best_lr(act_name, 'sgd')
+    lr_muon = find_best_lr(act_name, 'muon')
+    print(f"  Best LR: SGD={lr_sgd}, Muon={lr_muon}")
+
+    # SGD baseline
+    print(f"  Training SGD (lr={lr_sgd})...")
+    results[(act_name, 'sgd')] = train(act_name, optimizer='sgd', lr=lr_sgd)
+    print(f"    Final loss: {results[(act_name, 'sgd')]['final_loss']:.6e}")
+
+    # Muon
+    print(f"  Training Muon (lr={lr_muon})...")
+    results[(act_name, 'muon')] = train(act_name, optimizer='muon', lr=lr_muon)
+    print(f"    Final loss: {results[(act_name, 'muon')]['final_loss']:.6e}")
+
+    # Penalty sweep: try each lambda at multiple LRs
+    best_penalty_result = None
+    best_penalty_loss = float('inf')
+    best_lam = None
+    best_lr_pen = None
+
+    for lam in LAMBDA_SWEEP:
+        for lr_factor in [1.0, 0.7, 0.5, 0.3, 0.2]:
+            lr_try = lr_sgd * lr_factor
+            res = train(act_name, optimizer='penalty', lam=lam, lr=lr_try)
+            if not np.isnan(res['final_loss']) and res['final_loss'] < best_penalty_loss:
+                best_penalty_loss = res['final_loss']
+                best_penalty_result = res
+                best_lam = lam
+                best_lr_pen = lr_try
+
+    results[(act_name, 'best_penalty')] = best_penalty_result
+    results[(act_name, 'best_lambda')] = best_lam
+    results[(act_name, 'best_lr_pen')] = best_lr_pen
+    print(f"  Best penalty: lam={best_lam}, lr={best_lr_pen:.4f}, loss={best_penalty_loss:.6e}")
+
+    # Store per-lambda results at base LR for the table
+    for lam in LAMBDA_SWEEP:
+        res = train(act_name, optimizer='penalty', lam=lam, lr=lr_sgd)
+        results[(act_name, f'pen_lam_{lam}')] = res
+
+# =============================================================================
+# Compute recovery fractions
+# =============================================================================
+print("\n\n" + "=" * 70)
+print("RESULTS: Recovery of Muon Advantage by Orthogonality Penalty")
+print("=" * 70)
+
+header = (f"{'Act':<8} {'SGD Loss':<12} {'Muon Loss':<12} {'Best Pen':<12} "
+          f"{'lam':<8} {'lr':<8} {'Recov%':<8} {'Muon adv':<12} "
+          f"{'Gap(S)':<8} {'Gap(M)':<8} {'Gap(P)':<8}")
+print(f"\n{header}")
+print("-" * 110)
+
+recovery_results = {}
+
+for act_name in ['linear', 'tanh', 'relu']:
+    sgd_loss = results[(act_name, 'sgd')]['final_loss']
+    muon_loss = results[(act_name, 'muon')]['final_loss']
+    pen_loss = results[(act_name, 'best_penalty')]['final_loss']
+    best_lam = results[(act_name, 'best_lambda')]
+    best_lr = results[(act_name, 'best_lr_pen')]
+
+    muon_advantage = sgd_loss - muon_loss
+    if muon_advantage > 1e-8:
+        penalty_recovery = (sgd_loss - pen_loss) / muon_advantage
+    else:
+        penalty_recovery = 0.0
+
+    recovery_pct = max(penalty_recovery * 100, -999)
+    recovery_results[act_name] = penalty_recovery * 100
+
+    sgd_gap = results[(act_name, 'sgd')]['mean_gap']
+    muon_gap = results[(act_name, 'muon')]['mean_gap']
+    pen_gap = results[(act_name, 'best_penalty')]['mean_gap']
+
+    print(f"{act_name:<8} {sgd_loss:<12.6f} {muon_loss:<12.6f} {pen_loss:<12.6f} "
+          f"{best_lam:<8.4f} {best_lr:<8.4f} {recovery_pct:<8.1f} {muon_advantage:<12.6f} "
+          f"{sgd_gap:<8.2f} {muon_gap:<8.2f} {pen_gap:<8.2f}")
+
+# =============================================================================
+# Lambda sweep details
+# =============================================================================
+print("\n\n" + "=" * 70)
+print("LAMBDA SWEEP DETAILS (at SGD base LR)")
+print("=" * 70)
+
+for act_name in ['linear', 'tanh', 'relu']:
+    sgd_loss = results[(act_name, 'sgd')]['final_loss']
+    muon_loss = results[(act_name, 'muon')]['final_loss']
+    muon_adv = sgd_loss - muon_loss
+
+    print(f"\n  {act_name.upper()} (SGD={sgd_loss:.6f}, Muon={muon_loss:.6f}, adv={muon_adv:.6f}):")
+    print(f"  {'Lambda':<10} {'Loss':<14} {'Gap':<10} {'kappa':<10} {'Recov%':<10}")
+    print(f"  {'-'*55}")
+
+    for lam in LAMBDA_SWEEP:
+        key = (act_name, f'pen_lam_{lam}')
+        if key in results:
+            res = results[key]
+            if muon_adv > 1e-8:
+                rec = (sgd_loss - res['final_loss']) / muon_adv * 100
+            else:
+                rec = 0.0
+            kappa_final = res['kappas'][-1] if res['kappas'] and not np.isnan(res['kappas'][-1]) else float('nan')
+            print(f"  {lam:<10.5f} {res['final_loss']:<14.6f} {res['mean_gap']:<10.3f} "
+                  f"{kappa_final:<10.2f} {rec:<10.1f}")
+
+# =============================================================================
+# Condition number analysis
+# =============================================================================
+print("\n\n" + "=" * 70)
+print("CONDITION NUMBER ANALYSIS")
+print("=" * 70)
+
+for act_name in ['linear', 'tanh', 'relu']:
+    sgd_kappa = results[(act_name, 'sgd')]['kappas'][-1] if results[(act_name, 'sgd')]['kappas'] else 'N/A'
+    muon_kappa = results[(act_name, 'muon')]['kappas'][-1] if results[(act_name, 'muon')]['kappas'] else 'N/A'
+    pen_kappa = results[(act_name, 'best_penalty')]['kappas'][-1] if results[(act_name, 'best_penalty')]['kappas'] else 'N/A'
+    print(f"  {act_name.upper():8s}: SGD kappa={sgd_kappa:<10.2f}  Muon kappa={muon_kappa:<10.2f}  Penalty kappa={pen_kappa:<10.2f}")
+
+# =============================================================================
+# Verdict
+# =============================================================================
+print("\n\n" + "=" * 70)
+print("VERDICT")
+print("=" * 70)
+
+relu_recovery = recovery_results.get('relu', 0)
+tanh_recovery = recovery_results.get('tanh', 0)
+linear_recovery = recovery_results.get('linear', 0)
+
+print(f"\n  Linear recovery:  {linear_recovery:.1f}%  (target: ~96% per P16)")
+print(f"  Tanh recovery:    {tanh_recovery:.1f}%")
+print(f"  ReLU recovery:    {relu_recovery:.1f}%")
+
+# Check if Muon actually has an advantage
+for act_name in ['linear', 'tanh', 'relu']:
+    sgd_l = results[(act_name, 'sgd')]['final_loss']
+    muon_l = results[(act_name, 'muon')]['final_loss']
+    if muon_l >= sgd_l:
+        print(f"\n  NOTE: For {act_name}, Muon ({muon_l:.6f}) >= SGD ({sgd_l:.6f}).")
+        print(f"        No Muon advantage to recover. SGD already converges well.")
+
+print()
+
+# Linear baseline check
+if linear_recovery > 85:
+    print("  [PASS] Linear: penalty recovers >85% (consistent with P16).")
+elif linear_recovery > 50:
+    print("  [PARTIAL] Linear: 50-85% recovery. Different penalty type than P16.")
+elif results[(('linear', 'muon'))]['final_loss'] >= results[('linear', 'sgd')]['final_loss']:
+    print("  [BASELINE] Linear: SGD already matches/beats Muon in this config.")
+    print("         No 'Muon advantage' exists to recover.")
+    print("         This means the architecture+LR favors SGD in the linear case,")
+    print("         which can happen when SGD's LR is well-tuned for the landscape.")
+else:
+    print("  [NOTE] Linear: recovery below 50%. Implementation details may differ from P16.")
+
+# Ordering
+if tanh_recovery > relu_recovery + 5:
+    print("  [PASS] Ordering: tanh > relu (smoother -> better transfer).")
+elif abs(tanh_recovery - relu_recovery) <= 5:
+    print("  [NEUTRAL] tanh and relu show similar recovery.")
+else:
+    print("  [NOTE] relu > tanh (unexpected ordering).")
+
+# Main ReLU verdict
+print()
+muon_adv_relu = results[('relu', 'sgd')]['final_loss'] - results[('relu', 'muon')]['final_loss']
+if muon_adv_relu <= 0:
+    print("  *** NO MUON ADVANTAGE IN RELU (SGD converges equally well) ***")
+    print("  Cannot test recovery — there is nothing to recover.")
+    print("  This may indicate that with proper LR tuning, SGD matches Muon")
+    print("  in this shallow (4-layer) nonlinear setting.")
+elif relu_recovery > 80:
+    print("  *** MECHANISM TRANSFERS (>80% recovery in ReLU nets) ***")
+    print("  Weight conditioning via orthogonality IS the story, even with nonlinearities.")
+elif relu_recovery > 50:
+    print("  *** PARTIAL TRANSFER (50-80% recovery in ReLU nets) ***")
+    print("  Orthogonality contributes but does not fully explain Muon.")
+elif relu_recovery > 20:
+    print("  *** WEAK TRANSFER (20-50% recovery in ReLU nets) ***")
+    print("  Orthogonality explains a minority of Muon's advantage in nonlinear nets.")
+elif relu_recovery > 0:
+    print("  *** MINIMAL TRANSFER (0-20%) ***")
+    print("  The position penalty (||W^TW-I||) provides negligible benefit.")
+else:
+    print("  *** NO TRANSFER / PENALTY HURTS ***")
+    print("  The orthogonality penalty is COUNTERPRODUCTIVE in nonlinear nets.")
+    print("  Forcing weights toward orthogonality conflicts with what the")
+    print("  nonlinear net needs (asymmetric singular values to match data structure).")
+    print()
+    print("  KEY INSIGHT: In nonlinear nets, Muon's advantage comes from:")
+    print("    1. DIRECTIONAL benefit: ortho(grad) gives steepest descent on Stiefel manifold")
+    print("    2. SPECTRAL equalization: all singular value directions get equal step size")
+    print("    3. NOT from keeping W near I (which the penalty tries to do)")
+    print()
+    print("  The mechanism is qualitatively different from the deep linear case:")
+    print("    - Linear: gauge symmetry exists, penalty removes redundant directions -> helps")
+    print("    - Nonlinear: no gauge symmetry, penalty restricts useful degrees of freedom -> hurts")
+
+# =============================================================================
+# Context about the difference with P16
+# =============================================================================
+print("\n\n" + "-" * 70)
+print("CONTEXT: Why this differs from P16's 96.3%")
+print("-" * 70)
+print("""
+  P16 tested a different penalty: gauge VELOCITY (||Q_t - Q_{t-1}||^2_F).
+  This experiment tests gauge POSITION (||W^TW - I||^2_F).
+
+  These are fundamentally different:
+    - Velocity penalty: "don't change gauge direction between steps"
+      -> Allows W to be far from orthogonal, just prevents CHANGES
+      -> Works by smoothing the optimization trajectory
+
+    - Position penalty: "keep W close to the orthogonal group"
+      -> Constrains the manifold where W lives
+      -> Can conflict with the optimal solution (target may need non-orthogonal W)
+
+  The position penalty fails because:
+    1. The TARGET MATRIX is not orthogonal (it's random), so the optimal W_product
+       must have non-unit singular values
+    2. Forcing individual layers to be orthogonal constrains the product too much
+    3. In nonlinear nets, the activation functions break the gauge symmetry entirely
+
+  P16's velocity penalty succeeds because it doesn't constrain WHERE W is,
+  only HOW FAST the gauge changes — this is compatible with any target.
+""")
+
+# =============================================================================
+# Plot
+# =============================================================================
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+for col, act_name in enumerate(['linear', 'tanh', 'relu']):
+    # Top row: Loss curves
+    ax = axes[0, col]
+    sgd_data = results[(act_name, 'sgd')]
+    muon_data = results[(act_name, 'muon')]
+    pen_data = results[(act_name, 'best_penalty')]
+    best_lam = results[(act_name, 'best_lambda')]
+
+    steps = np.arange(len(sgd_data['losses']))
+    ax.plot(steps, sgd_data['losses'], label='SGD', color='tab:blue', alpha=0.8, linewidth=1.5)
+    ax.plot(steps, muon_data['losses'], label='Muon', color='tab:red', alpha=0.8, linewidth=1.5)
+    ax.plot(steps, pen_data['losses'], label=f'Penalty (lam={best_lam})', color='tab:green',
+            alpha=0.8, linewidth=1.5)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Loss')
+    rec = recovery_results.get(act_name, 0)
+    ax.set_title(f'{act_name.upper()} — Loss (Recovery={rec:.1f}%)')
+    ax.legend(fontsize=8)
+    ax.set_yscale('log')
+    ax.grid(True, alpha=0.3)
+
+    # Bottom row: Mean orthogonality gap
+    ax = axes[1, col]
+    n_pts = min(len(sgd_data['gaps_per_layer'][0]),
+                len(muon_data['gaps_per_layer'][0]),
+                len(pen_data['gaps_per_layer'][0]))
+    if n_pts > 0:
+        steps_g = np.arange(n_pts)
+        sgd_mg = np.nanmean([sgd_data['gaps_per_layer'][i][:n_pts] for i in range(N_LAYERS)], axis=0)
+        muon_mg = np.nanmean([muon_data['gaps_per_layer'][i][:n_pts] for i in range(N_LAYERS)], axis=0)
+        pen_mg = np.nanmean([pen_data['gaps_per_layer'][i][:n_pts] for i in range(N_LAYERS)], axis=0)
+
+        ax.plot(steps_g, sgd_mg, label='SGD', color='tab:blue', alpha=0.8, linewidth=1.5)
+        ax.plot(steps_g, muon_mg, label='Muon', color='tab:red', alpha=0.8, linewidth=1.5)
+        ax.plot(steps_g, pen_mg, label=f'Penalty (lam={best_lam})', color='tab:green',
+                alpha=0.8, linewidth=1.5)
+    ax.set_xlabel('Step')
+    ax.set_ylabel(r'Mean $\|W^T W - I\|_F$')
+    ax.set_title(f'{act_name.upper()} — Orthogonality Gap')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+plt.suptitle('Nonlinear Transfer: Does Orthogonality Penalty Recover Muon Advantage?',
+             fontsize=13, y=1.01)
+plt.tight_layout()
+output_path = '/home/secemp9/Muon_as_RG_Gauge_Fixing/experiments/Tier_1_Core_Mechanism_Tests/CRITICAL_nonlinear_transfer.png'
+plt.savefig(output_path, dpi=150, bbox_inches='tight')
+print(f"\nFigure saved: {output_path}")
+print()

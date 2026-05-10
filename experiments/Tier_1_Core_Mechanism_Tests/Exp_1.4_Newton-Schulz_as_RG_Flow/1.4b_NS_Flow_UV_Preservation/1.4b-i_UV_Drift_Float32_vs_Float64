@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""
+Experiment 1.4b-i: UV Drift -- Float32 vs Float64
+
+The NS iteration preserves UV directions exactly in exact arithmetic.
+In finite precision, floating-point errors cause the UV direction to drift.
+
+This experiment:
+1. Runs NS iteration in float32 and float64
+2. Measures ||U_k V_k^T - U_0 V_0^T||_F at each step
+3. Tests matrix sizes: 4x4, 16x16, 64x64, 256x256
+4. Compares how much precision affects UV drift
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def ns_iteration_with_tracking(W, n_iters=20, dtype=np.float64):
+    """
+    Run cubic NS iteration: X_{k+1} = X_k (3I - X_k^T X_k) / 2
+    Track UV drift at each step.
+    """
+    # Compute ground truth UV direction from high-precision SVD
+    W_f64 = W.astype(np.float64)
+    U0, S0, Vt0 = np.linalg.svd(W_f64, full_matrices=False)
+    UV_true = U0 @ Vt0  # the polar factor
+
+    # Work in the specified dtype
+    X = W.astype(dtype)
+    n = X.shape[1]
+
+    uv_drifts = []
+    ortho_errors = []
+    sv_errors = []
+
+    for k in range(n_iters + 1):
+        # Compute current SVD (in float64 for measurement)
+        X_f64 = X.astype(np.float64)
+        try:
+            Uk, Sk, Vtk = np.linalg.svd(X_f64, full_matrices=False)
+            UV_k = Uk @ Vtk
+
+            # UV drift: ||UV_k - UV_0||_F
+            drift = np.linalg.norm(UV_k - UV_true, 'fro')
+            uv_drifts.append(drift)
+
+            # Orthogonality error: ||X^T X - I||_F
+            XtX = X_f64.T @ X_f64
+            ortho_err = np.linalg.norm(XtX - np.eye(n), 'fro')
+            ortho_errors.append(ortho_err)
+
+            # SV error: sum of |sigma_i - 1|
+            sv_err = np.sum(np.abs(Sk - 1.0))
+            sv_errors.append(sv_err)
+        except np.linalg.LinAlgError:
+            uv_drifts.append(float('nan'))
+            ortho_errors.append(float('nan'))
+            sv_errors.append(float('nan'))
+
+        if k < n_iters:
+            # NS step
+            XtX = X.T @ X
+            I = np.eye(n, dtype=dtype)
+            X = X @ (3 * I - XtX) / dtype(2.0)
+
+    return uv_drifts, ortho_errors, sv_errors
+
+def main():
+    np.random.seed(42)
+    print("=" * 70)
+    print("Experiment 1.4b-i: UV Drift -- Float32 vs Float64")
+    print("=" * 70)
+    print()
+
+    sizes = [(4, 4), (16, 16), (64, 64), (256, 256)]
+    n_iters = 20
+    dtypes = [np.float32, np.float64]
+    dtype_names = ['float32', 'float64']
+
+    all_results = {}
+
+    for (m, n) in sizes:
+        print(f"--- Matrix size: {m}x{n} ---")
+        W = np.random.randn(m, n)
+        # Normalize to ensure convergence
+        W = W / np.linalg.norm(W, 'fro')
+
+        results = {}
+        for dtype, dname in zip(dtypes, dtype_names):
+            uv_drifts, ortho_errors, sv_errors = ns_iteration_with_tracking(
+                W, n_iters=n_iters, dtype=dtype)
+            results[dname] = {
+                'uv_drift': uv_drifts,
+                'ortho_err': ortho_errors,
+                'sv_err': sv_errors
+            }
+
+            print(f"\n  {dname}:")
+            print(f"    {'Step':>4s}  {'UV drift':>12s}  {'Ortho err':>12s}  {'SV err':>12s}")
+            for step in [0, 1, 2, 3, 5, 10, 15, 20]:
+                if step < len(uv_drifts):
+                    print(f"    {step:>4d}  {uv_drifts[step]:12.6e}  {ortho_errors[step]:12.6e}  {sv_errors[step]:12.6e}")
+
+        # Compare final drifts
+        drift32 = results['float32']['uv_drift'][-1]
+        drift64 = results['float64']['uv_drift'][-1]
+        if drift64 > 0:
+            ratio = drift32 / drift64
+        else:
+            ratio = float('inf')
+        print(f"\n  Final UV drift ratio (f32/f64): {ratio:.1f}x")
+        print()
+        all_results[(m, n)] = results
+
+    # ── Summary table ───────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("SUMMARY: Final UV drift after 20 NS iterations")
+    print("=" * 70)
+    print(f"  {'Size':>8s}  {'float32 drift':>14s}  {'float64 drift':>14s}  {'ratio (32/64)':>14s}")
+    for (m, n) in sizes:
+        d32 = all_results[(m, n)]['float32']['uv_drift'][-1]
+        d64 = all_results[(m, n)]['float64']['uv_drift'][-1]
+        ratio = d32 / d64 if d64 > 0 else float('inf')
+        print(f"  {m:>3d}x{n:<3d}   {d32:14.6e}  {d64:14.6e}  {ratio:14.1f}x")
+    print()
+
+    # ── Summary: orthogonality convergence ──────────────────────────────
+    print("SUMMARY: Orthogonality error ||X^TX - I||_F convergence")
+    print(f"  {'Size':>8s}  {'f32 @step5':>12s}  {'f64 @step5':>12s}  {'f32 @step10':>12s}  {'f64 @step10':>12s}")
+    for (m, n) in sizes:
+        o32_5 = all_results[(m, n)]['float32']['ortho_err'][5]
+        o64_5 = all_results[(m, n)]['float64']['ortho_err'][5]
+        o32_10 = all_results[(m, n)]['float32']['ortho_err'][10]
+        o64_10 = all_results[(m, n)]['float64']['ortho_err'][10]
+        print(f"  {m:>3d}x{n:<3d}   {o32_5:12.6e}  {o64_5:12.6e}  {o32_10:12.6e}  {o64_10:12.6e}")
+    print()
+
+    # ── Plot ────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Exp 1.4b-i: UV Drift -- Float32 vs Float64", fontsize=14, fontweight='bold')
+
+    for idx, (m, n) in enumerate(sizes):
+        ax = axes[idx // 2, idx % 2]
+        results = all_results[(m, n)]
+
+        steps = range(n_iters + 1)
+        for dname, style in [('float32', 'o-'), ('float64', 's--')]:
+            drifts = results[dname]['uv_drift']
+            # Replace 0 with tiny value for log scale
+            drifts_plot = [max(d, 1e-17) for d in drifts]
+            ax.semilogy(steps, drifts_plot, style, markersize=3, linewidth=1.5,
+                       label=f'{dname}')
+
+        ax.set_xlabel('NS iteration', fontsize=10)
+        ax.set_ylabel('UV drift $||U_kV_k^T - U_0V_0^T||_F$', fontsize=10)
+        ax.set_title(f'{m}x{n}', fontsize=12)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(SCRIPT_DIR, "uv_drift_float32_vs_float64.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"Plot saved: {plot_path}")
+    print()
+
+    # ── Additional plot: orthogonality convergence ──────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Orthogonality Error Convergence: Float32 vs Float64", fontsize=14, fontweight='bold')
+
+    for idx, (m, n) in enumerate(sizes):
+        ax = axes[idx // 2, idx % 2]
+        results = all_results[(m, n)]
+
+        steps = range(n_iters + 1)
+        for dname, style in [('float32', 'o-'), ('float64', 's--')]:
+            errs = results[dname]['ortho_err']
+            errs_plot = [max(e, 1e-17) for e in errs]
+            ax.semilogy(steps, errs_plot, style, markersize=3, linewidth=1.5,
+                       label=f'{dname}')
+
+        ax.set_xlabel('NS iteration', fontsize=10)
+        ax.set_ylabel('$||X^TX - I||_F$', fontsize=10)
+        ax.set_title(f'{m}x{n}', fontsize=12)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path2 = os.path.join(SCRIPT_DIR, "ortho_convergence_float32_vs_float64.png")
+    plt.savefig(plot_path2, dpi=150)
+    plt.close()
+    print(f"Plot saved: {plot_path2}")
+    print()
+
+    # ── PASS/FAIL ───────────────────────────────────────────────────────
+    print("=" * 70)
+    test_results = []
+
+    # Test 1: UV drift in float64 is negligible (< 1e-10) for all sizes
+    max_drift_64 = max(all_results[(m, n)]['float64']['uv_drift'][-1] for (m, n) in sizes)
+    t1 = max_drift_64 < 1e-10
+    test_results.append(t1)
+    print(f"TEST 1 - Float64 UV drift negligible:          {'PASS' if t1 else 'FAIL'}  (max: {max_drift_64:.2e})")
+
+    # Test 2: Float32 drift is significantly larger than float64
+    all_ratios = []
+    for (m, n) in sizes:
+        d32 = all_results[(m, n)]['float32']['uv_drift'][-1]
+        d64 = all_results[(m, n)]['float64']['uv_drift'][-1]
+        if d64 > 0:
+            all_ratios.append(d32 / d64)
+    min_ratio = min(all_ratios) if all_ratios else 0
+    t2 = min_ratio > 10  # float32 should be at least 10x worse
+    test_results.append(t2)
+    print(f"TEST 2 - Float32 drift >> Float64 drift:       {'PASS' if t2 else 'FAIL'}  (min ratio: {min_ratio:.0f}x)")
+
+    # Test 3: Both precisions converge TOWARD orthogonal (ortho error strictly decreasing)
+    # Large matrices need more iterations to fully converge, so we check the trend
+    all_ortho_pass = True
+    for (m, n) in sizes:
+        for dname in dtype_names:
+            errs = all_results[(m, n)][dname]['ortho_err']
+            # Check that error at step 20 < error at step 0 (monotone decrease overall)
+            if errs[-1] >= errs[0]:
+                all_ortho_pass = False
+    t3 = all_ortho_pass
+    test_results.append(t3)
+    print(f"TEST 3 - Both converge toward orthogonal:      {'PASS' if t3 else 'FAIL'}")
+
+    # Test 4: UV drift does NOT grow with iteration (stays bounded)
+    all_bounded = True
+    for (m, n) in sizes:
+        drifts = all_results[(m, n)]['float32']['uv_drift']
+        # After initial convergence (step 5+), drift should not grow
+        if len(drifts) > 10:
+            late_drifts = drifts[5:]
+            if max(late_drifts) > 10 * min(d for d in late_drifts if d > 0):
+                all_bounded = False
+    t4 = all_bounded
+    test_results.append(t4)
+    print(f"TEST 4 - UV drift bounded (not growing):       {'PASS' if t4 else 'FAIL'}")
+
+    # Test 5: Larger matrices have larger absolute drift but similar relative drift
+    # (drift scales with sqrt(n) approximately due to more floating-point ops)
+    if len(sizes) >= 2:
+        drift_4 = all_results[sizes[0]]['float32']['uv_drift'][-1]
+        drift_256 = all_results[sizes[-1]]['float32']['uv_drift'][-1]
+        t5 = drift_256 > drift_4  # larger matrix = more drift
+        test_results.append(t5)
+        print(f"TEST 5 - Drift grows with matrix size:         {'PASS' if t5 else 'FAIL'}  ({drift_4:.2e} -> {drift_256:.2e})")
+    else:
+        test_results.append(True)
+        print(f"TEST 5 - Drift grows with matrix size:         SKIP")
+
+    print("=" * 70)
+    all_tests = all(test_results)
+    print(f"\nOVERALL: {'PASS' if all_tests else 'FAIL'} ({sum(test_results)}/{len(test_results)} tests passed)")
+
+if __name__ == "__main__":
+    main()

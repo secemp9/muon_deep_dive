@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.6a -- Von Neumann trace inequality: verify on 2x2 and 3x3
+
+Von Neumann's inequality states:
+    max_{||X||_op <= 1}  tr(A^T X)  =  sum of singular values of A  =  ||A||_*
+
+The maximizer is X* = U V^T (the polar factor of A), where A = U S V^T is
+the SVD.  This is the mathematical reason Muon is "steepest descent under
+the spectral norm": ortho(G) maximizes the first-order loss decrease
+    tr(G^T Delta)
+over all updates Delta with ||Delta||_op <= 1.
+
+We verify this concretely:
+  1. Pen-and-paper walkthrough on A = [[3,1],[0,2]] (same matrix as 0.1a)
+  2. Random 3x3 matrix with 100,000 random samples
+  3. Steepest descent interpretation: ortho(G) vs other update directions
+  4. Comparison of steepest descent under different norms (Frobenius, spectral,
+     element-wise infinity)
+  5. Why the spectral norm is the "right" norm for matrices
+  6. Rectangular matrices (5x3 and 3x5)
+  7. Statistical sweep across 200 random matrices at multiple sizes
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+def sep(title: str) -> None:
+    """Print a section separator."""
+    print(f"\n{'=' * 72}")
+    print(f"  {title}")
+    print(f"{'=' * 72}\n")
+
+
+def subsep(title: str) -> None:
+    """Print a subsection separator."""
+    print(f"\n  {'-' * 66}")
+    print(f"    {title}")
+    print(f"  {'-' * 66}\n")
+
+
+def mat(name: str, A: np.ndarray) -> None:
+    """Pretty-print a labelled matrix."""
+    rows, cols = A.shape
+    print(f"  {name}  (shape {rows}x{cols}):")
+    show_r = min(rows, 6)
+    show_c = min(cols, 6)
+    for i in range(show_r):
+        vals = "  ".join(f"{A[i, j]: .8f}" for j in range(show_c))
+        suffix = "  ..." if cols > show_c else ""
+        print(f"    [{vals}{suffix}]")
+    if rows > show_r:
+        print(f"    ... ({rows - show_r} more rows)")
+    print()
+
+
+def ortho(M: np.ndarray) -> np.ndarray:
+    """Compute the polar factor Q = U V^T via thin SVD."""
+    U, _s, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+
+def pf(ok: bool) -> str:
+    """Return PASS or FAIL string."""
+    return "PASS" if ok else "FAIL"
+
+
+# Global tracking
+all_pass = True
+total_checks = 0
+total_failures = 0
+
+
+def check(condition: bool, label: str) -> bool:
+    """Record a pass/fail check."""
+    global all_pass, total_checks, total_failures
+    total_checks += 1
+    if not condition:
+        all_pass = False
+        total_failures += 1
+    print(f"    [{pf(condition)}]  {label}")
+    return condition
+
+
+rng = np.random.default_rng(42)
+tol = 1e-10
+
+
+# ===================================================================
+#  SECTION 1 -- Concrete 2x2 walkthrough
+# ===================================================================
+
+sep("SECTION 1: Concrete 2x2 walkthrough -- A = [[3,1],[0,2]]")
+
+print("  Von Neumann's trace inequality states:")
+print("    max_{||X||_op <= 1}  tr(A^T X)  =  ||A||_*  =  sum of singular values")
+print()
+print("  The maximizer is X* = U V^T where A = U Sigma V^T is the SVD.")
+print("  This is the polar factor of A, i.e., ortho(A).")
+print()
+
+A = np.array([[3.0, 1.0],
+              [0.0, 2.0]])
+
+# Step 1: SVD
+print("STEP 1  Compute SVD of A")
+U, s, Vt = np.linalg.svd(A)
+mat("A", A)
+mat("U", U)
+print(f"  Singular values: sigma_1 = {s[0]:.8f}, sigma_2 = {s[1]:.8f}")
+mat("V^T", Vt)
+print()
+
+# Step 2: Nuclear norm
+nuc_norm = np.sum(s)
+print(f"STEP 2  Nuclear norm ||A||_* = sigma_1 + sigma_2 = {s[0]:.8f} + {s[1]:.8f} = {nuc_norm:.8f}")
+print()
+
+# Step 3: Compute X* = UV^T
+X_star = U @ Vt
+print("STEP 3  Compute the maximizer X* = U V^T = ortho(A)")
+mat("X* = U V^T", X_star)
+
+# Verify X* has operator norm 1
+sv_Xstar = np.linalg.svd(X_star, compute_uv=False)
+print(f"  Singular values of X*: {sv_Xstar}")
+print(f"  ||X*||_op = {sv_Xstar[0]:.12f}")
+check(abs(sv_Xstar[0] - 1.0) < tol, f"||X*||_op = 1  (deviation = {abs(sv_Xstar[0] - 1.0):.2e})")
+print()
+
+# Verify X* is orthogonal (for square case)
+orth_dev = np.max(np.abs(X_star.T @ X_star - np.eye(2)))
+print(f"  X* is orthogonal: ||X*^T X* - I|| = {orth_dev:.2e}")
+check(orth_dev < tol, "X* is orthogonal (square case)")
+print()
+
+# Step 4: Verify tr(A^T X*) = ||A||_*
+trace_val = np.trace(A.T @ X_star)
+print(f"STEP 4  Verify tr(A^T X*) = ||A||_*")
+print(f"  tr(A^T X*) = {trace_val:.12f}")
+print(f"  ||A||_*    = {nuc_norm:.12f}")
+print(f"  Difference = {abs(trace_val - nuc_norm):.2e}")
+check(abs(trace_val - nuc_norm) < tol,
+      f"tr(A^T X*) = ||A||_* exactly  (gap = {abs(trace_val - nuc_norm):.2e})")
+print()
+
+# Step 5: Why this works -- expand the trace
+print("STEP 5  Why this works algebraically")
+print()
+print("  tr(A^T X) = tr( (U Sigma V^T)^T  X )  = tr( V Sigma U^T  X )")
+print("  For X = U V^T:")
+print("    tr(V Sigma U^T  U V^T) = tr(V Sigma V^T) = tr(Sigma) = sum(sigma_i)")
+print()
+print("  For general X with ||X||_op <= 1, write X = U' S' V'^T.")
+print("  Then tr(A^T X) = tr(V Sigma U^T  U' S' V'^T)")
+print("  By Von Neumann: tr(A^T X) <= sum(sigma_i(A) * sigma_i(X))")
+print("                             <= sum(sigma_i(A) * 1)  = ||A||_*")
+print("  Equality iff X = U V^T.")
+print()
+
+# Step 6: Monte Carlo verification -- 100,000 random X with ||X||_op <= 1
+print("STEP 6  Monte Carlo verification: 100,000 random X with ||X||_op <= 1")
+print()
+
+n_samples = 100_000
+traces = np.empty(n_samples)
+
+# Batch: generate random matrices in spectral ball via SVD + clipped sv
+for i in range(n_samples):
+    R = rng.standard_normal((2, 2))
+    Ur, sr, Vtr = np.linalg.svd(R, full_matrices=False)
+    sr_clipped = rng.uniform(0.0, 1.0, size=sr.shape)
+    X_rand = (Ur * sr_clipped) @ Vtr  # equivalent to Ur @ diag(sr_clipped) @ Vtr
+    traces[i] = np.sum(A * X_rand)  # tr(A^T X) = sum(A_ij * X_ij)
+
+best_random = np.max(traces)
+mean_trace = np.mean(traces)
+gap = nuc_norm - best_random
+
+print(f"  Theoretical maximum (nuclear norm): {nuc_norm:.8f}")
+print(f"  Best from 100,000 random samples:   {best_random:.8f}")
+print(f"  Gap (theory - best random):         {gap:.8f}")
+print(f"  Mean tr(A^T X) over random X:       {mean_trace:.8f}")
+print()
+
+# Check that NO random sample exceeds the nuclear norm
+n_violations = np.sum(traces > nuc_norm + tol)
+check(n_violations == 0,
+      f"No random sample exceeds ||A||_* (violations: {n_violations}/{n_samples})")
+check(gap > 0,
+      f"Best random sample is strictly below theoretical max (gap = {gap:.6f})")
+print()
+
+print("  Interpretation: among 100,000 random directions in the spectral norm")
+print("  ball, NONE achieved a trace value as high as ortho(A) = UV^T.")
+print("  ortho(A) is THE unique direction that maximizes loss decrease per")
+print("  unit spectral-norm step. This is what Muon computes.")
+print()
+
+
+# ===================================================================
+#  SECTION 2 -- Concrete 3x3
+# ===================================================================
+
+sep("SECTION 2: Concrete 3x3 verification")
+
+A3 = rng.standard_normal((3, 3))
+mat("A (random 3x3)", A3)
+
+U3, s3, Vt3 = np.linalg.svd(A3)
+nuc3 = np.sum(s3)
+X_star3 = U3 @ Vt3
+
+print(f"  Singular values: {s3}")
+print(f"  Nuclear norm ||A||_* = {nuc3:.8f}")
+mat("X* = ortho(A)", X_star3)
+
+trace_star3 = np.trace(A3.T @ X_star3)
+print(f"  tr(A^T X*) = {trace_star3:.12f}")
+print(f"  ||A||_*    = {nuc3:.12f}")
+check(abs(trace_star3 - nuc3) < tol,
+      f"tr(A^T X*) = ||A||_* for 3x3  (gap = {abs(trace_star3 - nuc3):.2e})")
+print()
+
+# Monte Carlo
+print("  Monte Carlo: 100,000 random X with ||X||_op <= 1")
+n_samples_3 = 100_000
+traces3 = np.empty(n_samples_3)
+
+for i in range(n_samples_3):
+    R = rng.standard_normal((3, 3))
+    Ur, sr, Vtr = np.linalg.svd(R, full_matrices=False)
+    sr_clipped = rng.uniform(0.0, 1.0, size=sr.shape)
+    X_rand = (Ur * sr_clipped) @ Vtr
+    traces3[i] = np.sum(A3 * X_rand)
+
+best_random3 = np.max(traces3)
+gap3 = nuc3 - best_random3
+n_violations3 = np.sum(traces3 > nuc3 + tol)
+
+print(f"  Theoretical maximum (nuclear norm): {nuc3:.8f}")
+print(f"  Best from 100,000 random samples:   {best_random3:.8f}")
+print(f"  Gap (theory - best random):         {gap3:.8f}")
+check(n_violations3 == 0,
+      f"No violations for 3x3  ({n_violations3}/{n_samples_3})")
+print()
+
+
+# ===================================================================
+#  SECTION 3 -- The steepest descent interpretation
+# ===================================================================
+
+sep("SECTION 3: The steepest descent interpretation")
+
+print("  For loss L(W), gradient G = nabla L:")
+print("    The steepest descent problem under the spectral norm is:")
+print("      argmax_{||Delta||_op <= 1}  tr(G^T Delta)")
+print()
+print("    By Von Neumann's inequality, the solution is Delta* = ortho(G).")
+print("    This means Muon's update direction ortho(G) maximizes the")
+print("    first-order loss decrease per unit spectral-norm budget.")
+print()
+
+subsep("Compare update directions for a random gradient G")
+
+G = rng.standard_normal((4, 4))  # use 4x4 for variety
+mat("G (random gradient)", G)
+
+U_G, s_G, Vt_G = np.linalg.svd(G)
+nuc_G = np.sum(s_G)
+op_G = s_G[0]
+frob_G = np.linalg.norm(G, 'fro')
+
+# Four candidate update directions
+Delta_muon = U_G @ Vt_G                    # ortho(G) -- Muon
+Delta_sgd = G / op_G                       # G / ||G||_op -- unit spectral ball
+Delta_sgd_frob = G / frob_G                # G / ||G||_F -- unit Frobenius ball
+Q_rand, _ = np.linalg.qr(rng.standard_normal((4, 4)))  # random orthogonal
+
+# Compute trace inner product tr(G^T Delta) for each
+tr_muon = np.trace(G.T @ Delta_muon)
+tr_sgd = np.trace(G.T @ Delta_sgd)
+tr_sgd_frob = np.trace(G.T @ Delta_sgd_frob)
+tr_orth_rand = np.trace(G.T @ Q_rand)
+
+# Verify operator norms
+op_muon = np.linalg.svd(Delta_muon, compute_uv=False)[0]
+op_sgd = np.linalg.svd(Delta_sgd, compute_uv=False)[0]
+op_sgd_frob = np.linalg.svd(Delta_sgd_frob, compute_uv=False)[0]
+op_rand = np.linalg.svd(Q_rand, compute_uv=False)[0]
+
+print(f"  {'Direction':>30s}  {'tr(G^T Delta)':>14s}  {'||Delta||_op':>14s}  {'tr/||op||':>12s}")
+print(f"  {'-' * 30}  {'-' * 14}  {'-' * 14}  {'-' * 12}")
+print(f"  {'ortho(G) [Muon]':>30s}  {tr_muon:>14.6f}  {op_muon:>14.8f}  {tr_muon / op_muon:>12.6f}")
+print(f"  {'G / ||G||_op':>30s}  {tr_sgd:>14.6f}  {op_sgd:>14.8f}  {tr_sgd / op_sgd:>12.6f}")
+print(f"  {'G / ||G||_F':>30s}  {tr_sgd_frob:>14.6f}  {op_sgd_frob:>14.8f}  {tr_sgd_frob / op_sgd_frob:>12.6f}")
+print(f"  {'Random orthogonal':>30s}  {tr_orth_rand:>14.6f}  {op_rand:>14.8f}  {tr_orth_rand / op_rand:>12.6f}")
+print()
+
+print(f"  Nuclear norm ||G||_* = {nuc_G:.6f}  (theoretical maximum of tr(G^T Delta) for ||Delta||_op <= 1)")
+print()
+
+check(abs(tr_muon - nuc_G) < tol,
+      f"tr(G^T ortho(G)) = ||G||_* = {nuc_G:.6f}")
+check(tr_muon > tr_sgd + tol,
+      f"ortho(G) beats G/||G||_op:  {tr_muon:.6f} > {tr_sgd:.6f}")
+check(tr_muon > tr_sgd_frob,
+      f"ortho(G) beats G/||G||_F:   {tr_muon:.6f} > {tr_sgd_frob:.6f}")
+check(tr_muon > tr_orth_rand,
+      f"ortho(G) beats random ortho: {tr_muon:.6f} > {tr_orth_rand:.6f}")
+print()
+
+print("  Key insight: among all matrices with ||Delta||_op <= 1, ortho(G)")
+print("  gives the largest possible first-order loss decrease tr(G^T Delta).")
+print("  This is the precise sense in which Muon is 'optimal'.")
+print()
+
+
+# ===================================================================
+#  SECTION 4 -- Comparison of steepest descent under different norms
+# ===================================================================
+
+sep("SECTION 4: Comparison of steepest descent under different norms")
+
+print("  Different optimizers correspond to steepest descent under different norms:")
+print()
+print("    Norm             Steepest direction       Optimizer analogy")
+print("    ----             ------------------       -----------------")
+print("    Frobenius        G / ||G||_F              SGD (treats matrix as flat vector)")
+print("    Spectral         ortho(G) = UV^T          Muon (respects matrix structure)")
+print("    Element-wise L1  sign(G)                  Adam-like (per-parameter)")
+print()
+print("  Each direction is optimal under its OWN norm, but suboptimal under others.")
+print("  We verify this numerically.")
+print()
+
+G4 = rng.standard_normal((5, 5))
+
+U4, s4, Vt4 = np.linalg.svd(G4)
+frob4 = np.linalg.norm(G4, 'fro')
+op4 = s4[0]
+nuc4 = np.sum(s4)
+
+# The three steepest descent directions
+D_frob = G4 / frob4                        # Frobenius steepest descent
+D_spec = U4 @ Vt4                           # Spectral steepest descent (Muon)
+D_sign = np.sign(G4)                        # Element-wise sign (Adam-like)
+
+# Normalize each to unit ball under its respective norm for fair comparison
+# D_frob already has ||D_frob||_F = 1
+# D_spec already has ||D_spec||_op = 1
+# D_sign needs to be normalized under element-wise infinity norm:
+#   ||sign(G)||_inf = 1 (max absolute entry), already satisfied
+# But for L1 dual, sign(G) is the steepest direction for the L_inf norm on entries
+# ||sign(G)||_max = 1
+
+print("  --- Optimality under the FROBENIUS norm ---")
+print("  The steepest descent direction for the Frobenius ball is Delta = G / ||G||_F")
+print(f"  tr(G^T (G/||G||_F))  = ||G||_F = {frob4:.6f}")
+print(f"  tr(G^T ortho(G))     = ||G||_* = {nuc4:.6f}  but ||ortho(G)||_F = {np.linalg.norm(D_spec, 'fro'):.6f}")
+tr_frob_frob = frob4  # tr(G^T G/||G||_F) = ||G||_F
+tr_spec_frob = np.trace(G4.T @ D_spec)
+frob_of_spec = np.linalg.norm(D_spec, 'fro')
+print(f"  tr(G^T ortho(G)) / ||ortho(G)||_F = {tr_spec_frob / frob_of_spec:.6f}")
+print(f"  tr(G^T (G/||G||_F)) / ||(G/||G||_F)||_F = {tr_frob_frob / 1.0:.6f}")
+print()
+# Under Frobenius norm, G/||G||_F is optimal: it achieves ||G||_F per unit Frobenius norm
+# ortho(G) achieves nuc / sqrt(min(m,n)) per unit Frobenius norm
+check(abs(tr_frob_frob - frob4) < tol,
+      "G/||G||_F achieves ||G||_F under Frobenius ball (optimal)")
+
+print()
+print("  --- Optimality under the SPECTRAL (operator) norm ---")
+print("  The steepest descent direction for the spectral ball is Delta = ortho(G)")
+op_of_frob = np.linalg.svd(D_frob, compute_uv=False)[0]
+op_of_sign = np.linalg.svd(D_sign, compute_uv=False)[0]
+tr_frob_val = np.trace(G4.T @ D_frob)
+tr_sign_val = np.trace(G4.T @ D_sign)
+
+print(f"  tr(G^T ortho(G))     = {nuc4:.6f}  ||ortho(G)||_op = {1.0:.6f}  ratio = {nuc4:.6f}")
+print(f"  tr(G^T (G/||G||_F))  = {tr_frob_val:.6f}  ||G/||G||_F||_op = {op_of_frob:.6f}  ratio = {tr_frob_val / op_of_frob:.6f}")
+print(f"  tr(G^T sign(G))      = {tr_sign_val:.6f}  ||sign(G)||_op   = {op_of_sign:.6f}  ratio = {tr_sign_val / op_of_sign:.6f}")
+print()
+
+check(nuc4 >= tr_frob_val / op_of_frob - tol,
+      f"ortho(G) beats G/||G||_F per unit spectral norm: {nuc4:.4f} >= {tr_frob_val / op_of_frob:.4f}")
+check(nuc4 >= tr_sign_val / op_of_sign - tol,
+      f"ortho(G) beats sign(G) per unit spectral norm:   {nuc4:.4f} >= {tr_sign_val / op_of_sign:.4f}")
+
+print()
+print("  --- Optimality under the ELEMENT-WISE infinity norm ---")
+print("  The steepest descent direction for the L_inf ball is Delta = sign(G)")
+linf_G = np.max(np.abs(G4))
+l1_norm = np.sum(np.abs(G4))
+# Under L_inf norm, sign(G) is optimal: tr(G^T sign(G)) = ||G||_1 (L1 norm)
+tr_sign = np.trace(G4.T @ D_sign)
+print(f"  tr(G^T sign(G))      = {tr_sign:.6f}  = ||G||_1 (sum of |g_ij|) = {l1_norm:.6f}")
+check(abs(tr_sign - l1_norm) < tol,
+      f"sign(G) achieves ||G||_1 under element-wise L_inf ball")
+print()
+
+print("  Summary: each norm induces a different 'best direction'.")
+print("  Frobenius ignores matrix structure (flat vector).")
+print("  Spectral respects the matrix structure (left/right singular spaces).")
+print("  Element-wise treats each entry independently.")
+print()
+
+
+# ===================================================================
+#  SECTION 5 -- Why spectral norm is the "right" norm for matrices
+# ===================================================================
+
+sep("SECTION 5: Why the spectral norm is the 'right' norm for matrices")
+
+print("  The spectral norm is invariant under orthogonal transformations:")
+print("    ||Q_1 A Q_2||_op = ||A||_op   for any orthogonal Q_1, Q_2")
+print()
+print("  This means it respects the intrinsic geometry of the matrix,")
+print("  independent of the chosen basis.  Neither Frobenius nor element-wise")
+print("  norms have this property (Frobenius is invariant, but element-wise is not).")
+print()
+print("  For ILL-CONDITIONED gradients, ortho(G) gives much larger loss decrease")
+print("  per unit spectral-norm step than G/||G||_F.  This is because ortho(G)")
+print("  redistributes the gradient's energy equally across all singular directions,")
+print("  while G/||G||_F wastes most of the budget on the dominant singular direction.")
+print()
+
+subsep("Ill-conditioned gradient: spectral vs Frobenius steepest descent")
+
+# Construct an ill-conditioned gradient
+U5, _ = np.linalg.qr(rng.standard_normal((5, 5)))
+V5, _ = np.linalg.qr(rng.standard_normal((5, 5)))
+s_ill = np.array([100.0, 10.0, 1.0, 0.1, 0.01])  # condition number 10,000
+G_ill = U5 @ np.diag(s_ill) @ V5.T
+
+nuc_ill = np.sum(s_ill)
+frob_ill = np.sqrt(np.sum(s_ill ** 2))
+op_ill = s_ill[0]
+
+D_muon_ill = U5 @ V5.T  # ortho(G_ill)
+D_sgd_ill = G_ill / frob_ill
+
+# Loss decrease per unit spectral-norm step
+tr_muon_ill = np.trace(G_ill.T @ D_muon_ill)
+tr_sgd_ill = np.trace(G_ill.T @ D_sgd_ill)
+op_sgd_ill = np.linalg.svd(D_sgd_ill, compute_uv=False)[0]
+
+print(f"  Gradient singular values: {s_ill}")
+print(f"  Condition number: {s_ill[0] / s_ill[-1]:.0f}")
+print()
+print(f"  ||G||_*  (nuclear)   = {nuc_ill:.4f}")
+print(f"  ||G||_F  (Frobenius) = {frob_ill:.4f}")
+print(f"  ||G||_op (spectral)  = {op_ill:.4f}")
+print()
+
+print(f"  Loss decrease tr(G^T Delta) with ||Delta||_op = 1:")
+print(f"    Muon (ortho(G)):   {tr_muon_ill:.6f}  (= ||G||_* = sum of ALL singular values)")
+print(f"    SGD  (G/||G||_F):  {tr_sgd_ill:.6f}  (||G/||G||_F||_op = {op_sgd_ill:.6f})")
+print(f"    SGD per unit op:   {tr_sgd_ill / op_sgd_ill:.6f}")
+print()
+
+ratio = tr_muon_ill / (tr_sgd_ill / op_sgd_ill)
+print(f"  Muon advantage ratio: {ratio:.2f}x")
+print(f"  (ortho(G) gives {ratio:.2f}x more loss decrease per unit spectral norm)")
+print()
+
+check(abs(tr_muon_ill - nuc_ill) < tol,
+      f"tr(G^T ortho(G)) = ||G||_* = {nuc_ill:.4f}")
+check(ratio > 1.0,
+      f"Muon advantage over SGD for kappa=10000: {ratio:.2f}x")
+print()
+
+print("  For this ill-conditioned gradient (kappa = 10,000):")
+print(f"    Muon uses ALL {len(s_ill)} singular directions equally (each contributes sigma_i to the trace).")
+print(f"    SGD concentrates on the top singular direction ({s_ill[0]:.1f}) and wastes")
+print(f"    budget on the small directions ({s_ill[-1]:.2f}).  The result: Muon gives")
+print(f"    {ratio:.1f}x more loss decrease per unit spectral-norm step.")
+print()
+
+# Well-conditioned case for contrast
+s_well = np.array([2.0, 1.8, 1.5, 1.2, 1.0])
+G_well = U5 @ np.diag(s_well) @ V5.T
+nuc_well = np.sum(s_well)
+frob_well = np.sqrt(np.sum(s_well ** 2))
+D_sgd_well = G_well / frob_well
+tr_muon_well = np.trace(G_well.T @ (U5 @ V5.T))
+tr_sgd_well = np.trace(G_well.T @ D_sgd_well)
+op_sgd_well = np.linalg.svd(D_sgd_well, compute_uv=False)[0]
+ratio_well = tr_muon_well / (tr_sgd_well / op_sgd_well)
+
+print(f"  For well-conditioned G (kappa = {s_well[0] / s_well[-1]:.1f}):")
+print(f"    Muon advantage ratio: {ratio_well:.2f}x  (smaller -- SGD is nearly as good)")
+print(f"    The advantage of Muon is largest when the gradient is ill-conditioned.")
+print()
+
+
+# ===================================================================
+#  SECTION 6 -- Rectangular matrices
+# ===================================================================
+
+sep("SECTION 6: Rectangular matrices (5x3 and 3x5)")
+
+print("  Von Neumann's inequality holds for ANY matrix shape, not just square.")
+print("  For A in R^{m x n}, X* = UV^T in R^{m x n} is the maximizer.")
+print()
+
+rect_configs = [(5, 3, 50_000), (3, 5, 50_000)]
+
+for (m, n, n_samp) in rect_configs:
+    subsep(f"A in R^{{{m} x {n}}}, {n_samp} random samples")
+
+    A_rect = rng.standard_normal((m, n))
+    U_r, s_r, Vt_r = np.linalg.svd(A_rect, full_matrices=False)
+    nuc_r = np.sum(s_r)
+    X_star_r = U_r @ Vt_r
+
+    # Verify X* has operator norm 1
+    sv_r = np.linalg.svd(X_star_r, compute_uv=False)
+    print(f"  Singular values of A: {s_r}")
+    print(f"  Nuclear norm ||A||_* = {nuc_r:.8f}")
+    print(f"  Singular values of X* = UV^T: {sv_r}")
+    print(f"  ||X*||_op = {sv_r[0]:.12f}")
+    print()
+
+    # Verify tr(A^T X*) = nuclear norm
+    tr_r = np.trace(A_rect.T @ X_star_r)
+    print(f"  tr(A^T X*) = {tr_r:.12f}")
+    print(f"  ||A||_*    = {nuc_r:.12f}")
+    check(abs(tr_r - nuc_r) < tol,
+          f"tr(A^T X*) = ||A||_* for {m}x{n}  (gap = {abs(tr_r - nuc_r):.2e})")
+    print()
+
+    # Monte Carlo
+    traces_r = np.empty(n_samp)
+    for i in range(n_samp):
+        R = rng.standard_normal((m, n))
+        Ur2, sr2, Vtr2 = np.linalg.svd(R, full_matrices=False)
+        sr2_clipped = rng.uniform(0.0, 1.0, size=sr2.shape)
+        X_rand_r = (Ur2 * sr2_clipped) @ Vtr2
+        traces_r[i] = np.sum(A_rect * X_rand_r)
+
+    best_r = np.max(traces_r)
+    gap_r = nuc_r - best_r
+    n_viol_r = np.sum(traces_r > nuc_r + tol)
+
+    print(f"  Best from {n_samp} random samples: {best_r:.8f}")
+    print(f"  Gap (theory - best):             {gap_r:.8f}")
+    check(n_viol_r == 0,
+          f"No violations for {m}x{n}  ({n_viol_r}/{n_samp})")
+    check(gap_r > 0,
+          f"Best random < theoretical max  (gap = {gap_r:.6f})")
+    print()
+
+
+# ===================================================================
+#  SECTION 7 -- Statistical sweep
+# ===================================================================
+
+sep("SECTION 7: Statistical sweep -- 200 matrices at each size")
+
+print("  For each size, generate 200 random A matrices and verify:")
+print("    (a) tr(A^T ortho(A)) = ||A||_* to machine precision")
+print("    (b) 10,000 random X with ||X||_op <= 1 never exceed ||A||_*")
+print()
+
+sizes = [(2, 2), (3, 3), (4, 4), (5, 5)]
+n_matrices = 200
+n_random_per = 10_000
+
+worst_identity_gap = 0.0  # worst |tr(A^T ortho(A)) - ||A||_*|
+worst_violation = -np.inf  # worst (max_random_trace - ||A||_*)
+total_violations = 0
+total_tested_sweep = 0
+
+print(f"  {'Size':>6s}  {'Worst identity gap':>20s}  {'Worst violation':>16s}  {'Violations':>12s}  Result")
+print(f"  {'-' * 6}  {'-' * 20}  {'-' * 16}  {'-' * 12}  {'-' * 6}")
+
+for (m, n) in sizes:
+    size_worst_gap = 0.0
+    size_worst_viol = -np.inf
+    size_violations = 0
+
+    # Pre-generate all random matrices for this size in one batch.
+    # For each of the n_random_per samples, we need a random X with
+    # ||X||_op <= 1.  We generate them once and reuse across all 200 A's.
+    # This is valid because the random X's are independent of A.
+    print(f"  Generating {n_random_per} random spectral-ball matrices for {m}x{n}...", end="", flush=True)
+    random_Xs = np.empty((n_random_per, m, n))
+    for j in range(n_random_per):
+        R = rng.standard_normal((m, n))
+        Ur3, sr3, Vtr3 = np.linalg.svd(R, full_matrices=False)
+        sr3_clipped = rng.uniform(0.0, 1.0, size=sr3.shape)
+        random_Xs[j] = (Ur3 * sr3_clipped) @ Vtr3
+    print(" done.")
+
+    for trial in range(n_matrices):
+        A_t = rng.standard_normal((m, n))
+        U_t, s_t, Vt_t = np.linalg.svd(A_t, full_matrices=False)
+        nuc_t = np.sum(s_t)
+        X_star_t = U_t @ Vt_t
+
+        # Check (a): identity tr(A^T ortho(A)) = ||A||_*
+        tr_t = np.sum(A_t * X_star_t)
+        identity_gap = abs(tr_t - nuc_t)
+        size_worst_gap = max(size_worst_gap, identity_gap)
+
+        # Check (b): vectorized -- compute tr(A^T X) for all random X at once
+        # tr(A^T X_j) = sum_{ij} A_{ij} * X_j_{ij}
+        # With random_Xs shape (n_random_per, m, n) and A_t shape (m, n):
+        all_traces = np.tensordot(random_Xs, A_t, axes=[[1, 2], [0, 1]])
+        max_trace = np.max(all_traces)
+        excess = max_trace - nuc_t
+        if excess > size_worst_viol:
+            size_worst_viol = excess
+        n_viol = int(np.sum(all_traces > nuc_t + tol))
+        size_violations += n_viol
+
+        total_tested_sweep += 1
+
+    worst_identity_gap = max(worst_identity_gap, size_worst_gap)
+    if size_worst_viol > worst_violation:
+        worst_violation = size_worst_viol
+    total_violations += size_violations
+
+    ok_size = (size_worst_gap < 1e-10 and size_violations == 0)
+    print(f"  {m}x{n:>4d}  {size_worst_gap:>20.2e}  {size_worst_viol:>16.2e}  {size_violations:>12d}  {pf(ok_size)}")
+    check(size_worst_gap < 1e-10,
+          f"Identity holds for all {n_matrices} matrices at {m}x{n}  (worst gap = {size_worst_gap:.2e})")
+    check(size_violations == 0,
+          f"No violations in {n_matrices * n_random_per:,} random samples at {m}x{n}")
+
+print()
+print(f"  Grand totals:")
+print(f"    Matrices tested:       {total_tested_sweep}")
+print(f"    Random samples tested: {total_tested_sweep * n_random_per:,}")
+print(f"    Worst identity gap:    {worst_identity_gap:.2e}")
+print(f"    Worst violation:       {worst_violation:.2e}")
+print(f"    Total violations:      {total_violations}")
+print()
+
+
+# ===================================================================
+#  FINAL VERDICT
+# ===================================================================
+
+sep("FINAL VERDICT")
+
+print(f"  Total checks:   {total_checks}")
+print(f"  Total failures: {total_failures}")
+print()
+
+if all_pass:
+    print("  ============================================")
+    print("  =            ALL TESTS PASSED              =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.6a VERIFIED:")
+    print()
+    print("  1. Von Neumann's trace inequality:")
+    print("       max_{||X||_op <= 1} tr(A^T X) = ||A||_* = sum of singular values")
+    print("     holds exactly (to machine precision) for all tested matrices.")
+    print()
+    print("  2. The maximizer is X* = UV^T = ortho(A), the polar factor of A.")
+    print("     Among 100,000+ random samples from the spectral norm ball,")
+    print("     NONE ever exceeded the nuclear norm.")
+    print()
+    print("  3. Steepest descent interpretation: for gradient G,")
+    print("       argmax_{||Delta||_op <= 1} tr(G^T Delta) = ortho(G)")
+    print("     This is EXACTLY what Muon computes. Muon's update direction")
+    print("     maximizes first-order loss decrease per unit spectral-norm step.")
+    print()
+    print("  4. Different norms give different 'optimal' directions:")
+    print("       Frobenius  -> G/||G||_F  (SGD: treats matrix as flat vector)")
+    print("       Spectral   -> ortho(G)   (Muon: respects matrix structure)")
+    print("       L_inf      -> sign(G)    (Adam-like: per-parameter)")
+    print("     Each is optimal under its own norm, suboptimal under others.")
+    print()
+    print("  5. For ill-conditioned gradients, Muon's advantage is dramatic:")
+    print("     ortho(G) redistributes energy equally across ALL singular directions,")
+    print("     while SGD wastes most budget on the dominant direction.")
+    print()
+    print("  6. The inequality holds for rectangular matrices too (5x3, 3x5).")
+    print()
+    print("  7. Statistical sweep: 200 matrices at each of 2x2, 3x3, 4x4, 5x5,")
+    print("     with 10,000 random samples each -- zero violations.")
+    print()
+    print("  CONCLUSION: Muon = spectral steepest descent, made concrete.")
+    print("  ortho(G) is THE optimal first-order update direction under the")
+    print("  spectral norm. This is a convex optimization fact, not a heuristic.")
+else:
+    print("  ============================================")
+    print("  =          SOME TESTS FAILED               =")
+    print("  ============================================")
+    print()
+    print(f"  Axiom 0.6a: {total_failures}/{total_checks} checks failed.")
+    print("  See details above.")
+
+print()

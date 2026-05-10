@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.1b -- Verify: Polar decomposition fails for singular M (det=0)
+
+For invertible M the polar decomposition M = QP is computed via
+    P = (M^T M)^{1/2},   Q = M (M^T M)^{-1/2}.
+When M is singular (det = 0), M^T M has a zero eigenvalue and the
+inverse square root (M^T M)^{-1/2} does not exist.
+
+However the SVD still works: M = U S V^T gives Q = U V^T (a partial
+isometry) and P = V S V^T (PSD but not PD).  The gauge fixing
+ortho(M) = U V^T is always well-defined, but for rank-deficient M the
+polar factor Q is *not unique* -- any rotation acting in the kernel of
+P yields another valid Q.  The fiber degenerates from a group orbit to
+a cone.
+
+Muon's Newton-Schulz iteration also handles this gracefully: the
+polynomial f(s) = a*s + b*s^3 + c*s^5 satisfies f(0) = 0, so zero
+singular values remain zero and the iteration converges to a partial
+isometry.
+
+This script verifies all of the above.
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+def sep(title: str) -> None:
+    """Print a section separator."""
+    print(f"\n{'=' * 72}")
+    print(f"  {title}")
+    print(f"{'=' * 72}\n")
+
+
+def mat(name: str, A: np.ndarray) -> None:
+    """Pretty-print a labelled matrix."""
+    print(f"{name} =")
+    for row in np.atleast_2d(A):
+        print("  [" + "  ".join(f"{v: .8f}" for v in row) + "]")
+    print()
+
+
+def polar_via_svd(M: np.ndarray):
+    """
+    Compute the right polar decomposition via SVD.
+    M = U S V^T  =>  Q = U V^T,  P = V S V^T.
+    Works for any matrix, including singular and rectangular.
+    """
+    U, s, Vt = np.linalg.svd(M, full_matrices=False)
+    Q = U @ Vt
+    P = Vt.T @ np.diag(s) @ Vt
+    return Q, P, U, s, Vt
+
+
+# ---------------------------------------------------------------------------
+#  Tracking
+# ---------------------------------------------------------------------------
+
+all_pass = True
+total_checks = 0
+total_failed = 0
+
+
+def check(condition: bool, label: str) -> bool:
+    """Record a pass/fail check."""
+    global all_pass, total_checks, total_failed
+    total_checks += 1
+    tag = "PASS" if condition else "FAIL"
+    if not condition:
+        total_failed += 1
+        all_pass = False
+    print(f"  [{tag}] {label}")
+    return condition
+
+
+# ===================================================================
+#  PART 1 -- Concrete walkthrough on M = [[1,0],[0,0]]
+# ===================================================================
+
+sep("PART 1: Concrete walkthrough -- M = [[1,0],[0,0]]")
+
+M = np.array([[1.0, 0.0],
+              [0.0, 0.0]])
+
+print("STEP 1  Define M and observe det(M) = 0")
+mat("M", M)
+det_M = np.linalg.det(M)
+print(f"  det(M) = {det_M:.1f}")
+check(abs(det_M) < 1e-15, "det(M) = 0  (M is singular)")
+print()
+
+# ---- Step 2: M^T M is singular ----
+print("STEP 2  Compute G = M^T M and show it is singular")
+G = M.T @ M
+mat("G = M^T M", G)
+print("  Expected: [[1,0],[0,0]]")
+check(np.allclose(G, [[1, 0], [0, 0]]), "G = [[1,0],[0,0]]")
+
+eigvals_G = np.linalg.eigvalsh(G)
+print(f"  Eigenvalues of G: {eigvals_G}")
+check(np.min(np.abs(eigvals_G)) < 1e-15, "G has a zero eigenvalue => G is singular")
+print()
+
+# ---- Step 3: (M^T M)^{-1/2} does not exist ----
+print("STEP 3  Show that (M^T M)^{-1/2} does NOT exist")
+print()
+print("  To form (M^T M)^{-1/2} = V diag(1/sqrt(lambda_i)) V^T,")
+print("  we need 1/sqrt(lambda) for each eigenvalue lambda.")
+print(f"  Eigenvalues of G: {eigvals_G}")
+print(f"  lambda_1 = {eigvals_G[0]:.1e}  =>  1/sqrt({eigvals_G[0]:.1e}) = UNDEFINED (division by zero)")
+print(f"  lambda_2 = {eigvals_G[1]:.1f}  =>  1/sqrt({eigvals_G[1]:.1f}) = {1.0/np.sqrt(eigvals_G[1]):.8f}")
+print()
+
+can_invert = True
+try:
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv_sqrt_eigvals = 1.0 / np.sqrt(np.maximum(eigvals_G, 0.0))
+    # numpy will produce inf for 1/sqrt(0) = 1/0 = inf
+    if np.any(np.isinf(inv_sqrt_eigvals)) or np.any(np.isnan(inv_sqrt_eigvals)):
+        can_invert = False
+except Exception:
+    can_invert = False
+
+check(not can_invert,
+      "(M^T M)^{-1/2} cannot be formed: zero eigenvalue => 1/0 = inf")
+print()
+print("  Gauge theory interpretation:")
+print("  The formula Q = M (M^T M)^{-1/2} requires inverting the Gram")
+print("  matrix. When det(M) = 0 the Gram matrix is singular and the")
+print("  inverse square root blows up. The 'straightforward' gauge-fixing")
+print("  map breaks down for singular weight matrices.")
+print()
+
+# ---- Step 4: SVD still works ----
+print("STEP 4  Compute SVD: M = U S V^T")
+Q, P, U, s, Vt = polar_via_svd(M)
+mat("U", U)
+print(f"  Singular values: s = {s}")
+mat("V^T", Vt)
+
+check(np.allclose(U, np.eye(2)), "U = I (identity)")
+check(np.allclose(s, [1.0, 0.0]), "Sigma = diag(1, 0)")
+check(np.allclose(Vt, np.eye(2)), "V^T = I  =>  V = I")
+print()
+
+# ---- Step 5: Q = UV^T (partial isometry) ----
+print("STEP 5  Q = U V^T (partial isometry)")
+mat("Q = U V^T", Q)
+check(np.allclose(Q, np.eye(2)), "Q = I")
+print()
+print("  Note: Q = I but M = [[1,0],[0,0]]. So Q != M.")
+check(not np.allclose(Q, M), "Q != M  (the gauge-fixed version differs from the original)")
+print()
+print("  Gauge theory interpretation:")
+print("  The SVD-based gauge fixing ortho(M) = U V^T is always well-defined,")
+print("  even for singular M. The SVD 'removes' the singular values and keeps")
+print("  only the orthogonal frame. For singular M, Q is a partial isometry")
+print("  (maps rank-dim subspace isometrically, annihilates the kernel).")
+print()
+
+# ---- Step 6: P = V S V^T (PSD but not PD) ----
+print("STEP 6  P = V S V^T -- PSD but NOT positive definite")
+mat("P = V S V^T", P)
+P_eigvals = np.linalg.eigvalsh(P)
+print(f"  Eigenvalues of P: {P_eigvals}")
+check(np.all(P_eigvals >= -1e-15), "All eigenvalues of P >= 0  (P is PSD)")
+check(np.min(P_eigvals) < 1e-15, "P has a zero eigenvalue => P is PSD but NOT PD")
+print()
+print("  Gauge theory interpretation:")
+print("  In the polar decomposition M = QP, the 'radial' part P represents")
+print("  the stretching. When M is singular, P has zero eigenvalues: the")
+print("  fiber degenerates from a full group orbit (P positive definite) to")
+print("  a cone (P only positive semi-definite).")
+print()
+
+# ---- Step 7: Verify QP = M ----
+print("STEP 7  Verify QP = M still holds")
+QP = Q @ P
+mat("Q @ P", QP)
+mat("M (original)", M)
+recon_dev = np.max(np.abs(QP - M))
+print(f"  max |QP - M| = {recon_dev:.2e}")
+check(recon_dev < 1e-14, "QP = M (reconstruction holds)")
+print()
+print("  Even though (M^T M)^{-1/2} doesn't exist, the SVD-based polar")
+print("  decomposition still reconstructs M perfectly. The gauge fixing")
+print("  'works', but the fiber degenerates.")
+print()
+
+
+# ===================================================================
+#  PART 2 -- Non-uniqueness demonstration
+# ===================================================================
+
+sep("PART 2: Non-uniqueness of Q for singular M")
+
+print("For M = [[1,0],[0,0]], we found Q = I and P = diag(1,0).")
+print("But Q is NOT unique. Consider Q' = [[1,0],[0,-1]]:\n")
+
+Q_prime = np.array([[1.0, 0.0],
+                     [0.0, -1.0]])
+mat("Q'", Q_prime)
+mat("P", P)
+QP_prime = Q_prime @ P
+mat("Q' @ P", QP_prime)
+print("  Q' @ P =")
+print("    [[1,0],[0,-1]] @ [[1,0],[0,0]] = [[1,0],[0,0]] = M")
+print()
+recon_dev2 = np.max(np.abs(QP_prime - M))
+print(f"  max |Q'P - M| = {recon_dev2:.2e}")
+check(recon_dev2 < 1e-14, "Q'P = M  (alternative Q also reconstructs M)")
+print()
+
+print("  Why does this work? The second column of P is zero:")
+print("    P = [[1,0],[0,0]]")
+print("  So the second column of Q is multiplied by zero -- the sign (or")
+print("  any rotation) in that column is invisible. The zero column of P")
+print("  'kills' the ambiguity in Q's action on the kernel.\n")
+
+# More general: any orthogonal Q whose first column matches
+print("  More generally, for any angle theta, the matrix")
+print("  Q''(theta) = [[1,0],[0,cos(theta)]] satisfies Q''P = M,")
+print("  because the second column of P is zero.\n")
+
+for theta in [0.0, np.pi/4, np.pi/2, np.pi, 3*np.pi/2]:
+    # Build Q'' that is identity on the range of M and arbitrary on the kernel
+    Q_arb = np.array([[1.0, 0.0],
+                       [0.0, np.cos(theta)]])
+    QP_arb = Q_arb @ P
+    dev = np.max(np.abs(QP_arb - M))
+    print(f"  theta = {theta:.4f}: Q''= diag(1, cos({theta:.2f})) = diag(1, {np.cos(theta):.4f})")
+    print(f"    Q'' @ P = {QP_arb.tolist()},  max|Q''P - M| = {dev:.2e}")
+    check(dev < 1e-14, f"Q'' @ P = M for theta = {theta:.4f}")
+
+print()
+print("  Gauge theory interpretation:")
+print("  For invertible M, the polar decomposition M = QP is unique: given")
+print("  P (which is determined by M), Q = M P^{-1} is forced. But when M")
+print("  is singular, P^{-1} doesn't exist and Q is not uniquely determined.")
+print("  Any rotation in ker(P) = ker(M) gives a valid Q. The gauge orbit")
+print("  degenerates: instead of a single gauge-fixed point, we have a")
+print("  family of equivalent Q's. The gauge slice still exists but is no")
+print("  longer a single point -- it's a coset of the stabilizer subgroup")
+print("  acting on the kernel of M.\n")
+
+
+# ===================================================================
+#  PART 3 -- Sweep of rank-deficient matrices
+# ===================================================================
+
+sep("PART 3: Sweep of rank-deficient and near-singular matrices")
+
+rng = np.random.default_rng(42)
+
+# --- Part 3a: Rank-1 matrices of various sizes ---
+print("--- 3a: Rank-1 matrices of various sizes ---\n")
+
+for n in [2, 3, 5]:
+    # Build a rank-1 matrix: M = u v^T for random unit vectors u, v
+    u = rng.standard_normal(n)
+    u = u / np.linalg.norm(u)
+    v = rng.standard_normal(n)
+    v = v / np.linalg.norm(v)
+    M_r1 = np.outer(u, v)
+
+    Q_r1, P_r1, U_r1, s_r1, Vt_r1 = polar_via_svd(M_r1)
+
+    recon_dev_r1 = np.max(np.abs(Q_r1 @ P_r1 - M_r1))
+    P_eigs = np.linalg.eigvalsh(P_r1)
+    rank_M = np.sum(s_r1 > 1e-10)
+    n_zero_P = np.sum(P_eigs < 1e-10)
+
+    print(f"  {n}x{n} rank-1 matrix:")
+    print(f"    Singular values: {np.array2string(s_r1, precision=6)}")
+    print(f"    rank(M) = {rank_M}")
+    print(f"    P eigenvalues: {np.array2string(P_eigs, precision=6)}")
+    print(f"    # P eigenvalues <= 0: {n_zero_P}")
+    print(f"    max|QP - M| = {recon_dev_r1:.2e}")
+
+    check(recon_dev_r1 < 1e-10, f"{n}x{n} rank-1: QP = M reconstruction")
+    check(n_zero_P == n - 1, f"{n}x{n} rank-1: P has {n-1} zero eigenvalues (PSD, not PD)")
+    print()
+
+# --- Part 3b: Gradually decreasing smallest singular value ---
+print("\n--- 3b: Matrices with gradually decreasing sigma_min ---\n")
+print("  For each sigma_min, we build a 4x4 matrix with singular values")
+print("  [3, 2, 1, sigma_min], compute the polar decomposition via SVD,")
+print("  and check whether (M^T M)^{-1/2} can also be formed.\n")
+
+sigma_min_values = [1.0, 0.1, 0.01, 1e-6, 1e-12, 0.0]
+
+for sigma_min in sigma_min_values:
+    n = 4
+    # Build M with prescribed singular values via random orthogonal frames
+    U_rand, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    V_rand, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    desired_svals = np.array([3.0, 2.0, 1.0, sigma_min])
+    M_test = U_rand @ np.diag(desired_svals) @ V_rand.T
+
+    # SVD-based polar decomposition (always works)
+    Q_test, P_test, _, s_test, _ = polar_via_svd(M_test)
+    recon_svd = np.max(np.abs(Q_test @ P_test - M_test))
+    P_eigs_test = np.linalg.eigvalsh(P_test)
+    min_P_eig = np.min(P_eigs_test)
+
+    # Try eigen-based (M^T M)^{-1/2}
+    G_test = M_test.T @ M_test
+    eigvals_test, V_eig = np.linalg.eigh(G_test)
+    sqrt_eigs = np.sqrt(np.maximum(eigvals_test, 0.0))
+    with np.errstate(divide='ignore'):
+        inv_sqrt_eigs = np.where(sqrt_eigs > 1e-15, 1.0 / sqrt_eigs, np.inf)
+    eigen_method_works = not np.any(np.isinf(inv_sqrt_eigs))
+
+    if eigen_method_works:
+        P_inv_test = V_eig @ np.diag(inv_sqrt_eigs) @ V_eig.T
+        Q_eigen_test = M_test @ P_inv_test
+        recon_eigen = np.max(np.abs(Q_eigen_test @ (V_eig @ np.diag(sqrt_eigs) @ V_eig.T) - M_test))
+        eigen_str = f"works  (recon err = {recon_eigen:.2e})"
+    else:
+        eigen_str = "FAILS  (1/sqrt(0) = inf)"
+
+    print(f"  sigma_min = {sigma_min:.1e}:")
+    print(f"    Actual singular values: {np.array2string(np.sort(s_test)[::-1], precision=6)}")
+    print(f"    SVD polar decomposition: max|QP-M| = {recon_svd:.2e}")
+    print(f"    min eigenvalue of P    : {min_P_eig:.2e}")
+    print(f"    (M^T M)^{{-1/2}} method : {eigen_str}")
+
+    check(recon_svd < 1e-8, f"sigma_min={sigma_min:.1e}: SVD polar QP=M")
+    if sigma_min == 0.0:
+        check(not eigen_method_works,
+              f"sigma_min=0: (M^T M)^{{-1/2}} correctly fails")
+        check(min_P_eig < 1e-10,
+              f"sigma_min=0: P is PSD not PD (min eigenvalue ~ 0)")
+    print()
+
+print("  Key observation:")
+print("  ortho(M) = U V^T is ALWAYS well-defined via SVD, regardless of rank.")
+print("  The (M^T M)^{-1/2} formula breaks down at sigma_min = 0 because")
+print("  inverting a zero eigenvalue is undefined. But the SVD never needs")
+print("  to invert anything -- it directly provides the orthogonal factor.\n")
+
+
+# ===================================================================
+#  PART 4 -- Muon's Newton-Schulz iteration on singular matrices
+# ===================================================================
+
+sep("PART 4: Muon's Newton-Schulz iteration on singular matrices")
+
+# The NS coefficients from Muon
+a_ns = 3.4445
+b_ns = -4.7750
+c_ns = 2.0315
+
+print("Muon's Newton-Schulz (NS) iteration uses the matrix recurrence:")
+print("    A = X @ X^T")
+print("    B = b*A + c*A@A")
+print("    X_{k+1} = a*X_k + B @ X_k")
+print(f"  with a={a_ns}, b={b_ns}, c={c_ns}.")
+print()
+print("  For a matrix with SVD M = U diag(s_i) V^T, each step acts on")
+print("  individual singular values as f(s) = a*s + b*s^3 + c*s^5.")
+print()
+print("  CRITICAL NUANCE (from Axiom 0.2a): s=1 is NOT a fixed point!")
+print(f"  f(1) = {a_ns} + ({b_ns}) + {c_ns} = {a_ns + b_ns + c_ns:.4f} != 1")
+print("  The iteration oscillates: nonzero singular values cycle in ~[0.68, 1.13].")
+print("  But the DIRECTION (UV^T, the polar factor) is captured exactly.")
+print("  Muon uses only 5 steps, and the result is later rescaled anyway.")
+print()
+print("  The key question for singular matrices: what happens when s = 0?")
+print()
+
+# ---- Analytical check: f(0) = 0 ----
+f_at_zero = a_ns * 0 + b_ns * 0**3 + c_ns * 0**5
+print(f"  f(0) = {a_ns}*0 + ({b_ns})*0^3 + {c_ns}*0^5 = {f_at_zero:.4f}")
+check(abs(f_at_zero) < 1e-15, "f(0) = 0: zero singular values stay zero under NS iteration")
+print()
+print("  This means: NS maps 0 -> 0 at every step. Zero singular values")
+print("  remain exactly zero forever. The iteration produces a scaled partial")
+print("  isometry (up to the scale oscillation on nonzero singular values).")
+print("  The rank structure is perfectly preserved.\n")
+
+# ---- Show the scalar polynomial behavior ----
+print("  Scalar polynomial behavior (f applied to individual singular values):\n")
+print(f"  {'s_init':>10s}  {'after 1':>10s}  {'after 2':>10s}  {'after 5 (Muon default)':>22s}")
+print(f"  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*22}")
+
+
+def ns_poly(s):
+    """Newton-Schulz polynomial f(s) = a*s + b*s^3 + c*s^5."""
+    return a_ns * s + b_ns * s**3 + c_ns * s**5
+
+
+test_sigmas = [0.0, 0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+
+for s0 in test_sigmas:
+    f1 = ns_poly(s0)
+    f2 = ns_poly(f1)
+    s_iter = s0
+    for _ in range(5):
+        s_iter = ns_poly(s_iter)
+    print(f"  {s0:10.4f}  {f1:10.6f}  {f2:10.6f}  {s_iter:22.6f}")
+
+print()
+print("  Note: nonzero values do NOT converge to 1 -- they oscillate.")
+print("  But f(0) = 0 exactly. This is all that matters for rank deficiency.\n")
+
+check(abs(ns_poly(0.0)) < 1e-15, "f(0) = 0 numerically confirmed")
+
+# Verify zero stays zero after many iterations
+s_test_zero = 0.0
+for _ in range(100):
+    s_test_zero = ns_poly(s_test_zero)
+check(abs(s_test_zero) < 1e-15, "f^100(0) = 0: zero singular values stay zero forever")
+print()
+
+# ---- Muon's actual matrix NS implementation ----
+def ortho_ns(M, steps=5):
+    """Muon's Newton-Schulz iteration (exact replica of zeropower_via_newtonschulz5).
+
+    Uses the 5th-order NS iteration:
+        A = X @ X^T;  B = b*A + c*A@A;  X = a*X + B@X
+    starting from X_0 = M / (||M||_F + eps).
+
+    Output is NOT orthogonal (singular values in ~[0.68, 1.13]),
+    but the polar factor direction (UV^T) matches the exact SVD.
+    """
+    X = M.copy().astype(np.float64)
+    transposed = False
+    if M.shape[0] > M.shape[1]:
+        X = X.T
+        transposed = True
+    norm = np.linalg.norm(X, 'fro')
+    X = X / (norm + 1e-7)
+    for _ in range(steps):
+        A = X @ X.T
+        B = b_ns * A + c_ns * A @ A
+        X = a_ns * X + B @ X
+    if transposed:
+        X = X.T
+    return X
+
+
+def ortho_svd(M):
+    """Exact orthogonal polar factor via SVD."""
+    U, _, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+# ---- Full matrix NS on M = [[1,0],[0,0]] ----
+print("  Now apply the full matrix NS iteration to M = [[1,0],[0,0]]:\n")
+
+M_sing = np.array([[1.0, 0.0],
+                    [0.0, 0.0]])
+
+X_ns = ortho_ns(M_sing, steps=5)
+Q_exact = ortho_svd(M_sing)
+
+print("  Tracing the iteration (5 steps, Muon default):")
+X_trace = M_sing.copy().astype(np.float64)
+norm_trace = np.linalg.norm(X_trace, 'fro')
+X_trace = X_trace / (norm_trace + 1e-7)
+print(f"  X_0 = M / (||M||_F + eps) = M / {norm_trace + 1e-7:.7f}")
+mat("X_0", X_trace)
+
+for step in range(5):
+    A_t = X_trace @ X_trace.T
+    B_t = b_ns * A_t + c_ns * A_t @ A_t
+    X_trace = a_ns * X_trace + B_t @ X_trace
+    svals_t = np.linalg.svd(X_trace, compute_uv=False)
+    print(f"  Step {step+1}: singular values = {np.array2string(svals_t, precision=8)}")
+
+print()
+mat("X_NS (after 5 steps)", X_ns)
+mat("Q_SVD = U V^T (exact)", Q_exact)
+
+svals_ns = np.linalg.svd(X_ns, compute_uv=False)
+print(f"  NS singular values: {svals_ns}")
+print(f"  (NOT {'{'}0, 1{'}'} -- this is expected! Muon's NS does not produce")
+print(f"   orthogonal matrices. Singular values land in ~[0.68, 1.13].)\n")
+
+# The key check: zero singular values stay zero
+zero_svals_preserved = all(s < 1e-10 for s in svals_ns if s < 0.5)
+nonzero_svals_exist = any(s > 0.5 for s in svals_ns)
+check(zero_svals_preserved, "Zero singular values remain zero (< 1e-10)")
+check(nonzero_svals_exist, "Nonzero singular values are pushed toward ~[0.68, 1.13]")
+print()
+
+# Directional check: extract UV^T from NS result, compare to exact
+Q_ns_direction = ortho_svd(X_ns)  # extract the polar factor of the NS output
+dir_dev = np.max(np.abs(Q_ns_direction - Q_exact))
+print(f"  Directional comparison: ortho_svd(X_NS) vs Q_exact")
+print(f"  max |ortho_svd(X_NS) - Q_SVD| = {dir_dev:.2e}")
+check(dir_dev < 1e-10, "NS captures the correct polar direction (UV^T matches SVD)")
+print()
+
+# ---- Test on a larger singular matrix ----
+print("  Test on a larger rank-deficient matrix (5x5, rank 3):\n")
+
+n_large = 5
+rank_target = 3
+U_large, _ = np.linalg.qr(rng.standard_normal((n_large, n_large)))
+V_large, _ = np.linalg.qr(rng.standard_normal((n_large, n_large)))
+svals_large = np.array([3.0, 2.0, 1.0, 0.0, 0.0])
+M_large = U_large @ np.diag(svals_large) @ V_large.T
+
+print(f"  Constructed 5x5 matrix with singular values: {svals_large}")
+print(f"  rank = {rank_target}\n")
+
+# SVD polar
+Q_large_exact = ortho_svd(M_large)
+Q_large_svd, P_large, _, _, _ = polar_via_svd(M_large)
+recon_large = np.max(np.abs(Q_large_svd @ P_large - M_large))
+
+# NS iteration (Muon's 5 steps)
+X_large_ns = ortho_ns(M_large, steps=5)
+svals_ns_large = np.linalg.svd(X_large_ns, compute_uv=False)
+Q_ns_large_dir = ortho_svd(X_large_ns)  # extract polar direction
+
+print(f"  SVD polar: max|QP - M| = {recon_large:.2e}")
+check(recon_large < 1e-10, "5x5 rank-3: SVD polar QP = M")
+print()
+
+print(f"  NS output singular values (5 steps): {np.array2string(svals_ns_large, precision=6)}")
+n_near_zero = np.sum(svals_ns_large < 1e-6)
+n_nonzero = np.sum(svals_ns_large > 0.5)
+print(f"  # near-zero singular values: {n_near_zero}  (expected: {n_large - rank_target})")
+print(f"  # nonzero singular values  : {n_nonzero}  (expected: {rank_target})")
+check(n_near_zero == n_large - rank_target,
+      f"5x5 rank-3: NS preserves {n_large - rank_target} zero singular values")
+print()
+
+# For rank-deficient matrices, UV^T is ambiguous in the null space.
+# We compare the action on the RANGE space only: project M's right
+# singular vectors (nonzero svals) and check that NS and SVD agree there.
+_, s_orig, Vt_orig = np.linalg.svd(M_large, full_matrices=False)
+V_range = Vt_orig[:rank_target, :].T  # columns = right singular vectors in range
+ns_on_range = X_large_ns @ V_range    # how NS maps the range
+q_on_range = Q_large_exact @ V_range  # how exact Q maps the range
+# Normalize columns (NS has non-unit singular values)
+for col in range(rank_target):
+    ns_norm = np.linalg.norm(ns_on_range[:, col])
+    q_norm = np.linalg.norm(q_on_range[:, col])
+    if ns_norm > 1e-10:
+        ns_on_range[:, col] /= ns_norm
+    if q_norm > 1e-10:
+        q_on_range[:, col] /= q_norm
+dir_dev_large = np.max(np.abs(ns_on_range - q_on_range))
+print(f"  Directional comparison (range-space only, normalized):")
+print(f"  max |NS_dir - SVD_dir| on range = {dir_dev_large:.2e}")
+print(f"  (Null-space directions are ambiguous for rank-deficient M,")
+print(f"   so we only compare on the rank-{rank_target} range space.)")
+check(dir_dev_large < 1e-8,
+      "5x5 rank-3: NS polar direction matches SVD on range space")
+print()
+print("  Gauge theory interpretation:")
+print("  Muon's Newton-Schulz iteration naturally handles rank-deficient")
+print("  weight matrices. The polynomial f(s) = a*s + b*s^3 + c*s^5 has")
+print("  f(0) = 0, so zero singular values stay exactly zero at every step.")
+print("  Nonzero singular values oscillate in ~[0.68, 1.13] but the DIRECTION")
+print("  (the UV^T polar factor) is captured exactly. This is what matters for")
+print("  gauge fixing: the orthogonal frame is correct, and Muon rescales the")
+print("  update later anyway.")
+print()
+print("  For rank-deficient M, the NS output is a 'scaled partial isometry':")
+print("  it acts as ~1x on the range of M and as 0 on the kernel. The gauge")
+print("  fixing still works -- the fiber degenerates from a group orbit to a")
+print("  cone, but the gauge direction (which submanifold of O(n) we project")
+print("  onto) is well-defined.\n")
+
+
+# ===================================================================
+#  FINAL VERDICT
+# ===================================================================
+
+sep("FINAL VERDICT")
+
+print(f"  Total checks: {total_checks}")
+print(f"  Passed      : {total_checks - total_failed}")
+print(f"  Failed      : {total_failed}")
+print()
+
+if all_pass:
+    print("  ============================================")
+    print("  =            ALL TESTS PASSED              =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.1b VERIFIED:")
+    print("    1. For singular M, (M^T M)^{-1/2} does not exist (zero eigenvalue).")
+    print("    2. The SVD-based polar decomposition M = QP still works:")
+    print("       Q = UV^T is a partial isometry, P = VSV^T is PSD (not PD).")
+    print("    3. Q is NOT unique for rank-deficient M: any rotation in")
+    print("       ker(M) gives a valid alternative Q.")
+    print("    4. For matrices approaching singularity (sigma_min -> 0),")
+    print("       the SVD method remains stable while the eigen method fails.")
+    print("    5. Muon's Newton-Schulz iteration handles rank deficiency")
+    print("       gracefully: f(0) = 0 ensures zero singular values stay zero.")
+    print("       The output is not orthogonal (singular values oscillate in")
+    print("       ~[0.68, 1.13]), but the POLAR DIRECTION (UV^T) matches the")
+    print("       exact SVD. This directional accuracy is what matters for")
+    print("       gauge fixing -- Muon rescales the update later anyway.")
+    print("    6. The gauge fixing ortho(M) = UV^T is ALWAYS well-defined.")
+    print("       For singular M the fiber degenerates (P is PSD not PD)")
+    print("       and the gauge slice is no longer a single point, but")
+    print("       a coset of the stabilizer subgroup acting on ker(M).")
+else:
+    print("  ============================================")
+    print("  =          SOME TESTS FAILED               =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.1b: VERIFICATION INCOMPLETE -- see failures above.")
+
+print()

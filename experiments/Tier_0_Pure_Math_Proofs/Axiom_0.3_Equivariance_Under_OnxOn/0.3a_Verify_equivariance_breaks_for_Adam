@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""
+Experiment 0.3a -- Verify equivariance breaks for Adam
+=======================================================
+
+Axiom 0.3 (O(n) x O(m) equivariance):
+    For any R in O(n), S in O(m), and any n x m gradient matrix G:
+        ortho(R G S^T) = R ortho(G) S^T
+
+This experiment proves that Adam's element-wise update rule violates this
+equivariance, while SGD and Muon preserve it.  The violation is O(1), not
+O(epsilon) -- Adam *fundamentally* depends on the coordinate system in which
+the gradient is expressed.
+
+Gauge-theory meaning
+--------------------
+A weight matrix W lives in R^{n x m}, but the network's function is invariant
+under W -> R W S^T for orthogonal R, S that are absorbed by neighboring layers.
+These are "gauge transformations."  An optimizer is gauge-covariant if its
+update rule commutes with gauge transformations.
+
+- SGD:  eta * G  ->  trivially covariant (scaling commutes with everything).
+- Muon: ortho(G) = U V^T from SVD  ->  covariant by Axiom 0.3.
+- Adam: G / (sqrt(G**2) + eps)  ->  NOT covariant.  Element-wise squaring
+  does not commute with orthogonal mixing of matrix entries.
+
+This is the algebraic root of why Adam is "coordinate-dependent": its update
+depends on which gauge you happen to express the gradient in.
+
+Hypothesis
+----------
+||Adam(R M S^T) - R Adam(M) S^T||_F  >  0.1 * ||Adam(M)||_F
+for generic R, S in O(n).  The violation is O(1), not O(epsilon).
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+RNG = np.random.default_rng(42)
+
+# ---------------------------------------------------------------------------
+# Helper: generate a random orthogonal matrix via QR of Gaussian
+# ---------------------------------------------------------------------------
+def random_orthogonal(n, rng=RNG):
+    """Return a uniformly random element of O(n) via QR decomposition."""
+    A = rng.standard_normal((n, n))
+    Q, R_qr = np.linalg.qr(A)
+    # Ensure uniform Haar measure: fix sign ambiguity of QR
+    Q = Q @ np.diag(np.sign(np.diag(R_qr)))
+    return Q
+
+
+# ---------------------------------------------------------------------------
+# The three optimizer "step" functions (single-step, no momentum state)
+# ---------------------------------------------------------------------------
+EPS = 1e-8
+
+def sgd_step(G, lr=1.0):
+    """SGD step: f(G) = lr * G."""
+    return lr * G
+
+def muon_step(G):
+    """Muon step: f(G) = UV^T from the SVD of G (orthogonal projection)."""
+    U, _, Vt = np.linalg.svd(G, full_matrices=False)
+    return U @ Vt
+
+def adam_step(G, eps=EPS):
+    """
+    Simplified Adam step (single-step, no momentum):
+        f(G) = G / (sqrt(G**2) + eps)
+
+    This is the element-wise normalization that is the core of Adam's
+    per-coordinate rescaling.  With beta2 -> 0, the second moment v = G**2,
+    and the update is G / (sqrt(v) + eps) = G / (|G| + eps).
+    """
+    return G / (np.sqrt(G ** 2) + eps)
+
+
+# ---------------------------------------------------------------------------
+# Equivariance violation measurement
+# ---------------------------------------------------------------------------
+def equivariance_violation(step_fn, M, R, S):
+    """
+    Compute ||f(R M S^T) - R f(M) S^T||_F.
+    If f is equivariant, this is zero (up to floating point).
+    """
+    left = step_fn(R @ M @ S.T)          # apply f to the rotated input
+    right = R @ step_fn(M) @ S.T         # rotate the output of f
+    return np.linalg.norm(left - right, 'fro')
+
+
+# ===================================================================
+# PART 1: The "5 lines of numpy" proof on a concrete 3x3 example
+# ===================================================================
+print("=" * 72)
+print("PART 1: The '5 lines of numpy' proof  (3x3)")
+print("=" * 72)
+print()
+
+M = RNG.standard_normal((3, 3))
+R = random_orthogonal(3)
+S = random_orthogonal(3)
+
+adam_of_rotated = adam_step(R @ M @ S.T)
+rotated_adam    = R @ adam_step(M) @ S.T
+diff = adam_of_rotated - rotated_adam
+
+frob_diff = np.linalg.norm(diff, 'fro')
+frob_adam = np.linalg.norm(adam_step(M), 'fro')
+relative  = frob_diff / frob_adam
+
+print(f"  M (3x3 random):\n{M}\n")
+print(f"  adam(R M S^T):\n{adam_of_rotated}\n")
+print(f"  R adam(M) S^T:\n{rotated_adam}\n")
+print(f"  Difference:\n{diff}\n")
+print(f"  ||adam(R M S^T) - R adam(M) S^T||_F = {frob_diff:.6f}")
+print(f"  ||adam(M)||_F                        = {frob_adam:.6f}")
+print(f"  Relative violation                   = {relative:.6f}")
+print()
+
+part1_pass = frob_diff > 0.01
+print(f"  PASS: violation is clearly nonzero (O(1))" if part1_pass
+      else f"  FAIL: violation unexpectedly small")
+print()
+
+
+# ===================================================================
+# PART 2: Why it breaks -- the algebraic explanation
+# ===================================================================
+print("=" * 72)
+print("PART 2: Why it breaks -- element-wise squaring vs rotation")
+print("=" * 72)
+print()
+print("  The key identity that FAILS:")
+print("    (R M S^T)**2  !=  R (M**2) S^T     (element-wise squaring)")
+print()
+print("  Element-wise squaring acts on individual matrix entries.")
+print("  Orthogonal rotation mixes those entries.  So squaring-then-rotating")
+print("  gives a different result from rotating-then-squaring.")
+print()
+
+M2 = M ** 2                           # element-wise square of M
+rotated_M = R @ M @ S.T
+rotated_M2 = rotated_M ** 2           # square AFTER rotating
+R_M2_ST = R @ M2 @ S.T               # rotate AFTER squaring
+
+print(f"  (R M S^T)**2   (square after rotating):\n{rotated_M2}\n")
+print(f"  R (M**2) S^T   (rotate after squaring):\n{R_M2_ST}\n")
+print(f"  Difference:\n{rotated_M2 - R_M2_ST}\n")
+
+sq_diff = np.linalg.norm(rotated_M2 - R_M2_ST, 'fro')
+print(f"  ||(R M S^T)**2 - R(M**2)S^T||_F = {sq_diff:.6f}")
+print()
+print("  This noncommutativity is the algebraic root of Adam's equivariance")
+print("  violation.  Adam divides by sqrt(G**2) + eps, which depends on the")
+print("  coordinate system.  Rotate the gradient, and the denominator changes")
+print("  in a way that does NOT correspond to rotating the numerator.")
+print()
+
+part2_pass = sq_diff > 0.01
+print(f"  PASS: (RMS^T)**2 != R(M**2)S^T confirmed" if part2_pass
+      else f"  FAIL: unexpected near-equality")
+print()
+
+
+# ===================================================================
+# PART 3: Three-way comparison -- SGD vs Muon vs Adam
+# ===================================================================
+print("=" * 72)
+print("PART 3: Three-way equivariance comparison (SGD vs Muon vs Adam)")
+print("=" * 72)
+print()
+print("  Using the same M, R, S from Part 1.")
+print()
+
+results = {}
+for name, fn in [("SGD", sgd_step), ("Muon", muon_step), ("Adam", adam_step)]:
+    viol = equivariance_violation(fn, M, R, S)
+    norm_f = np.linalg.norm(fn(M), 'fro')
+    rel = viol / norm_f if norm_f > 0 else 0.0
+    results[name] = (viol, norm_f, rel)
+    print(f"  {name:5s}: violation = {viol:.2e},  ||f(M)||_F = {norm_f:.4f},  "
+          f"relative = {rel:.2e}")
+
+print()
+print("  SGD is trivially equivariant:  R (eta G) S^T = eta (R G S^T).")
+print("  Muon is equivariant by Axiom 0.3:  ortho(R G S^T) = R ortho(G) S^T.")
+print("  Adam is NOT equivariant:  element-wise ops break under rotation.")
+print()
+
+sgd_ok  = results["SGD"][0]  < 1e-10
+muon_ok = results["Muon"][0] < 1e-10
+adam_breaks = results["Adam"][2] > 0.1
+
+part3_pass = sgd_ok and muon_ok and adam_breaks
+print(f"  SGD  violation ~ 0:  {'PASS' if sgd_ok else 'FAIL'}  "
+      f"({results['SGD'][0]:.2e})")
+print(f"  Muon violation ~ 0:  {'PASS' if muon_ok else 'FAIL'}  "
+      f"({results['Muon'][0]:.2e})")
+print(f"  Adam violation > 0.1 * ||adam(M)||_F:  "
+      f"{'PASS' if adam_breaks else 'FAIL'}  ({results['Adam'][2]:.4f})")
+print()
+
+
+# ===================================================================
+# PART 4: Statistical sweep -- 1000 trials at multiple sizes
+# ===================================================================
+print("=" * 72)
+print("PART 4: Statistical sweep (1000 trials, square matrices)")
+print("=" * 72)
+print()
+
+N_TRIALS = 1000
+SIZES = [(3, 3), (5, 5), (10, 10)]
+
+hypothesis_holds = True
+
+for (n, m) in SIZES:
+    violations = {"SGD": [], "Muon": [], "Adam": []}
+    adam_relative = []
+    adam_hypothesis_count = 0
+
+    for _ in range(N_TRIALS):
+        Mi = RNG.standard_normal((n, m))
+        Ri = random_orthogonal(n)
+        Si = random_orthogonal(m)
+
+        for name, fn in [("SGD", sgd_step), ("Muon", muon_step),
+                         ("Adam", adam_step)]:
+            v = equivariance_violation(fn, Mi, Ri, Si)
+            violations[name].append(v)
+
+        adam_norm = np.linalg.norm(adam_step(Mi), 'fro')
+        adam_rel = violations["Adam"][-1] / adam_norm if adam_norm > 0 else 0.0
+        adam_relative.append(adam_rel)
+        if adam_rel > 0.1:
+            adam_hypothesis_count += 1
+
+    print(f"  Size {n}x{m}  ({N_TRIALS} trials)")
+    print(f"  {'Optimizer':8s}  {'mean':>12s}  {'std':>12s}  "
+          f"{'min':>12s}  {'max':>12s}")
+    print(f"  {'-'*8}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*12}")
+    for name in ["SGD", "Muon", "Adam"]:
+        arr = np.array(violations[name])
+        print(f"  {name:8s}  {arr.mean():12.2e}  {arr.std():12.2e}  "
+              f"{arr.min():12.2e}  {arr.max():12.2e}")
+
+    pct = 100.0 * adam_hypothesis_count / N_TRIALS
+    print()
+    print(f"  Adam relative violation > 0.1:  "
+          f"{adam_hypothesis_count}/{N_TRIALS}  ({pct:.1f}%)")
+    print(f"  Mean Adam relative violation:   {np.mean(adam_relative):.4f}")
+    print()
+
+    if pct < 90.0:
+        hypothesis_holds = False
+
+part4_pass = hypothesis_holds
+print(f"  Hypothesis (Adam violation > 0.1*||adam(M)||_F for generic R,S): "
+      f"{'PASS' if part4_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 5: Rectangular matrices -- 4x2, 8x3
+# ===================================================================
+print("=" * 72)
+print("PART 5: Rectangular matrices (extends beyond square)")
+print("=" * 72)
+print()
+
+RECT_SIZES = [(4, 2), (8, 3)]
+rect_pass = True
+
+for (n, m) in RECT_SIZES:
+    violations = {"SGD": [], "Muon": [], "Adam": []}
+    adam_relative = []
+    adam_hypothesis_count = 0
+
+    for _ in range(N_TRIALS):
+        Mi = RNG.standard_normal((n, m))
+        Ri = random_orthogonal(n)
+        Si = random_orthogonal(m)
+
+        for name, fn in [("SGD", sgd_step), ("Muon", muon_step),
+                         ("Adam", adam_step)]:
+            v = equivariance_violation(fn, Mi, Ri, Si)
+            violations[name].append(v)
+
+        adam_norm = np.linalg.norm(adam_step(Mi), 'fro')
+        adam_rel = violations["Adam"][-1] / adam_norm if adam_norm > 0 else 0.0
+        adam_relative.append(adam_rel)
+        if adam_rel > 0.1:
+            adam_hypothesis_count += 1
+
+    print(f"  Size {n}x{m}  ({N_TRIALS} trials)")
+    print(f"  {'Optimizer':8s}  {'mean':>12s}  {'std':>12s}  "
+          f"{'min':>12s}  {'max':>12s}")
+    print(f"  {'-'*8}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*12}")
+    for name in ["SGD", "Muon", "Adam"]:
+        arr = np.array(violations[name])
+        print(f"  {name:8s}  {arr.mean():12.2e}  {arr.std():12.2e}  "
+              f"{arr.min():12.2e}  {arr.max():12.2e}")
+
+    pct = 100.0 * adam_hypothesis_count / N_TRIALS
+    print()
+    print(f"  Adam relative violation > 0.1:  "
+          f"{adam_hypothesis_count}/{N_TRIALS}  ({pct:.1f}%)")
+    print(f"  Mean Adam relative violation:   {np.mean(adam_relative):.4f}")
+    print()
+
+    if pct < 90.0:
+        rect_pass = False
+
+part5_pass = rect_pass
+print(f"  Rectangular hypothesis holds: {'PASS' if part5_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 6: Summary and gauge-theory commentary
+# ===================================================================
+print("=" * 72)
+print("PART 6: Summary")
+print("=" * 72)
+print()
+print("  Gauge-theory interpretation:")
+print("  ----------------------------")
+print("  A neural network's loss is invariant under 'gauge transformations'")
+print("  W -> R W S^T at each layer (with compensating transforms at neighbors).")
+print("  An optimizer that is NOT equivariant under these transforms gives")
+print("  DIFFERENT updates in different gauges -- its trajectory depends on")
+print("  arbitrary coordinate choices that have no physical (functional) meaning.")
+print()
+print("  - SGD (eta * G):  Gauge-covariant.  The update direction is the same")
+print("    in every coordinate system.  Trivially: R(eta G)S^T = eta(R G S^T).")
+print()
+print("  - Muon (UV^T):  Gauge-covariant by Axiom 0.3.  The orthogonal")
+print("    projection commutes with O(n) x O(m) gauge transforms.  Muon's")
+print("    update has no gauge-dependent artifacts.")
+print()
+print("  - Adam (G / (sqrt(G^2) + eps)):  NOT gauge-covariant.  The element-wise")
+print("    operations (squaring, division) act on individual matrix entries,")
+print("    which are gauge-dependent quantities.  Rotating the basis mixes")
+print("    entries, so squaring-then-rotating != rotating-then-squaring.")
+print("    Adam's update genuinely depends on which coordinates you use.")
+print()
+print("  This is not a small numerical artifact -- the violation is O(1) relative")
+print("  to the update norm.  It means Adam's optimization trajectory through")
+print("  weight space is a gauge artifact: the same initial conditions in a")
+print("  different gauge lead to materially different training dynamics.")
+print()
+
+all_pass = part1_pass and part2_pass and part3_pass and part4_pass and part5_pass
+
+print("  " + "-" * 40)
+print(f"  OVERALL: {'ALL TESTS PASSED' if all_pass else 'SOME TESTS FAILED'}")
+print("  " + "-" * 40)
+print()
+print(f"  Part 1 (5 lines of numpy proof):         {'PASS' if part1_pass else 'FAIL'}")
+print(f"  Part 2 (algebraic explanation):           {'PASS' if part2_pass else 'FAIL'}")
+print(f"  Part 3 (SGD vs Muon vs Adam):            {'PASS' if part3_pass else 'FAIL'}")
+print(f"  Part 4 (statistical sweep, square):       {'PASS' if part4_pass else 'FAIL'}")
+print(f"  Part 5 (rectangular matrices):            {'PASS' if part5_pass else 'FAIL'}")
+print()
+
+if all_pass:
+    print("  CONCLUSION: Adam is coordinate-dependent.  Muon is not.")
+    print("  This is the algebraic root of Muon's advantage as a gauge-fixing")
+    print("  optimizer: it respects the symmetry structure of the weight space.")
+else:
+    print("  CONCLUSION: Unexpected failures -- investigate.")
+
+print()

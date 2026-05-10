@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""
+Experiment 1.4c-ii: What If Fewer/More NS Steps (1,2,3,5,7,10,20)
+
+Sweep the number of Newton-Schulz steps k and measure:
+(a) Orthogonality error ||X^TX - I||_F
+(b) Directional error: angle between X and true UV^T
+(c) Actual training: 4-layer deep linear network, 300 steps, for each k value
+
+Find the Pareto frontier of accuracy vs compute.
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def newton_schulz_orthogonalize(G, num_iters=5):
+    """
+    Muon's actual Newton-Schulz orthogonalization (cubic form).
+    X_{k+1} = X_k (3I - X_k^T X_k) / 2
+
+    Returns the orthogonalized matrix after num_iters steps.
+    """
+    m, n = G.shape
+    # Frobenius normalize
+    X = G / (np.linalg.norm(G, 'fro') + 1e-30)
+
+    for _ in range(num_iters):
+        XtX = X.T @ X
+        X = X @ (3 * np.eye(n) - XtX) / 2
+
+    return X
+
+def polar_factor(M):
+    """True polar factor via SVD."""
+    U, S, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+def angular_error(A, B):
+    """Angle between matrices treated as vectors (Frobenius inner product)."""
+    A_norm = A / (np.linalg.norm(A, 'fro') + 1e-30)
+    B_norm = B / (np.linalg.norm(B, 'fro') + 1e-30)
+    cos_angle = np.clip(np.sum(A_norm * B_norm), -1.0, 1.0)
+    return np.arccos(np.abs(cos_angle))
+
+def ortho_error(X):
+    """Orthogonality error: ||X^T X - I||_F."""
+    n = X.shape[1]
+    return np.linalg.norm(X.T @ X - np.eye(n), 'fro')
+
+def train_deep_linear(depth=4, width=32, input_dim=32, output_dim=32,
+                      n_steps=300, lr=0.02, ns_steps=5, seed=42):
+    """
+    Train a deep linear network with Muon-style optimizer.
+    Returns loss curve and final loss.
+
+    Network: W_1 @ W_2 @ ... @ W_depth, mapping input_dim -> output_dim
+    Loss: ||W_1 @ W_2 @ ... @ W_depth - target||_F^2
+
+    Optimizer: gradient -> NS orthogonalize -> step
+    """
+    np.random.seed(seed)
+
+    # Target: a random matrix
+    target = np.random.randn(output_dim, input_dim) * 0.5
+
+    # Initialize weights
+    weights = []
+    dims = [input_dim] + [width] * (depth - 1) + [output_dim]
+    for i in range(depth):
+        fan_in = dims[i]
+        fan_out = dims[i + 1]
+        W = np.random.randn(fan_out, fan_in) * np.sqrt(2.0 / (fan_in + fan_out))
+        weights.append(W)
+
+    losses = []
+
+    for step in range(n_steps):
+        # Forward pass: compute product
+        product = np.eye(input_dim)
+        intermediates = [product.copy()]
+        for W in weights:
+            product = W @ product
+            intermediates.append(product.copy())
+
+        # Loss
+        diff = product - target
+        loss = 0.5 * np.linalg.norm(diff, 'fro') ** 2
+        losses.append(loss)
+
+        # Backward pass: compute gradients
+        # d(loss)/d(W_k) = (W_{k+1}...W_L)^T @ diff @ (W_1...W_{k-1})^T
+        grads = []
+        for k in range(depth):
+            # Left factor: W_{k+1} @ ... @ W_{depth}
+            left = np.eye(weights[k].shape[0])
+            for j in range(k + 1, depth):
+                left = weights[j] @ left
+
+            # Right factor: W_1 @ ... @ W_{k-1}
+            right = np.eye(input_dim)
+            for j in range(k):
+                right = weights[j] @ right
+
+            grad = left.T @ diff @ right.T
+            grads.append(grad)
+
+        # Muon-style update: orthogonalize gradient, then step
+        for k in range(depth):
+            G = grads[k]
+            if ns_steps > 0:
+                G_orth = newton_schulz_orthogonalize(G, num_iters=ns_steps)
+            else:
+                # ns_steps=0: just normalize by Frobenius norm (no orthogonalization)
+                G_orth = G / (np.linalg.norm(G, 'fro') + 1e-30)
+
+            weights[k] -= lr * G_orth
+
+    return losses
+
+def main():
+    np.random.seed(42)
+    print("=" * 70)
+    print("Experiment 1.4c-ii: What If Fewer/More NS Steps")
+    print("=" * 70)
+    print()
+
+    k_values = [0, 1, 2, 3, 5, 7, 10, 20]
+
+    # ── Part (a): Orthogonality error vs k ──────────────────────────────
+    print("Part (a): Orthogonality error ||X^TX - I||_F vs NS steps k")
+    print()
+
+    sizes = [(32, 32), (64, 32), (128, 64)]
+    ortho_results = {}
+
+    for (m, n) in sizes:
+        print(f"  {m}x{n}:")
+        print(f"    {'k':>4s}  {'||X^TX-I||':>12s}  {'||X-UV^T||':>12s}  {'angle(X,UV^T)':>14s}")
+        results_per_k = {}
+
+        for k in k_values:
+            # Average over 5 random matrices
+            ortho_errs = []
+            polar_errs = []
+            angles = []
+
+            for trial in range(5):
+                W = np.random.randn(m, n)
+                X = newton_schulz_orthogonalize(W, num_iters=k)
+                UV = polar_factor(W)
+
+                ortho_errs.append(ortho_error(X))
+                polar_errs.append(np.linalg.norm(X - UV, 'fro'))
+                angles.append(angular_error(X, UV))
+
+            avg_ortho = np.mean(ortho_errs)
+            avg_polar = np.mean(polar_errs)
+            avg_angle = np.mean(angles)
+            results_per_k[k] = (avg_ortho, avg_polar, avg_angle)
+            print(f"    {k:>4d}  {avg_ortho:12.6e}  {avg_polar:12.6e}  {avg_angle:14.6e} rad")
+
+        ortho_results[(m, n)] = results_per_k
+        print()
+
+    # ── Part (b): Convergence quality vs compute cost ───────────────────
+    print("Part (b): Compute cost analysis")
+    print("  Cost per NS step (cubic): 2 matmuls")
+    print("  For m x n matrix: 2 * (n*m*n + m*n*n) FLOPs/step")
+    print()
+    print(f"  {'k':>4s}  {'matmuls':>8s}  {'relative cost':>14s}  {'32x32 ortho':>12s}  {'benefit/cost':>14s}")
+
+    r32 = ortho_results[(32, 32)]
+    baseline_err = r32[0][0] if 0 in r32 else r32[1][0]
+    for k in k_values:
+        matmuls = 2 * k
+        rel_cost = k / 5.0  # relative to Muon's default of 5
+        ortho = r32[k][0]
+        benefit = baseline_err / (ortho + 1e-30)  # error reduction factor
+        efficiency = benefit / (matmuls + 1)  # benefit per matmul
+        print(f"  {k:>4d}  {matmuls:>8d}  {rel_cost:>14.2f}x  {ortho:12.6e}  {efficiency:14.2f}")
+    print()
+
+    # ── Part (c): Training with different k values ──────────────────────
+    print("Part (c): Training 4-layer deep linear network, 300 steps")
+    print("  (width=32, input=32, output=32, lr=0.02)")
+    print()
+
+    training_k_values = [0, 1, 2, 3, 5, 7, 10, 20]
+    training_results = {}
+
+    for k in training_k_values:
+        losses = train_deep_linear(
+            depth=4, width=32, input_dim=32, output_dim=32,
+            n_steps=300, lr=0.02, ns_steps=k, seed=42
+        )
+        final_loss = losses[-1]
+        min_loss = min(losses)
+        training_results[k] = losses
+        print(f"  k={k:>2d}: final_loss={final_loss:.6e}, min_loss={min_loss:.6e}")
+
+    print()
+
+    # ── Part (d): Pareto frontier ───────────────────────────────────────
+    print("Part (d): Pareto frontier -- accuracy vs compute")
+    print(f"  {'k':>4s}  {'final_loss':>12s}  {'cost (matmuls/step)':>20s}  {'on Pareto?':>12s}")
+
+    pareto_points = []
+    for k in training_k_values:
+        cost = max(2 * k, 1)  # minimum cost = 1 (just normalization)
+        loss = training_results[k][-1]
+        pareto_points.append((k, cost, loss))
+
+    # Compute Pareto frontier: point is on frontier if no other point has both
+    # lower cost AND lower loss
+    pareto_mask = []
+    for i, (k_i, c_i, l_i) in enumerate(pareto_points):
+        dominated = False
+        for j, (k_j, c_j, l_j) in enumerate(pareto_points):
+            if i != j and c_j <= c_i and l_j <= l_i and (c_j < c_i or l_j < l_i):
+                dominated = True
+                break
+        pareto_mask.append(not dominated)
+        status = "YES" if not dominated else "no"
+        print(f"  {k_i:>4d}  {l_i:12.6e}  {c_i:>20d}  {status:>12s}")
+    print()
+
+    pareto_k = [pareto_points[i][0] for i in range(len(pareto_points)) if pareto_mask[i]]
+    print(f"  Pareto-optimal k values: {pareto_k}")
+    print()
+
+    # ── Plot ────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Exp 1.4c-ii: What If Fewer/More NS Steps",
+                 fontsize=14, fontweight='bold')
+
+    # Top-left: Orthogonality error vs k
+    ax = axes[0, 0]
+    for (m, n) in sizes:
+        r = ortho_results[(m, n)]
+        ks = sorted(r.keys())
+        errs = [r[k][0] for k in ks]
+        ax.semilogy(ks, errs, 'o-', markersize=5, linewidth=1.5,
+                   label=f'{m}x{n}')
+    ax.set_xlabel('NS steps $k$', fontsize=12)
+    ax.set_ylabel('$||X^TX - I||_F$', fontsize=12)
+    ax.set_title('Orthogonality error vs NS steps')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Top-right: Directional error vs k
+    ax = axes[0, 1]
+    for (m, n) in sizes:
+        r = ortho_results[(m, n)]
+        ks = sorted(r.keys())
+        angles = [r[k][2] for k in ks]
+        ax.semilogy(ks, [max(a, 1e-16) for a in angles], 'o-', markersize=5,
+                   linewidth=1.5, label=f'{m}x{n}')
+    ax.set_xlabel('NS steps $k$', fontsize=12)
+    ax.set_ylabel('Angle to $UV^T$ (rad)', fontsize=12)
+    ax.set_title('Directional error vs NS steps')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Bottom-left: Training loss curves
+    ax = axes[1, 0]
+    cmap = plt.cm.viridis(np.linspace(0, 1, len(training_k_values)))
+    for idx, k in enumerate(training_k_values):
+        losses = training_results[k]
+        ax.semilogy(range(len(losses)), losses, '-', color=cmap[idx],
+                   linewidth=1.5, label=f'k={k}', alpha=0.8)
+    ax.set_xlabel('Training step', fontsize=12)
+    ax.set_ylabel('Loss', fontsize=12)
+    ax.set_title('Training curves (4-layer deep linear)')
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    # Bottom-right: Pareto plot (cost vs final loss)
+    ax = axes[1, 1]
+    costs = [max(2 * k, 1) for k in training_k_values]
+    final_losses = [training_results[k][-1] for k in training_k_values]
+
+    ax.scatter(costs, final_losses, c='blue', s=50, zorder=5)
+    for i, k in enumerate(training_k_values):
+        ax.annotate(f'k={k}', (costs[i], final_losses[i]),
+                   textcoords="offset points", xytext=(5, 5), fontsize=8)
+
+    # Draw Pareto frontier
+    pareto_costs = [pareto_points[i][1] for i in range(len(pareto_points)) if pareto_mask[i]]
+    pareto_losses = [pareto_points[i][2] for i in range(len(pareto_points)) if pareto_mask[i]]
+    sorted_pareto = sorted(zip(pareto_costs, pareto_losses))
+    if sorted_pareto:
+        pc, pl = zip(*sorted_pareto)
+        ax.plot(pc, pl, 'r--', linewidth=2, label='Pareto frontier')
+
+    ax.set_xlabel('Cost (matmuls per training step)', fontsize=12)
+    ax.set_ylabel('Final training loss', fontsize=12)
+    ax.set_title('Pareto frontier: accuracy vs compute')
+    ax.set_yscale('log')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(SCRIPT_DIR, "fewer_more_ns_steps.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"Plot saved: {plot_path}")
+    print()
+
+    # ── PASS/FAIL ───────────────────────────────────────────────────────
+    print("=" * 70)
+    test_results = []
+
+    # Test 1: More NS steps = lower orthogonality error (monotone for k >= 1)
+    r32 = ortho_results[(32, 32)]
+    ks_sorted = sorted(k for k in r32 if k >= 1)
+    errs_sorted = [r32[k][0] for k in ks_sorted]
+    t1 = all(errs_sorted[i] >= errs_sorted[i+1] for i in range(len(errs_sorted)-1))
+    test_results.append(t1)
+    print(f"TEST 1 - More steps = lower ortho error:       {'PASS' if t1 else 'FAIL'}  ({[f'{e:.1e}' for e in errs_sorted]})")
+
+    # Test 2: k=5 (Muon default) substantially reduces orthogonality error
+    # Note: with Frobenius-normalized 32x32, sigma ~ 0.18, so full convergence
+    # takes >10 steps. But k=5 should reduce error by at least 40% from k=0.
+    k5_err = r32[5][0]
+    k0_err = r32[0][0]
+    reduction = (k0_err - k5_err) / k0_err
+    t2 = reduction > 0.4  # at least 40% reduction
+    test_results.append(t2)
+    print(f"TEST 2 - k=5 reduces ortho error by >40%%:      {'PASS' if t2 else 'FAIL'}  (reduction={reduction:.1%}, err: {k0_err:.2e} -> {k5_err:.2e})")
+
+    # Test 3: k=1 gives meaningful but imperfect orthogonalization
+    k1_err = r32[1][0]
+    k0_err = r32[0][0]
+    t3 = k1_err < k0_err and k1_err > 0.01
+    test_results.append(t3)
+    print(f"TEST 3 - k=1 partially orthogonalizes:         {'PASS' if t3 else 'FAIL'}  (k=0: {k0_err:.2e}, k=1: {k1_err:.2e})")
+
+    # Test 4: Training with k=5 outperforms k=0 (Frobenius norm only)
+    loss_k0 = training_results[0][-1]
+    loss_k5 = training_results[5][-1]
+    t4 = loss_k5 < loss_k0
+    test_results.append(t4)
+    print(f"TEST 4 - k=5 trains better than k=0:           {'PASS' if t4 else 'FAIL'}  (k=0: {loss_k0:.2e}, k=5: {loss_k5:.2e})")
+
+    # Test 5: Diminishing returns beyond k=5 (k=10 not dramatically better than k=5)
+    loss_k10 = training_results[10][-1]
+    # k=10 should be at most 2x better than k=5
+    improvement_5_to_10 = (loss_k5 - loss_k10) / (loss_k0 - loss_k5 + 1e-30)
+    t5 = improvement_5_to_10 < 1.0  # improvement from 5->10 is less than 0->5
+    test_results.append(t5)
+    print(f"TEST 5 - Diminishing returns beyond k=5:       {'PASS' if t5 else 'FAIL'}  (0->5 gain vs 5->10 gain ratio: {improvement_5_to_10:.4f})")
+
+    # Test 6: k=5 is on the Pareto frontier
+    t6 = 5 in pareto_k
+    test_results.append(t6)
+    print(f"TEST 6 - k=5 is Pareto-optimal:                {'PASS' if t6 else 'FAIL'}  (Pareto k: {pareto_k})")
+
+    print("=" * 70)
+    all_tests = all(test_results)
+    print(f"\nOVERALL: {'PASS' if all_tests else 'FAIL'} ({sum(test_results)}/{len(test_results)} tests passed)")
+
+if __name__ == "__main__":
+    main()

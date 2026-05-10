@@ -1,0 +1,859 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.4b -- Does ortho(M + eE) ~ ortho(M) for small additive perturbation?
+
+Lipschitz stability of the polar map under additive noise
+==========================================================
+
+Scale invariance (Axiom 0.4a) holds for MULTIPLICATIVE perturbation (cM).
+This experiment asks the harder question: what about ADDITIVE perturbation
+M + eE, where E is a unit-norm noise matrix and e is small?
+
+Theory
+------
+The polar map ortho(M) = UV^T from the SVD is differentiable when M has
+distinct singular values, and its derivative depends on 1/(sigma_i + sigma_j)
+for all pairs of singular values. The sensitivity to perturbation is:
+
+    ||ortho(M + eE) - ortho(M)||_F  <=  C(M) * e
+
+where C(M) depends on the singular value gaps. The tightest bound involves
+the smallest gap 1/(sigma_i + sigma_j), and the worst case gives:
+
+    C(M) = O(1 / sigma_min(M))
+
+For well-conditioned M (sigma_min large), the polar map is stable:
+small additive noise produces small change in the orthogonal factor.
+
+For ill-conditioned M (sigma_min ~ 0), the polar map AMPLIFIES noise:
+even tiny e can produce large deviation in ortho(M).
+
+The key insight: the worst-case perturbation direction is NOT random --
+it's the direction that maximally rotates the smallest singular subspace.
+For a matrix with singular values [sigma_1, ..., sigma_k], a perturbation
+E that mixes the i-th and j-th singular subspaces produces a derivative
+proportional to 1/(sigma_i + sigma_j). The worst case is i=j=k (smallest),
+giving 1/(2*sigma_min).
+
+Hypothesis
+----------
+The polar map is Lipschitz with constant O(1/sigma_min(M)). This limits
+when gauge fixing is helpful: if the momentum/gradient has near-zero
+singular values (common in early training or tiny batches), ortho becomes
+unstable. Muon needs sufficient batch size so that gradient singular values
+are well above zero.
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+RNG = np.random.default_rng(42)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def sep(title: str) -> None:
+    """Print a section separator."""
+    print(f"\n{'=' * 72}")
+    print(f"  {title}")
+    print(f"{'=' * 72}\n")
+
+
+def ortho_svd(M: np.ndarray) -> np.ndarray:
+    """Orthogonal projection via SVD: ortho(M) = U V^T."""
+    U, _, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def ortho_ns(M: np.ndarray, n_iters: int = 50) -> np.ndarray:
+    """
+    Orthogonal projection via Newton-Schulz iteration.
+    Normalizes by ||M||_F first (this is what Muon does).
+    Uses many iterations for high accuracy.
+    """
+    norm = np.linalg.norm(M, 'fro')
+    if norm < 1e-15:
+        return np.zeros_like(M)
+    X = M / norm
+    for _ in range(n_iters):
+        X = 1.5 * X - 0.5 * X @ (X.T @ X)
+    return X
+
+
+def random_unit_perturbation(shape: tuple, rng: np.random.Generator) -> np.ndarray:
+    """Generate a random matrix with unit Frobenius norm."""
+    E = rng.standard_normal(shape)
+    return E / np.linalg.norm(E, 'fro')
+
+
+def make_matrix_with_condition(shape: tuple, kappa: float,
+                               rng: np.random.Generator) -> np.ndarray:
+    """
+    Generate a random matrix with prescribed condition number kappa.
+    Singular values are linearly spaced from 1/kappa to 1.
+    """
+    m, n = shape
+    k = min(m, n)
+    U, _ = np.linalg.qr(rng.standard_normal((m, k)))
+    Vt_full, _ = np.linalg.qr(rng.standard_normal((n, k)))
+    Vt = Vt_full.T
+    sigmas = np.linspace(1.0, 1.0 / kappa, k)
+    return U @ np.diag(sigmas) @ Vt
+
+
+def worst_case_perturbation(M: np.ndarray) -> np.ndarray:
+    """
+    Construct the worst-case perturbation for the polar map.
+
+    The derivative of the polar map P(M) = U V^T involves terms of the form
+    1/(sigma_i + sigma_j). The perturbation that maximizes the derivative
+    mixes singular subspaces separated by the smallest gap.
+
+    For a matrix M = U diag(sigma) V^T, the perturbation E that produces
+    maximal response is one that rotates the smallest singular direction:
+      E ~ u_k v_{k-1}^T - u_{k-1} v_k^T
+    where k is the index of the smallest singular value. This produces
+    a derivative ~ 1/(sigma_k + sigma_{k-1}).
+
+    For highly ill-conditioned M where sigma_k << sigma_{k-1}, this
+    approaches 1/sigma_{k-1} ~ 1/sigma_k.
+    """
+    U, s, Vt = np.linalg.svd(M, full_matrices=False)
+    k = len(s)
+    # Perturbation mixing the two smallest singular subspaces
+    # This is the "rotation" of the last two singular directions
+    E = np.outer(U[:, k-1], Vt[k-2, :]) - np.outer(U[:, k-2], Vt[k-1, :])
+    return E / np.linalg.norm(E, 'fro')
+
+
+def measure_lipschitz_empirical(M: np.ndarray, eps: float, n_dirs: int,
+                                rng: np.random.Generator,
+                                use_ns: bool = False) -> tuple:
+    """
+    Measure empirical Lipschitz constant of the polar map at M.
+    Returns (mean, max, worst_case) Lipschitz constants.
+    """
+    ortho_fn = ortho_ns if use_ns else ortho_svd
+    O_M = ortho_fn(M)
+    shape = M.shape
+
+    lip_vals = []
+    for _ in range(n_dirs):
+        Ei = random_unit_perturbation(shape, rng)
+        O_pert = ortho_fn(M + eps * Ei)
+        dev = np.linalg.norm(O_pert - O_M, 'fro')
+        lip_vals.append(dev / eps)
+
+    # Worst-case direction
+    E_w = worst_case_perturbation(M)
+    O_pert_w = ortho_fn(M + eps * E_w)
+    lip_worst = np.linalg.norm(O_pert_w - O_M, 'fro') / eps
+
+    return np.mean(lip_vals), np.max(lip_vals), lip_worst
+
+
+def sgd_step(G: np.ndarray, lr: float = 0.01) -> np.ndarray:
+    """SGD step: f(G) = lr * G."""
+    return lr * G
+
+
+def adam_step(G: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Simplified single-step Adam: f(G) = G / (sqrt(G^2) + eps)."""
+    return G / (np.sqrt(G ** 2) + eps)
+
+
+# ===================================================================
+# PART 1: Basic perturbation sweep
+# ===================================================================
+
+sep("PART 1: Basic perturbation sweep -- ortho(M + eE) vs ortho(M)")
+
+print("  Generate a well-conditioned 5x5 matrix M (condition number ~3).")
+print("  Generate random unit-norm perturbation E (||E||_F = 1).")
+print("  For e in [1e-8, ..., 1]: compute ||ortho(M + eE) - ortho(M)||_F.")
+print("  Verify deviation scales as O(e) -- linear in e for small e.")
+print()
+
+M = make_matrix_with_condition((5, 5), kappa=3.0, rng=RNG)
+sigmas_M = np.linalg.svd(M, compute_uv=False)
+sigma_min_M = sigmas_M[-1]
+sigma_max_M = sigmas_M[0]
+kappa_M = sigma_max_M / sigma_min_M
+
+print(f"  M: 5x5, sigma_max = {sigma_max_M:.6f}, sigma_min = {sigma_min_M:.6f}, "
+      f"kappa = {kappa_M:.2f}")
+print()
+
+E = random_unit_perturbation((5, 5), RNG)
+O_M = ortho_svd(M)
+
+epsilons = [1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0]
+
+print(f"  {'epsilon':>12s}  {'||ortho(M+eE)-ortho(M)||_F':>28s}  "
+      f"{'deviation / epsilon':>20s}  {'Status'}")
+print(f"  {'-'*12}  {'-'*28}  {'-'*20}  {'-'*6}")
+
+part1_pass = True
+ratios_part1 = []
+for eps_val in epsilons:
+    M_pert = M + eps_val * E
+    O_pert = ortho_svd(M_pert)
+    dev = np.linalg.norm(O_pert - O_M, 'fro')
+    ratio = dev / eps_val if eps_val > 0 else 0
+    ratios_part1.append(ratio)
+    print(f"  {eps_val:12.1e}  {dev:28.2e}  {ratio:20.6f}  {'--'}")
+
+# Check linearity: for the smallest epsilons, the ratio dev/eps should be constant
+small_ratios = ratios_part1[:5]  # epsilons 1e-8 through 1e-4
+ratio_spread = max(small_ratios) / min(small_ratios) if min(small_ratios) > 0 else 999
+part1_pass = ratio_spread < 1.5
+
+print()
+print(f"  Linearity check (small epsilon regime, e <= 1e-4):")
+print(f"    Ratios dev/eps: {['%.4f' % r for r in small_ratios]}")
+print(f"    Max/min ratio spread: {ratio_spread:.4f}")
+print(f"    Linear if spread < 1.5: {'PASS' if part1_pass else 'FAIL'}")
+print()
+print(f"  RESULT: Deviation scales as O(e) for small e. "
+      f"{'PASS' if part1_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 2: Lipschitz constant measurement
+# ===================================================================
+
+sep("PART 2: Lipschitz constant measurement")
+
+print("  For the same M, compute the empirical Lipschitz constant:")
+print("    L_emp = max over directions E of ||ortho(M+eE) - ortho(M)||_F / e")
+print("  Average over 100 random directions, plus worst-case direction.")
+print("  Compare with theoretical bound 1/sigma_min(M).")
+print()
+
+eps_lip = 1e-6
+lip_mean, lip_max, lip_worst = measure_lipschitz_empirical(
+    M, eps_lip, 100, RNG)
+lip_theoretical = 1.0 / sigma_min_M
+
+print(f"  epsilon used for numerical derivative: {eps_lip:.1e}")
+print(f"  Number of random directions:           100")
+print()
+print(f"  Empirical Lipschitz (mean over random):   {lip_mean:.6f}")
+print(f"  Empirical Lipschitz (max over random):    {lip_max:.6f}")
+print(f"  Empirical Lipschitz (worst-case E):       {lip_worst:.6f}")
+print(f"  Theoretical upper bound 1/sigma_min(M):   {lip_theoretical:.6f}")
+print()
+
+# All empirical values should be <= theoretical bound
+part2_pass = (lip_max <= lip_theoretical * 1.05 and
+              lip_worst <= lip_theoretical * 1.05)
+print(f"  All empirical <= bound (5% tol): "
+      f"{'PASS' if part2_pass else 'FAIL'}")
+print(f"    max_random / bound:  {lip_max / lip_theoretical:.6f}")
+print(f"    worst_case / bound:  {lip_worst / lip_theoretical:.6f}")
+print()
+print(f"  RESULT: Polar map Lipschitz constant bounded by 1/sigma_min(M). "
+      f"{'PASS' if part2_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 3: Condition number dependence
+# ===================================================================
+
+sep("PART 3: Condition number dependence")
+
+print("  Generate matrices with controlled condition numbers kappa.")
+print("  For each: measure empirical Lipschitz constant of the polar map.")
+print("  The theoretical bound is 1/sigma_min(M).")
+print()
+print("  Key insight: the empirical Lipschitz (from random directions) also grows")
+print("  with kappa, because even random perturbations have nonzero projection onto")
+print("  the sensitive subspace. The growth rate may be sub-linear in kappa because")
+print("  random directions are unlikely to align perfectly with the worst case.")
+print()
+
+kappas = [1, 2, 5, 10, 50, 100, 1000, 1e6]
+eps_cond = 1e-7
+
+print(f"  {'kappa':>12s}  {'sigma_min':>12s}  {'1/sigma_min':>12s}  "
+      f"{'Lip (emp max)':>14s}  {'emp/bound':>10s}  {'Status'}")
+print(f"  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*14}  {'-'*10}  {'-'*6}")
+
+part3_pass = True
+cond_results = []
+for kappa in kappas:
+    Mi = make_matrix_with_condition((5, 5), kappa, rng=RNG)
+    sigmas_i = np.linalg.svd(Mi, compute_uv=False)
+    smin_i = sigmas_i[-1]
+    O_Mi = ortho_svd(Mi)
+
+    # Measure Lipschitz over 200 random directions for better coverage
+    lip_vals = []
+    for _ in range(200):
+        Ei = random_unit_perturbation((5, 5), RNG)
+        O_pert_i = ortho_svd(Mi + eps_cond * Ei)
+        dev_i = np.linalg.norm(O_pert_i - O_Mi, 'fro')
+        lip_vals.append(dev_i / eps_cond)
+
+    lip_emp_i = np.max(lip_vals)
+    bound_i = 1.0 / smin_i
+    ratio_i = lip_emp_i / bound_i
+    # Empirical should not exceed theoretical bound
+    ok = ratio_i <= 1.05
+    if not ok:
+        part3_pass = False
+
+    cond_results.append((kappa, smin_i, bound_i, lip_emp_i, ratio_i))
+    print(f"  {kappa:12.0f}  {smin_i:12.2e}  {bound_i:12.2e}  "
+          f"{lip_emp_i:14.2e}  {ratio_i:10.4f}  {'PASS' if ok else 'FAIL'}")
+
+print()
+
+# Check monotonicity: Lipschitz constant should generally increase with kappa
+lip_vals_all = [r[3] for r in cond_results]
+monotone_count = sum(1 for i in range(1, len(lip_vals_all))
+                     if lip_vals_all[i] >= lip_vals_all[i-1] * 0.8)
+monotone_ok = monotone_count >= len(lip_vals_all) - 2  # allow 1 non-monotone due to randomness
+
+print(f"  Monotonicity check (Lipschitz grows with kappa):")
+print(f"    Empirical Lip values: {['%.2e' % v for v in lip_vals_all]}")
+print(f"    Mostly increasing: {'PASS' if monotone_ok else 'FAIL'} "
+      f"({monotone_count}/{len(lip_vals_all)-1} increasing pairs)")
+part3_pass = part3_pass and monotone_ok
+print()
+
+# Check growth: Lip at kappa=1e6 should be much larger than at kappa=1
+growth = cond_results[-1][3] / cond_results[0][3]
+growth_ok = growth > 2.0  # at least 2x growth (random dirs won't capture full kappa scaling)
+print(f"  Growth check:")
+print(f"    Lip(kappa=1)   = {cond_results[0][3]:.4f}")
+print(f"    Lip(kappa=1e6) = {cond_results[-1][3]:.4f}")
+print(f"    Growth ratio:    {growth:.1f}x")
+print(f"    Growth > 2x: {'PASS' if growth_ok else 'FAIL'}")
+part3_pass = part3_pass and growth_ok
+print()
+
+# The key test: empirical Lip is always <= 1/sigma_min
+all_bounded = all(r[4] <= 1.05 for r in cond_results)
+print(f"  All empirical Lip <= 1/sigma_min: {'PASS' if all_bounded else 'FAIL'}")
+print()
+print(f"  RESULT: Lipschitz constant grows with kappa and is bounded by 1/sigma_min. "
+      f"{'PASS' if part3_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 4: Ill-conditioned danger zone
+# ===================================================================
+
+sep("PART 4: Ill-conditioned danger zone -- noise amplification")
+
+print("  Create near-singular M with sigma_min = 1e-6.")
+print("  Show that additive perturbation causes MUCH larger deviation for")
+print("  ill-conditioned M than for well-conditioned M.")
+print("  This demonstrates noise amplification in gauge fixing.")
+print()
+
+# Build a 5x5 matrix with sigma_min = 1e-6
+M_ill = make_matrix_with_condition((5, 5), kappa=1e6, rng=RNG)
+sigmas_ill = np.linalg.svd(M_ill, compute_uv=False)
+smin_ill = sigmas_ill[-1]
+smax_ill = sigmas_ill[0]
+kappa_ill = smax_ill / smin_ill
+
+print(f"  M_ill: 5x5, sigma_max = {smax_ill:.6f}, sigma_min = {smin_ill:.2e}, "
+      f"kappa = {kappa_ill:.2e}")
+print()
+
+# Build a well-conditioned comparison matrix
+M_well = make_matrix_with_condition((5, 5), kappa=2.0, rng=RNG)
+sigmas_well = np.linalg.svd(M_well, compute_uv=False)
+smin_well = sigmas_well[-1]
+kappa_well = sigmas_well[0] / smin_well
+
+print(f"  M_well: 5x5, sigma_max = {sigmas_well[0]:.6f}, "
+      f"sigma_min = {smin_well:.6f}, kappa = {kappa_well:.2f}")
+print()
+
+O_M_ill = ortho_svd(M_ill)
+O_M_well = ortho_svd(M_well)
+
+# Compare deviations at various epsilon values
+eps_vals = [1e-10, 1e-8, 1e-6, 1e-4]
+
+print(f"  {'epsilon':>12s}  {'dev (ill)':>14s}  {'dev (well)':>14s}  "
+      f"{'ratio ill/well':>16s}  {'amp (ill)':>12s}  {'amp (well)':>12s}")
+print(f"  {'-'*12}  {'-'*14}  {'-'*14}  "
+      f"{'-'*16}  {'-'*12}  {'-'*12}")
+
+part4_pass = True
+# Use many random directions and take the max for each
+for eps_val in eps_vals:
+    devs_ill = []
+    devs_well = []
+    for _ in range(200):
+        Ei = random_unit_perturbation((5, 5), RNG)
+
+        O_pert_ill = ortho_svd(M_ill + eps_val * Ei)
+        devs_ill.append(np.linalg.norm(O_pert_ill - O_M_ill, 'fro'))
+
+        O_pert_well = ortho_svd(M_well + eps_val * Ei)
+        devs_well.append(np.linalg.norm(O_pert_well - O_M_well, 'fro'))
+
+    max_ill = np.max(devs_ill)
+    max_well = np.max(devs_well)
+    ratio = max_ill / max_well if max_well > 0 else float('inf')
+    amp_ill = max_ill / eps_val
+    amp_well = max_well / eps_val
+
+    print(f"  {eps_val:12.1e}  {max_ill:14.2e}  {max_well:14.2e}  "
+          f"{ratio:16.1f}  {amp_ill:12.1f}  {amp_well:12.1f}")
+
+print()
+
+# The definitive test: for the same epsilon, ill-conditioned M produces
+# vastly larger deviation than well-conditioned M
+eps_test = 1e-8
+devs_ill_final = []
+devs_well_final = []
+for _ in range(500):
+    Ei = random_unit_perturbation((5, 5), RNG)
+    O_pert_ill = ortho_svd(M_ill + eps_test * Ei)
+    O_pert_well = ortho_svd(M_well + eps_test * Ei)
+    devs_ill_final.append(np.linalg.norm(O_pert_ill - O_M_ill, 'fro'))
+    devs_well_final.append(np.linalg.norm(O_pert_well - O_M_well, 'fro'))
+
+mean_ill = np.mean(devs_ill_final)
+mean_well = np.mean(devs_well_final)
+max_ill = np.max(devs_ill_final)
+max_well = np.max(devs_well_final)
+amp_ratio = mean_ill / mean_well
+
+print(f"  Definitive comparison at epsilon = {eps_test:.1e} (500 random directions):")
+print(f"    Ill-conditioned (kappa={kappa_ill:.0e}):")
+print(f"      mean deviation = {mean_ill:.2e},  max = {max_ill:.2e}")
+print(f"      mean amplification = {mean_ill / eps_test:.1f}")
+print(f"    Well-conditioned (kappa={kappa_well:.1f}):")
+print(f"      mean deviation = {mean_well:.2e},  max = {max_well:.2e}")
+print(f"      mean amplification = {mean_well / eps_test:.1f}")
+print(f"    Amplification ratio (ill / well): {amp_ratio:.1f}x")
+print()
+
+# Verify the ill-conditioned amplification is significantly larger
+part4_pass = amp_ratio > 2.0 and mean_ill / eps_test > mean_well / eps_test
+print(f"  Ill-conditioned amplifies more than well-conditioned: "
+      f"{'PASS' if part4_pass else 'FAIL'}")
+print(f"    (amplification ratio = {amp_ratio:.1f}x)")
+print()
+
+# Show theoretical connection: empirical Lip should be bounded by 1/sigma_min
+lip_ill = max_ill / eps_test
+lip_well = max_well / eps_test
+bound_ill = 1.0 / smin_ill
+bound_well = 1.0 / smin_well
+
+bounded = lip_ill <= bound_ill * 1.05 and lip_well <= bound_well * 1.05
+part4_pass = part4_pass and bounded
+print(f"  Bound check:")
+print(f"    Ill:  Lip_emp = {lip_ill:.2f},  bound = {bound_ill:.2f},  "
+      f"ratio = {lip_ill / bound_ill:.4f}")
+print(f"    Well: Lip_emp = {lip_well:.2f},  bound = {bound_well:.2f},  "
+      f"ratio = {lip_well / bound_well:.4f}")
+print(f"    Both bounded: {'PASS' if bounded else 'FAIL'}")
+print()
+print(f"  RESULT: Ill-conditioned M causes noise amplification in ortho(). "
+      f"{'PASS' if part4_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 5: Comparison with SGD and Adam
+# ===================================================================
+
+sep("PART 5: Comparison with SGD and Adam -- Lipschitz constants")
+
+print("  Lipschitz constant of each optimizer's update rule:")
+print("    SGD:  ||sgd(M+eE) - sgd(M)||_F / e  =  lr  (constant)")
+print("    Adam: ||adam(M+eE) - adam(M)||_F / e  depends on M, bounded")
+print("    Muon: ||ortho(M+eE) - ortho(M)||_F / e  up to 1/sigma_min(M)")
+print()
+
+kappas_compare = [1, 2, 5, 10, 50, 100, 1000]
+eps_comp = 1e-6
+lr_sgd = 0.01
+
+print(f"  {'kappa':>8s}  {'SGD Lip':>12s}  {'Adam Lip':>12s}  "
+      f"{'Muon Lip':>12s}  {'1/sig_min':>12s}")
+print(f"  {'-'*8}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*12}")
+
+part5_pass = True
+part5_data = []
+for kappa in kappas_compare:
+    Mi = make_matrix_with_condition((5, 5), kappa, rng=RNG)
+    sigmas_i = np.linalg.svd(Mi, compute_uv=False)
+    smin_i = sigmas_i[-1]
+
+    sgd_lips = []
+    adam_lips = []
+    muon_lips = []
+
+    base_sgd = sgd_step(Mi, lr=lr_sgd)
+    base_adam = adam_step(Mi)
+    base_muon = ortho_svd(Mi)
+
+    for _ in range(100):
+        Ei = random_unit_perturbation((5, 5), RNG)
+        Mi_pert = Mi + eps_comp * Ei
+
+        pert_sgd = sgd_step(Mi_pert, lr=lr_sgd)
+        sgd_lips.append(np.linalg.norm(pert_sgd - base_sgd, 'fro') / eps_comp)
+
+        pert_adam = adam_step(Mi_pert)
+        adam_lips.append(np.linalg.norm(pert_adam - base_adam, 'fro') / eps_comp)
+
+        pert_muon = ortho_svd(Mi_pert)
+        muon_lips.append(np.linalg.norm(pert_muon - base_muon, 'fro') / eps_comp)
+
+    sgd_lip = np.max(sgd_lips)
+    adam_lip = np.max(adam_lips)
+    muon_lip = np.max(muon_lips)
+    bound = 1.0 / smin_i
+
+    part5_data.append((kappa, sgd_lip, adam_lip, muon_lip, bound))
+    print(f"  {kappa:8.0f}  {sgd_lip:12.4f}  {adam_lip:12.4f}  "
+          f"{muon_lip:12.4f}  {bound:12.4f}")
+
+    # SGD Lipschitz should be constant (= lr)
+    if abs(sgd_lip - lr_sgd) / lr_sgd > 0.1:
+        part5_pass = False
+
+print()
+
+# Verify structural claims
+# SGD: constant across kappas
+sgd_vals = [d[1] for d in part5_data]
+sgd_spread = max(sgd_vals) / min(sgd_vals)
+sgd_constant = sgd_spread < 1.2
+
+# Muon: grows with kappa
+muon_vals = [d[3] for d in part5_data]
+muon_grows = muon_vals[-1] > muon_vals[0] * 1.5
+
+# Muon >> SGD at high kappa
+muon_exceeds_sgd = muon_vals[-1] > sgd_vals[-1] * 10
+
+part5_pass = part5_pass and sgd_constant and muon_grows and muon_exceeds_sgd
+
+print("  Key observations:")
+print(f"    SGD:  constant Lip = {lr_sgd} (spread = {sgd_spread:.4f}x): "
+      f"{'PASS' if sgd_constant else 'FAIL'}")
+print(f"    Muon: grows with kappa (Lip(kappa=1000)/Lip(kappa=1) = "
+      f"{muon_vals[-1]/muon_vals[0]:.1f}x): "
+      f"{'PASS' if muon_grows else 'FAIL'}")
+print(f"    Muon >> SGD at kappa=1000: "
+      f"{'PASS' if muon_exceeds_sgd else 'FAIL'}")
+print()
+print("  Implication: Muon is the MOST sensitive to noise when M is ill-conditioned.")
+print("  SGD is the LEAST sensitive (constant Lipschitz regardless of M).")
+print()
+print(f"  RESULT: Three-way Lipschitz comparison. "
+      f"{'PASS' if part5_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 6: Rectangular matrices
+# ===================================================================
+
+sep("PART 6: Rectangular matrices -- 8x4 and 4x8")
+
+print("  The Lipschitz bound applies to rectangular matrices too.")
+print("  Verify: empirical Lip <= 1/sigma_min(M) for 8x4 and 4x8.")
+print()
+
+rect_shapes = [(8, 4), (4, 8)]
+kappas_rect = [1, 5, 10, 100, 1000]
+eps_rect = 1e-6
+
+part6_pass = True
+
+for shape in rect_shapes:
+    print(f"  Shape: {shape[0]}x{shape[1]}")
+    print(f"  {'kappa':>8s}  {'sigma_min':>12s}  {'1/sigma_min':>12s}  "
+          f"{'Lip (emp)':>12s}  {'emp/bound':>12s}  {'Status'}")
+    print(f"  {'-'*8}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*6}")
+
+    for kappa in kappas_rect:
+        Mi = make_matrix_with_condition(shape, kappa, rng=RNG)
+        sigmas_i = np.linalg.svd(Mi, compute_uv=False)
+        smin_i = sigmas_i[-1]
+        O_Mi = ortho_svd(Mi)
+
+        lip_vals = []
+        for _ in range(200):
+            Ei = random_unit_perturbation(shape, RNG)
+            O_pert_i = ortho_svd(Mi + eps_rect * Ei)
+            dev_i = np.linalg.norm(O_pert_i - O_Mi, 'fro')
+            lip_vals.append(dev_i / eps_rect)
+
+        lip_emp = np.max(lip_vals)
+        bound = 1.0 / smin_i
+        ratio = lip_emp / bound
+        ok = ratio <= 1.05
+        if not ok:
+            part6_pass = False
+
+        print(f"  {kappa:8.0f}  {smin_i:12.2e}  {bound:12.2e}  "
+              f"{lip_emp:12.2e}  {ratio:12.4f}  {'PASS' if ok else 'FAIL'}")
+
+    print()
+
+print(f"  RESULT: Rectangular matrices obey same Lipschitz bound. "
+      f"{'PASS' if part6_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 7: Connection to training (educational commentary)
+# ===================================================================
+
+sep("PART 7: Connection to training -- when does gauge fixing break?")
+
+print("  In training, M is the gradient or momentum accumulator.")
+print()
+print("  Scenario 1: Large batch, well-conditioned gradient")
+print("    - Gradient G has all singular values well above zero")
+print("    - sigma_min(G) is large => Lipschitz constant is small")
+print("    - ortho(G) is stable under noise => Muon works well")
+print()
+print("  Scenario 2: Tiny batch, noisy gradient")
+print("    - Gradient G has small singular values (noise dominates signal)")
+print("    - sigma_min(G) ~ 0 => Lipschitz constant ~ infinity")
+print("    - ortho(G) is UNSTABLE: tiny perturbation flips orthogonal factor")
+print("    - Gauge fixing amplifies noise => Muon may degrade")
+print()
+print("  Scenario 3: Early training (random weights)")
+print("    - Gradient structure is weak, singular values may be small")
+print("    - Similar to tiny batch: ortho is sensitive to noise")
+print()
+print("  This connects to Experiment 4.3 (tiny batch):")
+print("    When batch size is too small, gradient singular values approach zero,")
+print("    and Muon's polar projection amplifies the noise. The batch size must")
+print("    be large enough that sigma_min(gradient) >> 0.")
+print()
+
+# Numerical demonstration: batch-size effect on singular values
+print("  Numerical demonstration: batch-size effect on gradient singular values")
+print("  (Gradient = (1/B) * sum of B rank-1 outer products)")
+print()
+
+dim_sim = 8
+batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+
+print(f"  {'batch_size':>12s}  {'sigma_min':>12s}  {'sigma_max':>12s}  "
+      f"{'kappa':>12s}  {'1/sig_min':>12s}  {'full rank?'}")
+print(f"  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*10}")
+
+for B in batch_sizes:
+    G = np.zeros((dim_sim, dim_sim))
+    for _ in range(B):
+        x = RNG.standard_normal(dim_sim)
+        y = RNG.standard_normal(dim_sim)
+        G += np.outer(x, y)
+    G /= B
+
+    sigmas_G = np.linalg.svd(G, compute_uv=False)
+    smin_G = sigmas_G[-1]
+    smax_G = sigmas_G[0]
+    full_rank = smin_G > 1e-10
+    kappa_G = smax_G / smin_G if full_rank else float('inf')
+    lip_G = 1.0 / smin_G if full_rank else float('inf')
+
+    print(f"  {B:12d}  {smin_G:12.4e}  {smax_G:12.4f}  "
+          f"{kappa_G:12.1f}  {lip_G:12.1f}  "
+          f"{'YES' if full_rank else 'NO (rank-deficient)'}")
+
+print()
+print("  Observation: Small batches (B < min(m,n) = 8) produce rank-deficient")
+print("  gradients with sigma_min ~ 0, making Muon's polar map Lipschitz constant")
+print("  infinite. For B >= min(m,n), the gradient is generically full-rank.")
+print()
+print("  Practical rule: batch size should be >= min(m,n) for stable gauge fixing.")
+print()
+
+
+# ===================================================================
+# PART 8: Muon's NS iteration -- does normalization help?
+# ===================================================================
+
+sep("PART 8: Does Muon's Frobenius normalization help stability?")
+
+print("  Muon normalizes M by ||M||_F before Newton-Schulz:")
+print("    M_normalized = M / ||M||_F")
+print()
+print("  After normalization:")
+print("    sigma_min(M_norm) = sigma_min(M) / ||M||_F")
+print("    sigma_max(M_norm) = sigma_max(M) / ||M||_F")
+print("    kappa(M_norm) = kappa(M)  -- condition number is PRESERVED")
+print()
+print("  So normalization does NOT help with ill-conditioning.")
+print("  It only ensures singular values are in the convergence basin of NS.")
+print()
+
+print("  Numerical verification:")
+print()
+print(f"  {'kappa':>8s}  {'sig_min(M)':>12s}  {'sig_min(Mn)':>12s}  "
+      f"{'kappa(M)':>10s}  {'kappa(Mn)':>10s}  {'Same?'}")
+print(f"  {'-'*8}  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*10}  {'-'*6}")
+
+part8_pass = True
+kappas_ns = [1, 5, 10, 100, 1000, 1e6]
+
+for kappa in kappas_ns:
+    Mi = make_matrix_with_condition((5, 5), kappa, rng=RNG)
+    sigmas_i = np.linalg.svd(Mi, compute_uv=False)
+    smin_i = sigmas_i[-1]
+    smax_i = sigmas_i[0]
+    kappa_i = smax_i / smin_i
+
+    Mi_norm = Mi / np.linalg.norm(Mi, 'fro')
+    sigmas_norm = np.linalg.svd(Mi_norm, compute_uv=False)
+    smin_norm = sigmas_norm[-1]
+    kappa_norm = sigmas_norm[0] / smin_norm
+
+    kappa_match = abs(kappa_i - kappa_norm) / kappa_i < 1e-10
+    if not kappa_match:
+        part8_pass = False
+
+    print(f"  {kappa:8.0f}  {smin_i:12.2e}  {smin_norm:12.2e}  "
+          f"{kappa_i:10.2f}  {kappa_norm:10.2f}  "
+          f"{'PASS' if kappa_match else 'FAIL'}")
+
+print()
+
+# Compare SVD vs NS Lipschitz at moderate condition number
+# where NS converges well with 50 iterations
+print("  Lipschitz comparison: SVD vs Newton-Schulz (kappa=100):")
+print()
+
+M_comp = make_matrix_with_condition((5, 5), kappa=100, rng=RNG)
+sigmas_comp = np.linalg.svd(M_comp, compute_uv=False)
+smin_comp = sigmas_comp[-1]
+O_svd_comp = ortho_svd(M_comp)
+O_ns_comp = ortho_ns(M_comp)
+
+base_agreement = np.linalg.norm(O_svd_comp - O_ns_comp, 'fro')
+print(f"  M: 5x5, kappa = 100, sigma_min = {smin_comp:.2e}")
+print(f"  ||ortho_SVD(M) - ortho_NS(M)||_F = {base_agreement:.2e}")
+print(f"  Theoretical bound 1/sigma_min = {1.0/smin_comp:.2f}")
+print()
+
+eps_ns = 1e-6
+svd_lips = []
+ns_lips = []
+
+for _ in range(100):
+    Ei = random_unit_perturbation((5, 5), RNG)
+    Mi_pert = M_comp + eps_ns * Ei
+
+    O_svd_pert = ortho_svd(Mi_pert)
+    svd_lips.append(np.linalg.norm(O_svd_pert - O_svd_comp, 'fro') / eps_ns)
+
+    O_ns_pert = ortho_ns(Mi_pert)
+    ns_lips.append(np.linalg.norm(O_ns_pert - O_ns_comp, 'fro') / eps_ns)
+
+svd_max_lip = np.max(svd_lips)
+ns_max_lip = np.max(ns_lips)
+svd_ns_ratio = ns_max_lip / svd_max_lip if svd_max_lip > 0 else float('inf')
+
+print(f"  Lipschitz (SVD):  mean = {np.mean(svd_lips):.2f}, "
+      f"max = {svd_max_lip:.2f}")
+print(f"  Lipschitz (NS):   mean = {np.mean(ns_lips):.2f}, "
+      f"max = {ns_max_lip:.2f}")
+print(f"  NS/SVD ratio: {svd_ns_ratio:.4f}")
+print()
+
+similar = 0.1 < svd_ns_ratio < 10.0
+part8_pass = part8_pass and similar
+
+print(f"  Same order of magnitude (0.1 < ratio < 10): "
+      f"{'PASS' if similar else 'FAIL'}")
+print()
+print("  INTERPRETATION: Frobenius normalization does NOT reduce the condition")
+print("  number. It ensures NS convergence, but the polar map's sensitivity")
+print("  to additive noise is determined by kappa(M), which normalization")
+print("  preserves. For ill-conditioned M, both SVD and NS amplify noise.")
+print()
+print(f"  RESULT: Normalization preserves condition number. "
+      f"{'PASS' if part8_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# FINAL VERDICT
+# ===================================================================
+
+sep("FINAL VERDICT")
+
+all_pass = (part1_pass and part2_pass and part3_pass and part4_pass
+            and part5_pass and part6_pass and part8_pass)
+
+print(f"  Part 1 (perturbation sweep, linear scaling):         "
+      f"{'PASS' if part1_pass else 'FAIL'}")
+print(f"  Part 2 (Lipschitz constant measurement):             "
+      f"{'PASS' if part2_pass else 'FAIL'}")
+print(f"  Part 3 (condition number dependence):                 "
+      f"{'PASS' if part3_pass else 'FAIL'}")
+print(f"  Part 4 (ill-conditioned danger zone):                 "
+      f"{'PASS' if part4_pass else 'FAIL'}")
+print(f"  Part 5 (comparison with SGD and Adam):                "
+      f"{'PASS' if part5_pass else 'FAIL'}")
+print(f"  Part 6 (rectangular matrices):                        "
+      f"{'PASS' if part6_pass else 'FAIL'}")
+print(f"  Part 7 (connection to training):                      "
+      f"(educational, no pass/fail)")
+print(f"  Part 8 (Frobenius normalization and condition number): "
+      f"{'PASS' if part8_pass else 'FAIL'}")
+print()
+
+if all_pass:
+    print("  ============================================")
+    print("  =            ALL TESTS PASSED              =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.4b VERIFIED:")
+    print()
+    print("  1. The polar map ortho(M) is Lipschitz continuous with constant")
+    print("     bounded by 1/sigma_min(M). Additive perturbation of size epsilon")
+    print("     causes deviation O(epsilon / sigma_min(M)) in the orthogonal factor.")
+    print()
+    print("  2. For well-conditioned M (small kappa), this is O(epsilon): stable.")
+    print("     For ill-conditioned M (large kappa), deviation is amplified.")
+    print()
+    print("  3. SGD has constant Lipschitz (= learning rate), independent of M.")
+    print("     Adam has bounded Lipschitz, mildly dependent on M.")
+    print("     Muon has Lipschitz that grows with condition number of M.")
+    print()
+    print("  4. This holds for both square and rectangular matrices.")
+    print()
+    print("  5. Muon's Frobenius normalization does NOT help: it preserves the")
+    print("     condition number, so the noise amplification is unchanged.")
+    print()
+    print("  Practical implication for Muon:")
+    print("    When the gradient/momentum has near-zero singular values (tiny batch,")
+    print("    early training, degenerate loss landscape), Muon's polar projection")
+    print("    amplifies noise. Sufficient batch size is needed to keep sigma_min")
+    print("    well above zero, ensuring stable gauge fixing.")
+else:
+    print("  ============================================")
+    print("  =          SOME TESTS FAILED               =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.4b: VERIFICATION FAILED on some parts. Investigate above.")
+
+print()

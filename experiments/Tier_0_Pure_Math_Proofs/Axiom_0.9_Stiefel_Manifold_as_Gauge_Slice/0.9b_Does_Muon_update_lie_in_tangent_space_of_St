@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.9b -- Does Muon's update LIE in the tangent space of St? (or just near it?)
+
+CRUCIAL DISTINCTION:
+  Muon updates: W_{t+1} = W_t - eta * ortho(momentum_t)
+  ortho(momentum) is in St(m,n) -- the UPDATE DIRECTION is on the Stiefel manifold.
+  W_t itself is NOT constrained to St -- it lives freely in R^{m x n}.
+
+  Muon does NOT keep W on the Stiefel manifold.
+  Muon keeps the UPDATE on the Stiefel manifold.
+  The weight W itself drifts freely in GL(n).
+  The gauge fixing happens to the momentum/gradient direction, not to the weight.
+
+  This is like gauge fixing the vector potential A_mu -- it constrains the
+  DESCRIPTION (the step direction) not the FIELD (the weight matrix).
+
+Hypothesis:
+  1. W is NOT constrained to St -- even after many Muon steps, W^T W != I.
+  2. Even if W starts on St, ONE Muon step leaves St immediately (O(eta) departure).
+  3. The update direction UV^T is NOT in T_W St (tangent space at W).
+     It lives IN St itself, which is a different object.
+  4. Muon is NOT Riemannian optimization on St -- it's simpler and cheaper.
+  5. Weight decay + Muon does NOT push W toward St -- it controls norm, not orthogonality.
+
+This experiment verifies each claim numerically with clear pass/fail criteria.
+"""
+
+import numpy as np
+
+
+# ======================================================================
+# Core functions
+# ======================================================================
+
+def ortho_svd(M):
+    """Exact closest orthogonal (semi-orthogonal) matrix via SVD polar factor."""
+    U, _, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def ortho_ns(M, steps=5):
+    """Newton-Schulz approximation to the orthogonal polar factor (Muon's method).
+
+    Uses the 5th-order iteration with Muon-specific coefficients:
+        A = X @ X^T;  B = b*A + c*A@A;  X = a*X + B@X
+    where a=3.4445, b=-4.7750, c=2.0315.
+    """
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = M.copy().astype(np.float64)
+    transposed = False
+    if M.shape[0] > M.shape[1]:
+        X = X.T
+        transposed = True
+    norm = np.linalg.norm(X, 'fro')
+    if norm < 1e-30:
+        return np.zeros_like(M, dtype=np.float64)
+    X = X / (norm + 1e-7)
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if transposed:
+        X = X.T
+    return X
+
+
+def stiefel_departure(W):
+    """Measure how far W is from St: ||W^T W - I||_F for tall/square, ||W W^T - I||_F for wide."""
+    m, n = W.shape
+    if m >= n:
+        return np.linalg.norm(W.T @ W - np.eye(n), 'fro')
+    else:
+        return np.linalg.norm(W @ W.T - np.eye(m), 'fro')
+
+
+def tangent_space_projection(W, Delta):
+    """Project Delta onto T_W St (tangent space of Stiefel at W).
+
+    For W in St(m,n) with W^T W = I_n, the tangent space at W is:
+      T_W St = { Delta : W^T Delta + Delta^T W = 0 }  (skew-symmetric condition)
+
+    The orthogonal projection onto T_W St is:
+      P_W(Delta) = Delta - W * sym(W^T Delta)
+    where sym(A) = (A + A^T)/2.
+    """
+    WtD = W.T @ Delta
+    sym_WtD = 0.5 * (WtD + WtD.T)
+    return Delta - W @ sym_WtD
+
+
+def polar_retraction(W):
+    """Retract W back to St via polar decomposition (closest point on St)."""
+    return ortho_svd(W)
+
+
+def qr_retraction(W):
+    """Retract W back to St via QR decomposition."""
+    m, n = W.shape
+    if m >= n:
+        Q, R = np.linalg.qr(W)
+        # Fix sign ambiguity: make diagonal of R positive
+        signs = np.sign(np.diag(R))
+        signs[signs == 0] = 1
+        Q = Q * signs[np.newaxis, :]
+        return Q
+    else:
+        Q, R = np.linalg.qr(W.T)
+        signs = np.sign(np.diag(R))
+        signs[signs == 0] = 1
+        Q = Q * signs[np.newaxis, :]
+        return Q.T
+
+
+# ======================================================================
+# Main experiment
+# ======================================================================
+
+def main():
+    np.random.seed(42)
+
+    SEP = "=" * 95
+    all_passed = True
+
+    print(SEP)
+    print("Axiom 0.9b -- Does Muon's update LIE in the tangent space of St?")
+    print("             The crucial distinction: Muon gauge-fixes the STEP, not the WEIGHT")
+    print(SEP)
+
+    # ==================================================================
+    # PART 1: THE CRUCIAL DISTINCTION
+    # W is NOT constrained to St -- only the update direction is
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 1: THE CRUCIAL DISTINCTION")
+    print("  Muon's update: W_{t+1} = W_t - eta * ortho(momentum_t)")
+    print("  ortho(momentum) in St(m,n) -- but W_t itself is NOT on St")
+    print("-" * 95)
+    print()
+
+    print("  [1a] Start with random W (NOT orthogonal), take one Muon step")
+    print("       Verify: W_new is also not orthogonal")
+    print()
+
+    part1_passed = True
+    for (m, n) in [(8, 8), (16, 8), (8, 16), (32, 32)]:
+        W = np.random.randn(m, n) * 0.5  # Random, not orthogonal
+        G = np.random.randn(m, n)         # Simulated gradient/momentum
+        Q = ortho_svd(G)                  # ortho(momentum) in St
+        eta = 0.01
+
+        dep_before = stiefel_departure(W)
+        W_new = W - eta * Q
+        dep_after = stiefel_departure(W_new)
+
+        # Q should be on St
+        q_on_st = stiefel_departure(Q)
+        q_ok = q_on_st < 1e-12
+
+        # W_new should NOT be on St (departure should be O(1), not O(eta))
+        w_not_on_st = dep_after > 0.1  # Should be large since W wasn't on St
+
+        passed = q_ok and w_not_on_st
+        part1_passed &= passed
+        status = "PASS" if passed else "FAIL"
+        print(f"  [{status}]  shape=({m:>2d},{n:>2d}):  ||W^TW - I||_F before = {dep_before:.4f}, "
+              f"after = {dep_after:.4f}")
+        print(f"          update Q on St: ||Q^TQ - I||_F = {q_on_st:.2e}  "
+              f"(Q in St: {'YES' if q_ok else 'NO'})")
+
+    all_passed &= part1_passed
+    print()
+    print(f"  Conclusion: The update Q is on St, but W itself stays off St.")
+    print(f"  Muon does NOT constrain weights to be orthogonal.")
+
+    # ==================================================================
+    # PART 2: WHAT IF W HAPPENED TO BE ON St? WOULD IT STAY?
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 2: WHAT IF W STARTED ON St? WOULD IT STAY?")
+    print("  Initialize W_0 in St, take one step W_1 = W_0 - eta*Q where Q in St")
+    print("  Is W_1 in St? Answer: NO. Departure is O(eta), not O(eta^2).")
+    print("-" * 95)
+    print()
+
+    print("  [2a] W_0 on St, one Muon step with various eta")
+    print("       Measure ||W_1^T W_1 - I||_F as function of eta")
+    print()
+
+    part2_passed = True
+    n_test = 16
+    W0, _ = np.linalg.qr(np.random.randn(n_test, n_test))  # W0 in St
+    G = np.random.randn(n_test, n_test)
+    Q = ortho_svd(G)  # Q in St, independent of W0
+
+    etas = [1e-4, 1e-3, 1e-2, 1e-1, 0.5, 1.0]
+    departures = []
+
+    print(f"  W_0: {n_test}x{n_test} orthogonal (from QR)")
+    print(f"  Q:   {n_test}x{n_test} ortho(randn) in St")
+    print()
+    print(f"  {'eta':<12s} {'||W1^T W1 - I||_F':<22s} {'departure/eta':<18s} {'order'}")
+    print(f"  {'-'*12} {'-'*22} {'-'*18} {'-'*12}")
+
+    for eta in etas:
+        W1 = W0 - eta * Q
+        dep = stiefel_departure(W1)
+        departures.append(dep)
+        ratio = dep / eta if eta > 0 else 0
+        print(f"  {eta:<12.1e} {dep:<22.6e} {ratio:<18.4f} {'O(eta)' if abs(ratio - departures[0]/etas[0]) / (departures[0]/etas[0] + 1e-30) < 2.0 else 'nonlinear'}")
+
+    # Check that departure scales as O(eta) for small eta
+    # Ratio dep/eta should be approximately constant for small eta
+    ratios_small = [departures[i] / etas[i] for i in range(3)]  # first 3 are small
+    ratio_variation = max(ratios_small) / min(ratios_small) if min(ratios_small) > 0 else 999
+    linear_scaling = ratio_variation < 2.0
+    part2_passed &= linear_scaling
+    all_passed &= part2_passed
+
+    print()
+    print(f"  dep/eta ratio for small eta: {ratios_small}")
+    print(f"  Ratio variation (max/min): {ratio_variation:.4f}")
+    status = "PASS" if linear_scaling else "FAIL"
+    print(f"  [{status}] Departure scales as O(eta) -- first-order, NOT second-order")
+    print()
+    print("  Interpretation: Even if W starts orthogonal, one Muon step IMMEDIATELY leaves St.")
+    print("  This is NOT a retraction or geodesic step -- it's a Euclidean step with an")
+    print("  orthogonal DIRECTION. The direction has unit operator norm, but the step")
+    print("  doesn't respect the curvature of St.")
+
+    # ==================================================================
+    # PART 3: COMPARISON WITH RIEMANNIAN OPTIMIZATION ON St
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 3: COMPARISON WITH RIEMANNIAN OPTIMIZATION ON St")
+    print("  True Riemannian SGD: project gradient onto T_W St, retract back to St")
+    print("  Muon: project gradient onto St ITSELF (not tangent space), Euclidean step")
+    print("  These are DIFFERENT operations.")
+    print("-" * 95)
+    print()
+
+    part3_passed = True
+    n_test = 16
+    W0, _ = np.linalg.qr(np.random.randn(n_test, n_test))  # W0 in St
+    G = np.random.randn(n_test, n_test)
+    eta = 0.01
+
+    # Muon's approach: ortho(G) in St, Euclidean step
+    Q_muon = ortho_svd(G)  # In St (not in T_W St)
+    W_muon = W0 - eta * Q_muon
+
+    # Riemannian SGD: project G onto T_{W0} St, then retract
+    G_tangent = tangent_space_projection(W0, G)
+    W_riem_pre = W0 - eta * G_tangent  # Euclidean step in tangent direction
+    W_riem = polar_retraction(W_riem_pre)  # Retract back to St
+
+    dep_muon = stiefel_departure(W_muon)
+    dep_riem = stiefel_departure(W_riem)
+
+    print(f"  [3a] Single step comparison (eta={eta}, n={n_test})")
+    print(f"        Muon:       ||W_muon^T W_muon - I||_F = {dep_muon:.6e}")
+    print(f"        Riem. SGD:  ||W_riem^T W_riem - I||_F = {dep_riem:.6e}")
+    print()
+
+    # Muon leaves St, Riemannian stays on St (by construction -- retraction)
+    muon_leaves = dep_muon > 1e-6
+    riem_stays = dep_riem < 1e-12
+    part3_passed &= muon_leaves and riem_stays
+
+    status_m = "PASS" if muon_leaves else "FAIL"
+    status_r = "PASS" if riem_stays else "FAIL"
+    print(f"  [{status_m}] Muon leaves St (departure > 1e-6)")
+    print(f"  [{status_r}] Riemannian SGD stays on St (retraction enforces it)")
+    print()
+
+    # Difference between the two updates
+    diff_updates = np.linalg.norm(W_muon - W_riem, 'fro')
+    diff_directions = np.linalg.norm(Q_muon - G_tangent / (np.linalg.norm(G_tangent, 'fro') + 1e-30), 'fro')
+    print(f"  [3b] How different are the updates?")
+    print(f"        ||W_muon - W_riem||_F = {diff_updates:.6e}")
+    print(f"        The update DIRECTIONS are fundamentally different objects:")
+    print(f"        Muon uses Q in St(n,n), Riemannian uses grad in T_W St")
+    print()
+
+    # Show that Q_muon is NOT in T_{W0} St
+    # Tangent space condition: W^T Delta + Delta^T W = 0 (must be skew-symmetric)
+    skew_test = W0.T @ Q_muon + Q_muon.T @ W0
+    skew_norm = np.linalg.norm(skew_test, 'fro')
+    # For something in T_W St, this should be zero
+    # For Q_muon (random orthogonal), this is O(1)
+    not_tangent = skew_norm > 0.1
+    part3_passed &= not_tangent
+
+    status = "PASS" if not_tangent else "FAIL"
+    print(f"  [3c] Is ortho(G) in the tangent space T_{{W0}} St?")
+    print(f"        Tangent condition: ||W^T Q + Q^T W||_F should be 0 for tangent vectors")
+    print(f"        Actual value: {skew_norm:.4f}")
+    print(f"  [{status}] ortho(G) is NOT in T_W St -- it's in St itself (different object)")
+
+    all_passed &= part3_passed
+
+    # ==================================================================
+    # PART 4: WHAT MUON ACTUALLY DOES GEOMETRICALLY (multi-step simulation)
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 4: WHAT MUON ACTUALLY DOES GEOMETRICALLY")
+    print("  Simulate 100 Muon steps on a quadratic loss.")
+    print("  Track ||W^T W - I||_F over time -- does W drift toward or away from St?")
+    print("-" * 95)
+    print()
+
+    part4_passed = True
+    m, n = 16, 16
+    np.random.seed(123)
+
+    # Quadratic loss: L(W) = 0.5 * ||W X - Y||_F^2
+    # Gradient: dL/dW = (W X - Y) X^T
+    X_data = np.random.randn(n, 50) * 0.3   # 50 data points
+    W_target = np.random.randn(m, n) * 0.5
+    Y_data = W_target @ X_data + np.random.randn(m, 50) * 0.01
+
+    # Start with W on St
+    W, _ = np.linalg.qr(np.random.randn(m, n))
+    eta = 0.001
+    momentum = np.zeros((m, n))
+    beta = 0.9  # Momentum coefficient
+
+    departures_over_time = []
+    losses_over_time = []
+    n_steps = 100
+
+    for t in range(n_steps):
+        # Compute gradient
+        residual = W @ X_data - Y_data
+        grad = residual @ X_data.T / X_data.shape[1]
+
+        # Momentum update (like Muon uses Nesterov)
+        momentum = beta * momentum + grad
+
+        # Muon step: ortho(momentum), then Euclidean step
+        Q = ortho_svd(momentum)
+        W = W - eta * Q
+
+        dep = stiefel_departure(W)
+        loss = 0.5 * np.linalg.norm(residual, 'fro')**2 / X_data.shape[1]
+        departures_over_time.append(dep)
+        losses_over_time.append(loss)
+
+    print(f"  Quadratic loss, m=n={m}, eta={eta}, beta={beta}, {n_steps} steps")
+    print(f"  W starts ON St (orthogonal initialization)")
+    print()
+    print(f"  {'Step':<8s} {'||W^TW - I||_F':<20s} {'Loss':<15s}")
+    print(f"  {'-'*8} {'-'*20} {'-'*15}")
+    for t in [0, 9, 19, 49, 99]:
+        print(f"  {t+1:<8d} {departures_over_time[t]:<20.6f} {losses_over_time[t]:<15.6f}")
+
+    # W should drift AWAY from St monotonically
+    drifts_away = departures_over_time[-1] > departures_over_time[0]
+    monotonic_drift = all(departures_over_time[i+10] >= departures_over_time[i] * 0.5
+                         for i in range(0, 80, 10))
+    part4_passed &= drifts_away
+
+    status = "PASS" if drifts_away else "FAIL"
+    print()
+    print(f"  [{status}] W drifts away from St over training")
+    print(f"        Initial departure: {departures_over_time[0]:.6f}")
+    print(f"        Final departure:   {departures_over_time[-1]:.6f}")
+    print()
+    print("  Interpretation: Muon does NOT keep W on St. The weight matrix accumulates")
+    print("  non-orthogonality over time. Each step adds an orthogonal direction but the")
+    print("  ACCUMULATION of many orthogonal steps is not orthogonal.")
+
+    all_passed &= part4_passed
+
+    # ==================================================================
+    # PART 5: THE GAUGE-FIXING INTERPRETATION REFINED
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 5: THE GAUGE-FIXING INTERPRETATION REFINED")
+    print("  Muon doesn't fix the gauge of W (keep W orthogonal).")
+    print("  Muon fixes the gauge of the STEP (keep Delta orthogonal).")
+    print("  Each step is 'spectrally democratic' -- all singular values of the update are 1.")
+    print("-" * 95)
+    print()
+
+    part5_passed = True
+    np.random.seed(77)
+
+    print("  [5a] Singular values of the update direction (should all be 1)")
+    print()
+    for (m, n) in [(8, 8), (16, 8), (8, 16), (32, 16)]:
+        G = np.random.randn(m, n)
+        Q = ortho_svd(G)
+        sv = np.linalg.svd(Q, compute_uv=False)
+        sv_err = np.max(np.abs(sv - 1.0))
+        ok = sv_err < 1e-12
+        part5_passed &= ok
+        status = "PASS" if ok else "FAIL"
+        print(f"  [{status}]  update direction ({m:>2d}x{n:>2d}):  "
+              f"sv range = [{sv.min():.10f}, {sv.max():.10f}]  "
+              f"max|sv-1| = {sv_err:.2e}")
+
+    print()
+    print("  [5b] Singular values of W after 100 Muon steps (should NOT be 1)")
+    print("       W can develop arbitrary spectrum -- Muon doesn't constrain it")
+    print()
+
+    m, n = 16, 16
+    W, _ = np.linalg.qr(np.random.randn(m, n))
+    X_data = np.random.randn(n, 50) * 0.3
+    W_target = np.random.randn(m, n) * 0.5
+    Y_data = W_target @ X_data
+
+    momentum = np.zeros((m, n))
+    for t in range(100):
+        residual = W @ X_data - Y_data
+        grad = residual @ X_data.T / X_data.shape[1]
+        momentum = 0.9 * momentum + grad
+        Q = ortho_svd(momentum)
+        W = W - 0.001 * Q
+
+    sv_W = np.linalg.svd(W, compute_uv=False)
+    sv_spread = sv_W.max() / sv_W.min()
+    not_orthogonal = abs(sv_spread - 1.0) > 0.01
+    part5_passed &= not_orthogonal
+
+    status = "PASS" if not_orthogonal else "FAIL"
+    print(f"  [{status}]  W after 100 steps: sv range = [{sv_W.min():.4f}, {sv_W.max():.4f}]")
+    print(f"        condition number = {sv_spread:.4f} (should be != 1 if not on St)")
+    print()
+    print("  Interpretation: Each STEP has all singular values = 1 (spectral democracy).")
+    print("  But the accumulated W can have ANY singular value structure.")
+    print("  Physics analogy: gauge fixing A_mu doesn't constrain F_mu_nu.")
+
+    all_passed &= part5_passed
+
+    # ==================================================================
+    # PART 6: DOES WEIGHT DECAY + MUON APPROXIMATELY CONSTRAIN W NEAR St?
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 6: DOES WEIGHT DECAY + MUON PUSH W TOWARD St?")
+    print("  Weight decay: W <- (1-lambda)W each step -- shrinks toward 0")
+    print("  Muon step: adds something with operator norm 1")
+    print("  Prediction: W does NOT approach St. It has bounded norm but arbitrary condition #")
+    print("-" * 95)
+    print()
+
+    part6_passed = True
+    np.random.seed(99)
+
+    m, n = 16, 16
+    X_data = np.random.randn(n, 100) * 0.3
+    W_target = np.random.randn(m, n) * 0.3
+    Y_data = W_target @ X_data
+
+    eta = 0.01
+    wd_lambda = 0.01  # Weight decay coefficient
+    n_steps = 500
+
+    W, _ = np.linalg.qr(np.random.randn(m, n))
+    momentum = np.zeros((m, n))
+
+    departures_wd = []
+    frobnorms_wd = []
+    condnums_wd = []
+
+    for t in range(n_steps):
+        residual = W @ X_data - Y_data
+        grad = residual @ X_data.T / X_data.shape[1]
+        momentum = 0.9 * momentum + grad
+
+        Q = ortho_svd(momentum)
+        # Weight decay + Muon step
+        W = (1 - wd_lambda) * W - eta * Q
+
+        dep = stiefel_departure(W)
+        frob = np.linalg.norm(W, 'fro')
+        sv = np.linalg.svd(W, compute_uv=False)
+        cond = sv.max() / (sv.min() + 1e-30)
+
+        departures_wd.append(dep)
+        frobnorms_wd.append(frob)
+        condnums_wd.append(cond)
+
+    print(f"  Muon + weight decay (lambda={wd_lambda}), eta={eta}, {n_steps} steps")
+    print()
+    print(f"  {'Step':<8s} {'||W^TW-I||_F':<16s} {'||W||_F':<12s} {'cond(W)':<12s}")
+    print(f"  {'-'*8} {'-'*16} {'-'*12} {'-'*12}")
+    for t in [0, 49, 99, 249, 499]:
+        print(f"  {t+1:<8d} {departures_wd[t]:<16.4f} {frobnorms_wd[t]:<12.4f} "
+              f"{condnums_wd[t]:<12.4f}")
+
+    # Norm should stabilize (WD bounds it)
+    norm_bounded = frobnorms_wd[-1] < 50.0
+
+    # Departure from St should NOT go to zero -- W is NOT approaching St
+    still_off_st = departures_wd[-1] > 0.1
+    part6_passed &= still_off_st and norm_bounded
+
+    # Condition number should be > 1 (not approaching orthogonal)
+    nontrivial_cond = condnums_wd[-1] > 1.1
+    part6_passed &= nontrivial_cond
+
+    status = "PASS" if still_off_st else "FAIL"
+    print()
+    print(f"  [{status}] W does NOT approach St even with weight decay")
+    print(f"        Final ||W^TW - I||_F = {departures_wd[-1]:.4f} (still far from 0)")
+    status = "PASS" if norm_bounded else "FAIL"
+    print(f"  [{status}] ||W||_F is bounded (WD controls norm): final = {frobnorms_wd[-1]:.4f}")
+    status = "PASS" if nontrivial_cond else "FAIL"
+    print(f"  [{status}] cond(W) > 1 (not approaching orthogonal): final = {condnums_wd[-1]:.4f}")
+    print()
+    print("  Interpretation: Weight decay + Muon keeps ||W||_F bounded but does NOT")
+    print("  push W toward St. The weight has bounded norm but non-trivial condition number.")
+    print("  WD shrinks ALL singular values uniformly; Muon adds in ALL directions equally.")
+    print("  Neither mechanism preferentially enforces orthogonality.")
+
+    all_passed &= part6_passed
+
+    # ==================================================================
+    # PART 7: TANGENT SPACE MEMBERSHIP TEST
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 7: TANGENT SPACE MEMBERSHIP TEST")
+    print("  For Q in St, is Q itself in T_Q St (tangent space at its own base point)?")
+    print("  Tangent condition at Q: Q^T Delta + Delta^T Q must be skew-symmetric (= 0 for 2*sym)")
+    print("  If Delta = Q: Q^T Q + Q^T Q = 2I -- NOT skew. So Q is NOT in T_Q St.")
+    print("-" * 95)
+    print()
+
+    part7_passed = True
+    np.random.seed(55)
+
+    print("  [7a] Is the update direction in T_Q St at its own base point?")
+    print("       For Q in St: test if Q in T_Q St via skew condition ||Q^TQ + Q^TQ||_F = ||2I||_F")
+    print()
+
+    for (m, n) in [(8, 8), (16, 8), (8, 16), (32, 32)]:
+        G = np.random.randn(m, n)
+        Q = ortho_svd(G)  # Q in St
+
+        # Test: is Q in T_Q St?
+        # Tangent condition: Q^T Q + Q^T Q = 2 * Q^T Q = 2I (for Q in St)
+        # This should be ZERO for a tangent vector, but it's 2I -- maximally NOT tangent
+        k = min(m, n)
+        skew_check = Q.T @ Q + Q.T @ Q  # = 2 * Q^T Q = 2I
+        deviation_from_zero = np.linalg.norm(skew_check, 'fro')
+        expected = np.linalg.norm(2.0 * np.eye(k), 'fro')  # = 2*sqrt(k)
+
+        relative_err = abs(deviation_from_zero - expected) / expected
+        is_not_tangent = deviation_from_zero > 1.0  # Should be 2*sqrt(k), definitely > 1
+        part7_passed &= is_not_tangent
+
+        status = "PASS" if is_not_tangent else "FAIL"
+        print(f"  [{status}]  Q in St({m},{n}):  ||Q^TQ + Q^TQ||_F = {deviation_from_zero:.4f}  "
+              f"(expected {expected:.4f} = 2*sqrt({k}))")
+        print(f"          For tangent vector this should be 0. It's {expected:.4f}. "
+              f"Q is NOT in T_Q St.")
+
+    print()
+    print("  [7b] Fraction of update that lies in tangent space")
+    print("       Project ortho(G) onto T_W St for random W in St, measure fraction")
+    print()
+
+    for (m, n) in [(8, 8), (16, 8), (8, 16), (32, 32)]:
+        W, _ = np.linalg.qr(np.random.randn(m, n))  # W in St (need m >= n)
+        if m < n:
+            W = W.T
+            m, n = n, m
+            # Redo
+            W_full, _ = np.linalg.qr(np.random.randn(m, n))
+            # For m < n originally, use a different construction
+            W = np.random.randn(m, n)
+            W = ortho_svd(W)
+
+        G = np.random.randn(m, n)
+        Delta = ortho_svd(G)  # The Muon update direction, in St
+
+        # Project Delta onto T_W St
+        Delta_tangent = tangent_space_projection(W, Delta)
+        Delta_normal = Delta - Delta_tangent
+
+        frac_tangent = np.linalg.norm(Delta_tangent, 'fro') / np.linalg.norm(Delta, 'fro')
+        frac_normal = np.linalg.norm(Delta_normal, 'fro') / np.linalg.norm(Delta, 'fro')
+
+        print(f"  shape=({m:>2d},{n:>2d}):  tangent fraction = {frac_tangent:.4f}, "
+              f"normal fraction = {frac_normal:.4f}")
+        print(f"          (tangent^2 + normal^2 = {frac_tangent**2 + frac_normal**2:.6f}, should be 1)")
+
+    print()
+    print("  [7c] Self-test: is a TRUE tangent vector detected correctly?")
+    print("       Construct Z in T_W St: Z = W*A + W_perp*B where A is skew-symmetric")
+    print()
+
+    m, n = 16, 8
+    W, _ = np.linalg.qr(np.random.randn(m, n))  # W in St(m,n) with m >= n
+
+    # Construct a tangent vector: Z = W*A + (I - W W^T)*B
+    # where A is n x n skew-symmetric and B is m x n arbitrary
+    A_skew = np.random.randn(n, n)
+    A_skew = A_skew - A_skew.T  # Make skew-symmetric
+    B_arb = np.random.randn(m, n)
+    Z_tangent = W @ A_skew + (np.eye(m) - W @ W.T) @ B_arb
+
+    # Verify Z_tangent is in T_W St
+    skew_check_tangent = W.T @ Z_tangent + Z_tangent.T @ W
+    tangent_err = np.linalg.norm(skew_check_tangent, 'fro')
+
+    # Project and check fraction
+    Z_proj = tangent_space_projection(W, Z_tangent)
+    proj_err = np.linalg.norm(Z_proj - Z_tangent, 'fro') / (np.linalg.norm(Z_tangent, 'fro') + 1e-30)
+
+    true_tangent_ok = tangent_err < 1e-12 and proj_err < 1e-12
+    part7_passed &= true_tangent_ok
+
+    status = "PASS" if true_tangent_ok else "FAIL"
+    print(f"  [{status}]  Constructed Z in T_W St(16,8):")
+    print(f"        Skew condition ||W^TZ + Z^TW||_F = {tangent_err:.2e} (should be ~0)")
+    print(f"        Projection residual ||P(Z) - Z||/||Z|| = {proj_err:.2e} (should be ~0)")
+    print()
+
+    # Now test Muon's update
+    Delta_muon = ortho_svd(np.random.randn(m, n))
+    skew_check_muon = W.T @ Delta_muon + Delta_muon.T @ W
+    muon_tangent_err = np.linalg.norm(skew_check_muon, 'fro')
+
+    Delta_muon_proj = tangent_space_projection(W, Delta_muon)
+    muon_proj_residual = np.linalg.norm(Delta_muon_proj - Delta_muon, 'fro') / np.linalg.norm(Delta_muon, 'fro')
+
+    muon_not_tangent = muon_tangent_err > 0.1
+    part7_passed &= muon_not_tangent
+
+    status = "PASS" if muon_not_tangent else "FAIL"
+    print(f"  [{status}]  Muon's ortho(G) tested against T_W St(16,8):")
+    print(f"        Skew condition ||W^T Delta + Delta^T W||_F = {muon_tangent_err:.4f} (should be 0 for tangent)")
+    print(f"        Projection residual ||P(Delta) - Delta||/||Delta|| = {muon_proj_residual:.4f}")
+    print(f"        Muon's update has {muon_proj_residual*100:.1f}% of its norm OUTSIDE T_W St")
+
+    all_passed &= part7_passed
+
+    # ==================================================================
+    # SUMMARY
+    # ==================================================================
+    print()
+    print(SEP)
+    print("SUMMARY")
+    print(SEP)
+    print()
+
+    results = [
+        ("Part 1: W is NOT constrained to St by Muon", part1_passed),
+        ("Part 2: Starting on St, one step leaves with O(eta) departure", part2_passed),
+        ("Part 3: Muon != Riemannian SGD (different operations)", part3_passed),
+        ("Part 4: W drifts away from St over many Muon steps", part4_passed),
+        ("Part 5: Each STEP is spectrally democratic, W is not", part5_passed),
+        ("Part 6: Weight decay does NOT push W toward St", part6_passed),
+        ("Part 7: Update direction is NOT in tangent space of St", part7_passed),
+    ]
+
+    for desc, passed in results:
+        status = "PASS" if passed else "FAIL"
+        print(f"  [{status}]  {desc}")
+
+    overall = all(p for _, p in results)
+    print()
+    print(f"  Overall: {'ALL PASSED' if overall else 'SOME FAILED'}")
+
+    print()
+    print(SEP)
+    if overall:
+        print("CONCLUSION")
+        print(SEP)
+        print()
+        print("  WHAT MUON IS:")
+        print("    - Muon projects the GRADIENT/MOMENTUM onto St (the Stiefel manifold)")
+        print("    - Each update direction has all singular values = 1 (spectral steepest descent)")
+        print("    - This is gauge-fixing the STEP: removing scale redundancy from the update")
+        print()
+        print("  WHAT MUON IS NOT:")
+        print("    - Muon does NOT keep W on St (weights are not orthogonal)")
+        print("    - Muon is NOT Riemannian SGD on St (no retraction, no tangent projection)")
+        print("    - The update is NOT in T_W St (tangent space at W)")
+        print("    - Weight decay does NOT make Muon approximate Riemannian optimization")
+        print()
+        print("  THE GEOMETRIC PICTURE:")
+        print("    - The update UV^T lives IN St(m,n), not in T_W St")
+        print("    - St is a curved manifold -- the straight line W - eta*Q leaves it immediately")
+        print("    - Departure from St is O(eta), first-order -- not O(eta^2) like a retraction")
+        print("    - Over many steps, W develops arbitrary singular value structure")
+        print()
+        print("  THE GAUGE THEORY ANALOGY:")
+        print("    - Gauge fixing A_mu (the vector potential) doesn't constrain F_mu_nu (the field)")
+        print("    - Similarly: gauge fixing the STEP doesn't constrain the WEIGHT")
+        print("    - Muon fixes the description (how you move) not the state (where you are)")
+        print("    - The constraint is on the VELOCITY, not the POSITION")
+        print()
+        print("  WHY THIS MATTERS:")
+        print("    - Muon is CHEAPER than Riemannian SGD (no retraction needed)")
+        print("    - The benefit comes from spectral democracy of steps, not from staying on St")
+        print("    - Each step uses all directions equally (no wasted update in redundant directions)")
+        print("    - The weights CAN develop any spectrum -- this is a feature, not a bug")
+    else:
+        print("WARNING: Some tests failed. Investigate above.")
+
+    print()
+    return 0 if overall else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

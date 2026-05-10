@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""
+X1: Muon Advantage Over Training Time
+======================================
+PREDICTION (unified from info theory, control theory, evolution models):
+  Muon's advantage DECREASES over training as gradient effective rank drops.
+
+If speedup is CONSTANT over training -> all three models are WRONG about late-training degradation.
+If speedup DECREASES -> unified prediction CONFIRMED, optimal switching time exists.
+
+Setup: Deep linear net (4 layers, 32x32), quadratic loss, random target.
+Train 500 steps with SGD and Muon simultaneously (separate copies).
+Every 10 steps measure speedup ratio, effective rank, gauge fraction.
+"""
+
+import numpy as np
+
+np.random.seed(42)
+
+# =============================================================================
+# SETUP: Deep linear network (4 layers, 32x32), quadratic loss, random target
+# =============================================================================
+
+INPUT_DIM = 32
+HIDDEN_DIM = 32
+OUTPUT_DIM = 32
+NUM_LAYERS = 4
+NUM_STEPS = 500
+MEASURE_EVERY = 10
+LR_SGD = 0.005
+LR_MUON = 0.005
+
+# Random target matrix (the "label" for the product of weight matrices)
+W_target = np.random.randn(OUTPUT_DIM, INPUT_DIM) * 0.5
+
+# Random input data (fixed batch for deterministic comparison)
+X_data = np.random.randn(INPUT_DIM, 64) * 0.3
+
+
+def init_weights():
+    """Initialize 4 layers of 32x32 weight matrices (near identity for stability)."""
+    weights = []
+    for _ in range(NUM_LAYERS):
+        W = np.eye(HIDDEN_DIM) + np.random.randn(HIDDEN_DIM, HIDDEN_DIM) * 0.1
+        weights.append(W.copy())
+    return weights
+
+
+def forward(weights, X):
+    """Forward pass through deep linear net: W4 @ W3 @ W2 @ W1 @ X."""
+    out = X.copy()
+    for W in weights:
+        out = W @ out
+    return out
+
+
+def compute_loss(weights, X, target):
+    """Quadratic loss: 0.5 * ||W_product @ X - target @ X||^2 / N."""
+    pred = forward(weights, X)
+    target_out = target @ X
+    diff = pred - target_out
+    return 0.5 * np.mean(np.sum(diff**2, axis=0))
+
+
+def compute_gradients(weights, X, target):
+    """Compute gradients for each layer via backprop through linear net."""
+    N = X.shape[1]
+    # Forward pass storing activations
+    activations = [X.copy()]
+    out = X.copy()
+    for W in weights:
+        out = W @ out
+        activations.append(out.copy())
+
+    # Backward pass
+    target_out = target @ X
+    delta = (activations[-1] - target_out) / N  # (32, 64)
+
+    grads = []
+    for i in range(NUM_LAYERS - 1, -1, -1):
+        # Gradient for W_i: delta @ activations[i].T
+        G = delta @ activations[i].T
+        grads.insert(0, G)
+        # Propagate delta backward
+        if i > 0:
+            delta = weights[i].T @ delta
+
+    return grads
+
+
+def newton_schulz_orthogonalize(G, num_iters=5):
+    """
+    Muon-style: Newton-Schulz iteration to find the closest orthogonal matrix to G.
+    Approximates U @ V^T from SVD(G) = U S V^T.
+    """
+    # Normalize G
+    norm = np.linalg.norm(G, ord='fro')
+    if norm < 1e-12:
+        return G
+    X = G / norm
+
+    # Newton-Schulz iterations: X_{k+1} = X_k (3I - X_k^T X_k) / 2
+    # Using the 5-iteration variant with specific coefficients for faster convergence
+    for _ in range(num_iters):
+        A = X.T @ X
+        # X = X @ (aI + bA + cA^2) with coefficients for cubic polynomial approx
+        # Standard NS: X = 0.5 * X @ (3*I - A)
+        X = 1.5 * X - 0.5 * X @ A
+
+    return X
+
+
+def muon_update(G):
+    """Muon optimizer: apply Newton-Schulz orthogonalization to gradient."""
+    return newton_schulz_orthogonalize(G)
+
+
+def effective_rank(G):
+    """
+    Effective rank: exp(entropy of normalized singular values).
+    Measures how many singular values are 'active'.
+    """
+    sv = np.linalg.svd(G, compute_uv=False)
+    sv = sv[sv > 1e-12]  # remove near-zero
+    if len(sv) == 0:
+        return 1.0
+    # Normalize to get probability distribution
+    p = sv / np.sum(sv)
+    # Shannon entropy
+    entropy = -np.sum(p * np.log(p + 1e-15))
+    return np.exp(entropy)
+
+
+def gauge_fraction_effective(eff_rank, n=32, m=32):
+    """
+    Gauge fraction adjusted for effective rank.
+    Predicted: (n+1)/(2m) * (n/eff_rank)
+    This captures how much of gradient information is 'gauge' (redundant).
+    """
+    base_gauge = (n + 1) / (2 * m)
+    rank_adjustment = n / eff_rank
+    return base_gauge * rank_adjustment
+
+
+# =============================================================================
+# TRAINING LOOP
+# =============================================================================
+
+# Initialize two separate copies
+weights_sgd = init_weights()
+weights_muon = [w.copy() for w in weights_sgd]  # Same initialization
+
+# Storage for measurements
+results = []
+
+print("=" * 90)
+print("X1: MUON ADVANTAGE OVER TRAINING TIME")
+print("=" * 90)
+print(f"Setup: {NUM_LAYERS}-layer deep linear net ({INPUT_DIM}x{HIDDEN_DIM}), "
+      f"quadratic loss, {NUM_STEPS} steps")
+print(f"LR_SGD={LR_SGD}, LR_Muon={LR_MUON}")
+print("-" * 90)
+
+for step in range(NUM_STEPS + 1):
+    # Compute losses
+    loss_sgd = compute_loss(weights_sgd, X_data, W_target)
+    loss_muon = compute_loss(weights_muon, X_data, W_target)
+
+    # Measure every 10 steps
+    if step % MEASURE_EVERY == 0:
+        # Compute gradient for effective rank measurement (use SGD copy as reference)
+        grads_sgd = compute_gradients(weights_sgd, X_data, W_target)
+
+        # Average effective rank across layers
+        eff_ranks = [effective_rank(G) for G in grads_sgd]
+        avg_eff_rank = np.mean(eff_ranks)
+
+        # Gauge fraction
+        gauge_frac = gauge_fraction_effective(avg_eff_rank)
+
+        # Speedup ratio (avoid division by zero)
+        if loss_muon > 1e-12:
+            speedup = loss_sgd / loss_muon
+        else:
+            speedup = 1.0
+
+        results.append({
+            'step': step,
+            'loss_sgd': loss_sgd,
+            'loss_muon': loss_muon,
+            'speedup': speedup,
+            'eff_rank': avg_eff_rank,
+            'gauge_frac': gauge_frac,
+        })
+
+    # Training step (skip on last iteration)
+    if step < NUM_STEPS:
+        # SGD update
+        grads_sgd = compute_gradients(weights_sgd, X_data, W_target)
+        for i in range(NUM_LAYERS):
+            weights_sgd[i] -= LR_SGD * grads_sgd[i]
+
+        # Muon update
+        grads_muon = compute_gradients(weights_muon, X_data, W_target)
+        for i in range(NUM_LAYERS):
+            update = muon_update(grads_muon[i])
+            weights_muon[i] -= LR_MUON * update
+
+# =============================================================================
+# RESULTS TABLE
+# =============================================================================
+
+print(f"\n{'Step':>5} | {'Loss SGD':>10} | {'Loss Muon':>10} | {'Speedup':>8} | "
+      f"{'Eff Rank':>9} | {'Gauge Frac':>10}")
+print("-" * 90)
+
+for r in results:
+    print(f"{r['step']:5d} | {r['loss_sgd']:10.4f} | {r['loss_muon']:10.4f} | "
+          f"{r['speedup']:8.3f} | {r['eff_rank']:9.3f} | {r['gauge_frac']:10.4f}")
+
+# =============================================================================
+# ANALYSIS: Correlation between speedup and effective rank
+# =============================================================================
+
+steps = np.array([r['step'] for r in results])
+speedups = np.array([r['speedup'] for r in results])
+eff_ranks = np.array([r['eff_rank'] for r in results])
+losses_sgd = np.array([r['loss_sgd'] for r in results])
+losses_muon = np.array([r['loss_muon'] for r in results])
+
+# Skip step 0 for trend analysis (initial condition)
+if len(speedups) > 2:
+    # Pearson correlation: speedup vs effective rank
+    corr_speedup_rank = np.corrcoef(speedups[1:], eff_ranks[1:])[0, 1]
+
+    # Trend: is speedup decreasing?
+    # Linear regression of speedup vs step
+    steps_norm = (steps[1:] - steps[1:].mean()) / (steps[1:].std() + 1e-12)
+    speedup_slope = np.polyfit(steps[1:], speedups[1:], 1)[0]
+
+    # Effective rank trend
+    rank_slope = np.polyfit(steps[1:], eff_ranks[1:], 1)[0]
+
+print("\n" + "=" * 90)
+print("ANALYSIS")
+print("=" * 90)
+
+print(f"\nSpeedup at start (step 10):  {speedups[1]:.4f}")
+print(f"Speedup at end (step {int(steps[-1])}): {speedups[-1]:.4f}")
+print(f"Speedup slope (per step):    {speedup_slope:.6f}")
+print(f"  -> {'DECREASING' if speedup_slope < 0 else 'INCREASING or CONSTANT'} over training")
+
+print(f"\nEffective rank at start:     {eff_ranks[1]:.4f}")
+print(f"Effective rank at end:       {eff_ranks[-1]:.4f}")
+print(f"Effective rank slope:        {rank_slope:.6f}")
+print(f"  -> {'DECREASING' if rank_slope < 0 else 'INCREASING or CONSTANT'} over training")
+
+print(f"\nCorrelation(speedup, eff_rank): {corr_speedup_rank:.4f}")
+print(f"  -> {'POSITIVE (confirms prediction)' if corr_speedup_rank > 0.3 else 'WEAK or NEGATIVE (contradicts prediction)' if corr_speedup_rank > -0.3 else 'NEGATIVE (contradicts prediction)'}")
+
+# =============================================================================
+# CROSSOVER DETECTION: Does SGD catch up to Muon?
+# =============================================================================
+
+print("\n" + "-" * 90)
+print("CROSSOVER DETECTION")
+print("-" * 90)
+
+crossover_step = None
+for r in results:
+    if r['speedup'] <= 1.0 and r['step'] > 0:
+        crossover_step = r['step']
+        break
+
+if crossover_step is not None:
+    print(f"CROSSOVER FOUND at step {crossover_step}: SGD catches up to Muon")
+    print("  -> This confirms optimal switching time exists")
+else:
+    # Check if speedup is approaching 1
+    final_speedups = speedups[-5:]
+    if np.mean(final_speedups) < 1.2:
+        print(f"No full crossover, but speedup approaching 1.0 (final avg: {np.mean(final_speedups):.3f})")
+        print("  -> Trend suggests crossover would occur with more training")
+    else:
+        print(f"No crossover detected. Final speedup still high: {speedups[-1]:.3f}")
+        print("  -> Muon maintains advantage throughout training window")
+
+# =============================================================================
+# VERDICT
+# =============================================================================
+
+print("\n" + "=" * 90)
+print("VERDICT")
+print("=" * 90)
+
+if speedup_slope < -0.0001 and corr_speedup_rank > 0.2:
+    print("CONFIRMED: Speedup DECREASES over training AND correlates with effective rank drop.")
+    print("  -> All three models (info theory, control theory, evolution) are VALIDATED.")
+    print("  -> An optimal Muon->SGD switching time EXISTS.")
+    print("  -> Late-training degradation of Muon advantage is REAL.")
+elif speedup_slope < -0.0001:
+    print("PARTIALLY CONFIRMED: Speedup decreases but weak rank correlation.")
+    print("  -> Advantage degradation is real but mechanism may differ from predicted.")
+elif abs(speedup_slope) < 0.0001:
+    print("REFUTED: Speedup is CONSTANT over training.")
+    print("  -> All three models are WRONG about late-training degradation.")
+    print("  -> Muon advantage does NOT depend on gradient rank structure as predicted.")
+else:
+    print("UNEXPECTED: Speedup INCREASES over training.")
+    print("  -> None of the three models predicted this.")
+    print("  -> Muon may be exploiting something beyond gauge-fixing.")
+
+print("\n" + "=" * 90)

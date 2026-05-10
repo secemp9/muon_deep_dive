@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.10c — Count gauge degrees of freedom in a full transformer.
+
+For each weight matrix in a transformer, the gauge DOF count is:
+    gauge_DOF = n(n+1)/2  where n = min(rows, cols)
+
+This script computes the full "gauge budget" of GPT-2 Small, GPT-2 Medium,
+and GPT-3, showing:
+  1. Total parameters
+  2. Total gauge DOF
+  3. Overall gauge fraction
+  4. Weighted average gauge fraction
+  5. Predicted overall Muon speedup
+
+Builds on 0.10a: uses the same gauge_fraction formula applied to every
+weight matrix in the architecture.
+"""
+
+import numpy as np
+
+# ─── Architecture Definitions ────────────────────────────────────────────────
+
+def build_transformer_arch(name, n_layers, d_model, d_ff, n_heads, vocab_size):
+    """
+    Build a list of all weight matrices in a transformer.
+    Returns list of (layer_name, rows, cols, count).
+    """
+    d_head = d_model // n_heads
+    layers = []
+
+    # Embedding
+    layers.append(("Embedding", vocab_size, d_model, 1))
+
+    # Per-block layers (repeated n_layers times)
+    # Attention: Q, K, V projections (each d_model -> d_model)
+    # These are often represented as d_model x d_model matrices
+    # (combining all heads: each head is d_model x d_head, but stored as one big matrix)
+    layers.append(("Attn Q proj", d_model, d_model, n_layers))
+    layers.append(("Attn K proj", d_model, d_model, n_layers))
+    layers.append(("Attn V proj", d_model, d_model, n_layers))
+    layers.append(("Attn Out proj", d_model, d_model, n_layers))
+
+    # MLP
+    layers.append(("MLP Up proj", d_model, d_ff, n_layers))
+    layers.append(("MLP Down proj", d_ff, d_model, n_layers))
+
+    # LM Head (often tied with embedding, but we count it separately for analysis)
+    layers.append(("LM Head", d_model, vocab_size, 1))
+
+    # Layer norms and biases are NOT matrices — they have no gauge redundancy
+    # We note them for completeness but don't include in gauge count
+    # (LayerNorm: 2 * d_model params per layer, biases: various)
+
+    return {"name": name, "n_layers": n_layers, "d_model": d_model,
+            "d_ff": d_ff, "n_heads": n_heads, "vocab_size": vocab_size,
+            "layers": layers}
+
+
+# Define architectures
+architectures = [
+    build_transformer_arch("GPT-2 Small",  12, 768,   3072,  12, 50257),
+    build_transformer_arch("GPT-2 Medium", 24, 1024,  4096,  16, 50257),
+    build_transformer_arch("GPT-3 175B",   96, 12288, 49152, 96, 50257),
+]
+
+# ─── Gauge DOF Computation ───────────────────────────────────────────────────
+
+def compute_gauge_stats(rows, cols):
+    """Compute gauge DOF and fraction for a rows x cols matrix."""
+    n = min(rows, cols)
+    m = max(rows, cols)
+    total_params = rows * cols
+    gauge_dof = n * (n + 1) // 2
+    gauge_frac = gauge_dof / total_params  # = (n+1)/(2m)
+    physical_dof = total_params - gauge_dof
+    return {
+        "params": total_params,
+        "gauge_dof": gauge_dof,
+        "physical_dof": physical_dof,
+        "gauge_frac": gauge_frac,
+        "n": n,
+        "m": m,
+    }
+
+
+# ─── Main Computation ───────────────────────────────────────────────────────
+
+print("=" * 80)
+print("AXIOM 0.10c: Gauge DOF Budget for Full Transformer Architectures")
+print("=" * 80)
+print()
+print("Formula: gauge_DOF = n(n+1)/2 per weight matrix, where n = min(rows, cols)")
+print("         gauge_fraction = n(n+1) / (2*rows*cols)")
+print()
+
+for arch in architectures:
+    print()
+    print("=" * 80)
+    print(f"  Architecture: {arch['name']}")
+    print(f"  Layers: {arch['n_layers']}, d_model: {arch['d_model']}, "
+          f"d_ff: {arch['d_ff']}, heads: {arch['n_heads']}, vocab: {arch['vocab_size']}")
+    print("=" * 80)
+    print()
+
+    # ─── Per-layer breakdown ─────────────────────────────────────────────────
+
+    print(f"{'Layer Type':<18} {'Shape':<16} {'Count':<7} {'Params':<14} "
+          f"{'Gauge DOF':<14} {'Gauge Frac':<12} {'Phys DOF':<14}")
+    print("-" * 95)
+
+    total_params = 0
+    total_gauge = 0
+    total_physical = 0
+    layer_data = []
+
+    for layer_name, rows, cols, count in arch["layers"]:
+        stats = compute_gauge_stats(rows, cols)
+
+        # Multiply by count (number of such layers in the model)
+        layer_params = stats["params"] * count
+        layer_gauge = stats["gauge_dof"] * count
+        layer_physical = stats["physical_dof"] * count
+
+        total_params += layer_params
+        total_gauge += layer_gauge
+        total_physical += layer_physical
+
+        layer_data.append((layer_name, rows, cols, count, layer_params,
+                           layer_gauge, layer_physical, stats["gauge_frac"]))
+
+        print(f"{layer_name:<18} {rows}x{cols:<10} {count:<7} "
+              f"{layer_params:<14,} {layer_gauge:<14,} "
+              f"{stats['gauge_frac']:<12.4%} {layer_physical:<14,}")
+
+    print("-" * 95)
+    print(f"{'TOTAL':<18} {'—':<16} {'—':<7} "
+          f"{total_params:<14,} {total_gauge:<14,} "
+          f"{'—':<12} {total_physical:<14,}")
+    print()
+
+    # ─── Summary Statistics ──────────────────────────────────────────────────
+
+    overall_gauge_frac = total_gauge / total_params
+    weighted_avg_gauge = sum(lp * gf for _, _, _, _, lp, _, _, gf in layer_data) / total_params
+    predicted_speedup = 1.0 / (1.0 - weighted_avg_gauge)
+
+    print(f"  Summary for {arch['name']}:")
+    print(f"    Total parameters:          {total_params:>14,}")
+    print(f"    Total gauge DOF:           {total_gauge:>14,}")
+    print(f"    Total physical DOF:        {total_physical:>14,}")
+    print(f"    Overall gauge fraction:    {overall_gauge_frac:>14.4%}")
+    print(f"    Weighted avg gauge frac:   {weighted_avg_gauge:>14.4%}")
+    print(f"    Predicted Muon speedup:    {predicted_speedup:>14.4f}x")
+    print()
+
+    # ─── Gauge Budget Breakdown ──────────────────────────────────────────────
+
+    print(f"  Gauge Budget (where the gauge DOF live):")
+    print(f"  {'Layer Type':<18} {'% of total gauge':<20} {'% of total params':<20}")
+    print(f"  {'-'*60}")
+
+    for layer_name, rows, cols, count, lp, lg, lphys, gf in layer_data:
+        pct_gauge = lg / total_gauge * 100
+        pct_params = lp / total_params * 100
+        print(f"  {layer_name:<18} {pct_gauge:>15.2f}%     {pct_params:>15.2f}%")
+
+    print()
+
+# ─── Cross-Architecture Comparison ──────────────────────────────────────────
+
+print()
+print("=" * 80)
+print("CROSS-ARCHITECTURE COMPARISON")
+print("=" * 80)
+print()
+
+print(f"{'Architecture':<18} {'Total Params':<16} {'Gauge DOF':<16} "
+      f"{'Gauge Frac':<14} {'Muon Speedup':<14}")
+print("-" * 78)
+
+summary_data = []
+
+for arch in architectures:
+    total_params = 0
+    total_gauge = 0
+
+    for layer_name, rows, cols, count in arch["layers"]:
+        stats = compute_gauge_stats(rows, cols)
+        total_params += stats["params"] * count
+        total_gauge += stats["gauge_dof"] * count
+
+    gauge_frac = total_gauge / total_params
+    weighted_avg = sum(
+        compute_gauge_stats(rows, cols)["params"] * count *
+        compute_gauge_stats(rows, cols)["gauge_frac"]
+        for _, rows, cols, count in arch["layers"]
+    ) / total_params
+    speedup = 1.0 / (1.0 - weighted_avg)
+
+    summary_data.append((arch["name"], total_params, total_gauge, gauge_frac, speedup))
+
+    # Format large numbers
+    if total_params > 1e9:
+        param_str = f"{total_params/1e9:.1f}B"
+    elif total_params > 1e6:
+        param_str = f"{total_params/1e6:.1f}M"
+    else:
+        param_str = f"{total_params:,}"
+
+    print(f"{arch['name']:<18} {param_str:<16} {total_gauge:>14,} "
+          f"{gauge_frac:<14.4%} {speedup:<14.4f}x")
+
+print()
+
+# ─── Scaling Analysis ────────────────────────────────────────────────────────
+
+print("=" * 80)
+print("SCALING ANALYSIS: How Gauge Fraction Changes with Model Size")
+print("=" * 80)
+print()
+print("Key observation: As models get larger (d_model increases), the gauge")
+print("fraction of attention layers stays ~50% (they remain square), while")
+print("the MLP and embedding gauge fractions DECREASE (they become more rectangular).")
+print()
+print("However, attention layers dominate the parameter count in larger models,")
+print("so the overall gauge fraction tends to INCREASE slightly toward 50%.")
+print()
+
+print(f"{'d_model':<10} {'Attn gauge':<14} {'MLP gauge':<14} "
+      f"{'Embed gauge':<14} {'Weighted avg':<14}")
+print("-" * 66)
+
+for d in [256, 512, 768, 1024, 2048, 4096, 12288]:
+    d_ff = 4 * d
+    vocab = 50257
+
+    attn_gf = (d + 1) / (2 * d)  # square: ~50%
+    mlp_n = min(d, d_ff)
+    mlp_m = max(d, d_ff)
+    mlp_gf = (mlp_n + 1) / (2 * mlp_m)
+    embed_n = min(vocab, d)
+    embed_m = max(vocab, d)
+    embed_gf = (embed_n + 1) / (2 * embed_m)
+
+    # Weighted average (approximate: 4 attn + 2 mlp per block, 12 blocks, 2 embed)
+    n_layers = 12
+    attn_params = 4 * d * d * n_layers
+    mlp_params = 2 * d * d_ff * n_layers
+    embed_params = 2 * vocab * d
+    total = attn_params + mlp_params + embed_params
+
+    weighted = (attn_params * attn_gf + mlp_params * mlp_gf +
+                embed_params * embed_gf) / total
+
+    print(f"{d:<10} {attn_gf:<14.4%} {mlp_gf:<14.4%} "
+          f"{embed_gf:<14.4%} {weighted:<14.4%}")
+
+print()
+print("As d_model grows: attention gauge stays ~50%, MLP gauge drops (d/(4d) ~ 12.5%),")
+print("embedding gauge becomes negligible. The weighted average depends on the")
+print("attention-to-MLP parameter ratio.")
+print()
+
+# ─── Detailed GPT-2 Small Verification ───────────────────────────────────────
+
+print("=" * 80)
+print("DETAILED VERIFICATION: GPT-2 Small Parameter Count")
+print("=" * 80)
+print()
+print("Expected ~124M parameters for GPT-2 Small.")
+print()
+
+gpt2_small = architectures[0]
+total = 0
+print("  Component breakdown:")
+for layer_name, rows, cols, count in gpt2_small["layers"]:
+    params = rows * cols * count
+    total += params
+    print(f"    {layer_name:<18} {rows}x{cols} x{count:<3} = {params:>12,}")
+
+print(f"    {'─'*50}")
+print(f"    {'Total (weight matrices)':<34} = {total:>12,}")
+print()
+
+# Add biases and layer norms for GPT-2 Small
+n_layers = 12
+d_model = 768
+d_ff = 3072
+vocab = 50257
+
+bias_params = (
+    n_layers * (4 * d_model + d_ff + d_model) +  # attn biases + MLP biases
+    n_layers * (2 * 2 * d_model) +                 # 2 LayerNorms per block x (gamma+beta)
+    2 * d_model +                                   # final LayerNorm
+    vocab                                           # output bias (if used)
+)
+
+print(f"    Bias + LayerNorm params (approx): {bias_params:>12,}")
+print(f"    Total with biases:                {total + bias_params:>12,}")
+print()
+
+# GPT-2 Small is typically quoted as ~124M (117M without embedding tying)
+actual_124m = 124_000_000
+print(f"    Reference GPT-2 Small:            {actual_124m:>12,}")
+print(f"    Our count (weight only):          {total:>12,}")
+print(f"    Note: GPT-2 ties embedding + LM head weights, so actual unique")
+print(f"    params = total - vocab*d = {total - vocab*d_model:>12,} + biases")
+print()
+
+# With tied weights
+tied_total = total - vocab * d_model  # remove duplicate LM head
+print(f"    With tied weights + biases: ~{(tied_total + bias_params)/1e6:.1f}M")
+print()
+
+# ─── Per-Block Gauge DOF (Detailed) ─────────────────────────────────────────
+
+print("=" * 80)
+print("PER-BLOCK GAUGE DOF DETAIL (GPT-2 Small)")
+print("=" * 80)
+print()
+
+d = 768
+d_ff_val = 3072
+
+print("Per Attention Block (x12):")
+attn_gauge_per_matrix = d * (d + 1) // 2
+print(f"  Q proj ({d}x{d}): gauge DOF = {d}*{d+1}/2 = {attn_gauge_per_matrix:,}")
+print(f"  K proj ({d}x{d}): gauge DOF = {attn_gauge_per_matrix:,}")
+print(f"  V proj ({d}x{d}): gauge DOF = {attn_gauge_per_matrix:,}")
+print(f"  Out proj ({d}x{d}): gauge DOF = {attn_gauge_per_matrix:,}")
+print(f"  Total per block: 4 x {attn_gauge_per_matrix:,} = {4*attn_gauge_per_matrix:,}")
+print(f"  Gauge fraction: {(d+1)/(2*d):.4%} (all square)")
+print()
+
+print("Per MLP Block (x12):")
+mlp_n = min(d, d_ff_val)
+mlp_m = max(d, d_ff_val)
+mlp_gauge = mlp_n * (mlp_n + 1) // 2
+mlp_gf = mlp_gauge / (d * d_ff_val)
+print(f"  Up proj ({d}x{d_ff_val}): n=min={mlp_n}, gauge DOF = {mlp_n}*{mlp_n+1}/2 = {mlp_gauge:,}")
+print(f"  Down proj ({d_ff_val}x{d}): n=min={mlp_n}, gauge DOF = {mlp_n}*{mlp_n+1}/2 = {mlp_gauge:,}")
+print(f"  Total per block: 2 x {mlp_gauge:,} = {2*mlp_gauge:,}")
+print(f"  Gauge fraction: {mlp_gf:.4%}")
+print()
+
+print("Embedding + LM Head:")
+embed_n = min(50257, d)
+embed_m = max(50257, d)
+embed_gauge = embed_n * (embed_n + 1) // 2
+embed_gf = embed_gauge / (50257 * d)
+print(f"  Embedding ({50257}x{d}): n={embed_n}, gauge DOF = {embed_gauge:,}")
+print(f"  LM Head ({d}x{50257}): n={embed_n}, gauge DOF = {embed_gauge:,}")
+print(f"  Gauge fraction: {embed_gf:.4%}")
+print()
+
+total_gauge_gpt2 = 12 * (4 * attn_gauge_per_matrix + 2 * mlp_gauge) + 2 * embed_gauge
+total_params_gpt2 = 12 * (4 * d * d + 2 * d * d_ff_val) + 2 * 50257 * d
+overall_gf = total_gauge_gpt2 / total_params_gpt2
+
+print(f"GPT-2 Small total gauge DOF: {total_gauge_gpt2:,} / {total_params_gpt2:,} = {overall_gf:.4%}")
+print(f"Predicted Muon speedup (weighted): {1/(1-overall_gf):.4f}x")
+print()
+
+# ─── Pass/Fail Checks ───────────────────────────────────────────────────────
+
+print("=" * 80)
+print("VERIFICATION CHECKS")
+print("=" * 80)
+print()
+
+# Check 1: GPT-2 Small param count in reasonable range
+check1 = 100_000_000 < total_params_gpt2 < 200_000_000
+print(f"  1. GPT-2 Small params in [100M, 200M]:  "
+      f"{total_params_gpt2/1e6:.1f}M — {'PASS' if check1 else 'FAIL'}")
+
+# Check 2: Square layers have ~50% gauge
+check2 = abs((d+1)/(2*d) - 0.5) < 0.01
+print(f"  2. Square layer gauge ~50%:              "
+      f"{(d+1)/(2*d):.4%} — {'PASS' if check2 else 'FAIL'}")
+
+# Check 3: MLP layers have ~12.5% gauge
+check3 = abs(mlp_gf - 0.125) < 0.01
+print(f"  3. MLP layer gauge ~12.5%:               "
+      f"{mlp_gf:.4%} — {'PASS' if check3 else 'FAIL'}")
+
+# Check 4: Embedding gauge < 1%
+check4 = embed_gf < 0.01
+print(f"  4. Embedding gauge < 1%:                 "
+      f"{embed_gf:.4%} — {'PASS' if check4 else 'FAIL'}")
+
+# Check 5: Overall gauge fraction between 10% and 50%
+# (GPT-2 Small has large embedding which dilutes the gauge fraction)
+check5 = 0.10 < overall_gf < 0.50
+print(f"  5. Overall gauge fraction in [10%, 50%]: "
+      f"{overall_gf:.4%} — {'PASS' if check5 else 'FAIL'}")
+
+# Check 6: Muon speedup > 1.1x
+speedup_val = 1/(1-overall_gf)
+check6 = speedup_val > 1.1
+print(f"  6. Predicted Muon speedup > 1.1x:       "
+      f"{speedup_val:.4f}x — {'PASS' if check6 else 'FAIL'}")
+
+# Check 7: GPT-3 has more total gauge DOF than GPT-2
+gpt3_total_gauge = 0
+for _, rows, cols, count in architectures[2]["layers"]:
+    stats = compute_gauge_stats(rows, cols)
+    gpt3_total_gauge += stats["gauge_dof"] * count
+
+check7 = gpt3_total_gauge > total_gauge_gpt2
+print(f"  7. GPT-3 gauge DOF > GPT-2 gauge DOF:   "
+      f"{gpt3_total_gauge:,} > {total_gauge_gpt2:,} — {'PASS' if check7 else 'FAIL'}")
+
+print()
+
+# ─── Final Summary ──────────────────────────────────────────────────────────
+
+print("=" * 80)
+print("FINAL SUMMARY: Gauge Budget Across Architectures")
+print("=" * 80)
+print()
+print("  Architecture     | Gauge Fraction | Muon Speedup | Dominant Source")
+print("  ─────────────────┼────────────────┼──────────────┼─────────────────────")
+
+for arch in architectures:
+    tp = 0
+    tg = 0
+    attn_g = 0
+    mlp_g = 0
+    embed_g = 0
+
+    for layer_name, rows, cols, count in arch["layers"]:
+        stats = compute_gauge_stats(rows, cols)
+        params = stats["params"] * count
+        gauge = stats["gauge_dof"] * count
+        tp += params
+        tg += gauge
+
+        if "Attn" in layer_name:
+            attn_g += gauge
+        elif "MLP" in layer_name:
+            mlp_g += gauge
+        else:
+            embed_g += gauge
+
+    gf = tg / tp
+    sp = 1.0 / (1.0 - gf)
+
+    # Dominant source
+    if attn_g > mlp_g and attn_g > embed_g:
+        dominant = f"Attention ({attn_g/tg:.0%})"
+    elif mlp_g > embed_g:
+        dominant = f"MLP ({mlp_g/tg:.0%})"
+    else:
+        dominant = f"Embedding ({embed_g/tg:.0%})"
+
+    print(f"  {arch['name']:<17}| {gf:<14.2%} | {sp:<12.4f}x | {dominant}")
+
+print()
+print("Key insights:")
+print("  - Attention layers dominate the gauge budget (they are square -> 50% gauge)")
+print("  - MLP layers contribute moderate gauge (rectangular -> ~12.5%)")
+print("  - Embedding layers are nearly gauge-free (very rectangular -> <1%)")
+print("  - Overall: ~13-25% of transformer parameters are gauge-redundant")
+print("    (lower for small models where embeddings dominate, higher for large models)")
+print("  - Muon predicts ~1.15-1.33x overall efficiency gain from gauge removal")
+print("    (more for larger models where attention/MLP dominate over embeddings)")
+print()
+print("Practical implication:")
+print("  Muon should be applied to ALL weight matrices, but the per-step benefit")
+print("  is concentrated in attention layers. The overall training speedup")
+print("  is a parameter-weighted average of the per-layer benefits.")
+print()
+
+overall = check1 and check2 and check3 and check4 and check5 and check6 and check7
+print(f"{'='*80}")
+print(f"OVERALL: {'PASS' if overall else 'FAIL'}")
+print(f"{'='*80}")

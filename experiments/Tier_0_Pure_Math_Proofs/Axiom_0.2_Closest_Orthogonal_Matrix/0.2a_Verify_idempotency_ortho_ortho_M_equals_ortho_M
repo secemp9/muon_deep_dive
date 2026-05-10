@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.2a -- Verify idempotency: ortho(ortho(M)) = ortho(M)
+
+TWO implementations of the orthogonal projection are tested:
+
+  1. EXACT (SVD):  ortho_svd(M) = U @ V^T   where M = U S V^T
+     All singular values of UV^T are 1, so reapplying is a no-op.
+
+  2. APPROXIMATE (Newton-Schulz, as used by Muon):
+     ortho_ns(M, steps=5) uses the 5th-order NS iteration with
+     Muon-specific coefficients  a=3.4445, b=-4.7750, c=2.0315:
+       A = X @ X^T;  B = b*A + c*A@A;  X = a*X + B@X
+     starting from X_0 = M / (||M||_F + eps), with transpose when rows > cols.
+
+     CRITICAL NUANCE (discovered empirically):
+     Muon's NS does NOT produce an orthogonal matrix. Per its own docstring:
+     "does not produce UV^T but rather something like US'V^T where S' is
+     diagonal with S_{ii}' ~ Uniform(0.5, 1.5)."  The singular values land
+     in roughly [0.68, 1.13], NOT at 1.0.
+
+     Consequently, ortho_ns is NOT idempotent in the raw sense:
+       ortho_ns(ortho_ns(M)) != ortho_ns(M)
+     because the re-normalization step changes the singular value starting
+     point each time.
+
+     HOWEVER, ortho_ns IS directionally idempotent:
+       ortho_svd(ortho_ns(ortho_ns(M))) = ortho_svd(ortho_ns(M))
+     to machine precision.  Both applications produce the SAME polar factor
+     UV^T -- the same rotation/reflection.  Only the singular value SCALE
+     differs, not the direction.
+
+Hypothesis (from Flywheel node, refined by experiment):
+  - Exact SVD: idempotency to machine epsilon (~1e-14).
+  - Newton-Schulz: DIRECTIONAL idempotency to machine epsilon.  The polar
+    factor (gauge direction) is fixed after one application.  The singular
+    values (gauge scale) oscillate but this does not affect Muon because
+    the update is later rescaled anyway.
+
+Gauge theory interpretation:
+  The gauge-fixing map selects a DIRECTION on the orthogonal manifold.
+  Exact SVD projection is idempotent in both direction and scale.
+  Muon's NS approximation is idempotent in DIRECTION -- the gauge choice
+  is the same after one or two applications.  The scale variation is
+  irrelevant because Muon rescales the update by sqrt(max(m,n)/min(m,n))
+  after the NS step anyway.
+"""
+
+import numpy as np
+
+
+# ======================================================================
+# Core projection functions
+# ======================================================================
+
+def ortho_svd(M):
+    """Exact closest orthogonal (semi-orthogonal) matrix via SVD polar factor."""
+    U, _, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def ortho_ns(M, steps=5):
+    """Newton-Schulz approximation to the orthogonal polar factor (Muon's method).
+
+    Uses the 5th-order iteration with Muon-specific coefficients:
+        A = X @ X^T;  B = b*A + c*A@A;  X = a*X + B@X
+    where a=3.4445, b=-4.7750, c=2.0315.
+
+    This is an exact replica of Muon's zeropower_via_newtonschulz5, except
+    in float64 instead of bfloat16.
+
+    IMPORTANT: The output is NOT orthogonal. Singular values land in roughly
+    [0.68, 1.13]. But the polar factor (U, V direction) matches the exact SVD
+    to machine precision.
+    """
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = M.copy().astype(np.float64)
+    transposed = False
+    if M.shape[0] > M.shape[1]:
+        X = X.T
+        transposed = True
+    norm = np.linalg.norm(X, 'fro')
+    if norm < 1e-30:
+        return np.zeros_like(M, dtype=np.float64)
+    # Normalize so that spectral norm <= 1 (since sigma_max <= ||M||_F)
+    X = X / (norm + 1e-7)
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if transposed:
+        X = X.T
+    return X
+
+
+# ======================================================================
+# Test helpers
+# ======================================================================
+
+def run_test_svd(name, M, tol=1e-12):
+    """Idempotency check for exact SVD projection."""
+    Q = ortho_svd(M)
+    QQ = ortho_svd(Q)
+    frob_err = np.linalg.norm(QQ - Q, 'fro')
+    max_err = np.max(np.abs(QQ - Q))
+    passed = max_err < tol
+    status = "PASS" if passed else "FAIL"
+    r, c = M.shape
+    print(f"  [{status}]  {name:42s}  shape=({r:>2d},{c:>2d})  "
+          f"max|err|={max_err:.2e}  ||err||_F={frob_err:.2e}")
+    return passed, max_err, frob_err
+
+
+def run_test_ns_directional(name, M, tol=1e-10):
+    """Directional idempotency check for Newton-Schulz.
+
+    Tests: ortho_svd(ortho_ns(ortho_ns(M))) = ortho_svd(ortho_ns(M))
+    i.e., both applications produce the same polar factor.
+    """
+    Q1 = ortho_ns(M)
+    Q2 = ortho_ns(Q1)
+    P1 = ortho_svd(Q1)
+    P2 = ortho_svd(Q2)
+    frob_err = np.linalg.norm(P2 - P1, 'fro')
+    max_err = np.max(np.abs(P2 - P1))
+    passed = max_err < tol
+    status = "PASS" if passed else "FAIL"
+    r, c = M.shape
+    print(f"  [{status}]  {name:42s}  shape=({r:>2d},{c:>2d})  "
+          f"max|err|={max_err:.2e}  ||err||_F={frob_err:.2e}")
+    return passed, max_err, frob_err
+
+
+def check_orthogonality(Q):
+    """Return max deviation of Q from being (semi-)orthogonal."""
+    r, c = Q.shape
+    if r >= c:
+        prod = Q.T @ Q
+        I = np.eye(c)
+    else:
+        prod = Q @ Q.T
+        I = np.eye(r)
+    return np.max(np.abs(prod - I))
+
+
+# ======================================================================
+# Main
+# ======================================================================
+
+def main():
+    np.random.seed(42)
+
+    svd_all_passed = True
+    ns_all_passed = True
+    svd_max_dev = 0.0
+    ns_max_dev = 0.0
+    svd_max_frob = 0.0
+    ns_max_frob = 0.0
+    svd_count = 0
+    ns_count = 0
+
+    SEP = "=" * 95
+
+    print(SEP)
+    print("Axiom 0.2a  --  Verify idempotency: ortho(ortho(M)) = ortho(M)")
+    print("             Tests BOTH exact SVD and Newton-Schulz (Muon) approximations")
+    print(SEP)
+
+    # ==================================================================
+    # PART 1: EXACT SVD PROJECTION
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 1: EXACT SVD PROJECTION  --  ortho_svd(ortho_svd(M)) = ortho_svd(M)")
+    print("  Tolerance: 1e-12 (machine epsilon regime)")
+    print("-" * 95)
+
+    # --- 1a. Random matrices of various shapes ---
+    print()
+    print("  [1a] Random Gaussian matrices (various shapes)")
+    for (r, c) in [(2, 2), (3, 3), (5, 5), (10, 10), (32, 32),
+                    (3, 5), (5, 3), (8, 4), (4, 8), (20, 3), (3, 20)]:
+        M = np.random.randn(r, c)
+        ok, mx, fr = run_test_svd(f"randn({r},{c})", M)
+        svd_all_passed &= ok
+        svd_max_dev = max(svd_max_dev, mx)
+        svd_max_frob = max(svd_max_frob, fr)
+        svd_count += 1
+
+    # --- 1b. 100 random matrices (statistical sweep) ---
+    print()
+    print("  [1b] 100 random matrices (mixed shapes, statistical sweep)")
+    shapes_100 = [(np.random.randint(2, 33), np.random.randint(2, 33)) for _ in range(100)]
+    worst_100_max = 0.0
+    worst_100_frob = 0.0
+    all_ok_100 = True
+    for r, c in shapes_100:
+        M = np.random.randn(r, c)
+        Q = ortho_svd(M)
+        QQ = ortho_svd(Q)
+        mx = np.max(np.abs(QQ - Q))
+        fr = np.linalg.norm(QQ - Q, 'fro')
+        worst_100_max = max(worst_100_max, mx)
+        worst_100_frob = max(worst_100_frob, fr)
+        if mx >= 1e-12:
+            all_ok_100 = False
+    status = "PASS" if all_ok_100 else "FAIL"
+    print(f"  [{status}]  100 random matrices (shapes 2..32)        "
+          f"worst max|err|={worst_100_max:.2e}  worst ||err||_F={worst_100_frob:.2e}")
+    svd_all_passed &= all_ok_100
+    svd_max_dev = max(svd_max_dev, worst_100_max)
+    svd_max_frob = max(svd_max_frob, worst_100_frob)
+    svd_count += 100
+
+    # --- 1c. Identity and negative identity ---
+    print()
+    print("  [1c] Identity and negative identity matrices")
+    for n in [2, 3, 5, 10]:
+        ok, mx, fr = run_test_svd(f"I_{n}", np.eye(n))
+        svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+        svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+    for n in [3, 5]:
+        ok, mx, fr = run_test_svd(f"-I_{n}", -np.eye(n))
+        svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+        svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+
+    # --- 1d. Diagonal matrices ---
+    print()
+    print("  [1d] Diagonal matrices")
+    for n in [3, 5, 10]:
+        d = np.random.randn(n)
+        ok, mx, fr = run_test_svd(f"diag(randn({n}))", np.diag(d))
+        svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+        svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+    ok, mx, fr = run_test_svd("diag([3,-2,0.5,-7,1e-8])",
+                               np.diag([3.0, -2.0, 0.5, -7.0, 1e-8]))
+    svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+    svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+
+    # --- 1e. Near-singular and rank-deficient ---
+    print()
+    print("  [1e] Near-singular and rank-deficient matrices")
+    for n in [3, 5, 10]:
+        M = np.random.randn(n, n)
+        U, S, Vt = np.linalg.svd(M)
+        S[-1] = 1e-15
+        M_ns = U @ np.diag(S) @ Vt
+        ok, mx, fr = run_test_svd(f"near-singular {n}x{n} (sv_min=1e-15)", M_ns)
+        svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+        svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+    u = np.random.randn(5, 1); v = np.random.randn(5, 1)
+    ok, mx, fr = run_test_svd("rank-1  5x5", u @ v.T)
+    svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+    svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+
+    # --- 1f. Already-orthogonal matrices ---
+    print()
+    print("  [1f] Already-orthogonal matrices (should be exact fixed points)")
+    for n in [3, 5, 10]:
+        Q, _ = np.linalg.qr(np.random.randn(n, n))
+        ok, mx, fr = run_test_svd(f"random orthogonal Q ({n}x{n})", Q)
+        svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+        svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+    P = np.eye(5)[np.random.permutation(5)]
+    ok, mx, fr = run_test_svd("permutation 5x5", P)
+    svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+    svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+    v = np.random.randn(4); v = v / np.linalg.norm(v)
+    H = np.eye(4) - 2 * np.outer(v, v)
+    ok, mx, fr = run_test_svd("Householder reflection 4x4", H)
+    svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+    svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+
+    # --- 1g. Special structure ---
+    print()
+    print("  [1g] Special structure matrices")
+    for (r, c) in [(3, 3), (4, 6)]:
+        ok, mx, fr = run_test_svd(f"ones({r},{c})", np.ones((r, c)))
+        svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+        svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+    ok, mx, fr = run_test_svd("randn(5,5)*1e10", np.random.randn(5, 5) * 1e10)
+    svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+    svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+    ok, mx, fr = run_test_svd("randn(5,5)*1e-10", np.random.randn(5, 5) * 1e-10)
+    svd_all_passed &= ok; svd_max_dev = max(svd_max_dev, mx)
+    svd_max_frob = max(svd_max_frob, fr); svd_count += 1
+
+    # --- 1h. Sanity: ortho_svd output is actually orthogonal ---
+    print()
+    print("  [1h] Sanity check: ortho_svd(M) is orthogonal / semi-orthogonal")
+    for (r, c) in [(5, 5), (3, 7), (7, 3)]:
+        M = np.random.randn(r, c)
+        Q = ortho_svd(M)
+        orth_err = check_orthogonality(Q)
+        status = "PASS" if orth_err < 1e-12 else "FAIL"
+        k = min(r, c)
+        label = "Q^TQ" if r >= c else "QQ^T"
+        print(f"  [{status}]  {label}=I_{k} for randn({r},{c}){'':<22s}  "
+              f"max|err|={orth_err:.2e}")
+        svd_all_passed &= (orth_err < 1e-12)
+        svd_count += 1
+
+    # ==================================================================
+    # PART 2: NEWTON-SCHULZ (Muon) -- DIRECTIONAL IDEMPOTENCY
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 2: NEWTON-SCHULZ (Muon) -- DIRECTIONAL IDEMPOTENCY")
+    print("  5th-order iteration, coefficients a=3.4445, b=-4.7750, c=2.0315, 5 steps")
+    print()
+    print("  Key insight: Muon's NS does NOT produce orthogonal matrices.")
+    print("  Output has singular values in ~[0.68, 1.13], not exactly 1.")
+    print("  So raw idempotency ortho_ns(ortho_ns(M)) = ortho_ns(M) does NOT hold.")
+    print()
+    print("  BUT: the DIRECTION (polar factor UV^T) is preserved perfectly.")
+    print("  Test: ortho_svd(ortho_ns^2(M)) = ortho_svd(ortho_ns(M)) to machine eps.")
+    print("  Tolerance: 1e-10")
+    print("-" * 95)
+
+    # --- 2a. Random matrices of various shapes ---
+    print()
+    print("  [2a] Random Gaussian matrices (various shapes)")
+    print("       directional idempotency: ||ortho_svd(NS^2(M)) - ortho_svd(NS(M))||_F")
+    for (r, c) in [(2, 2), (3, 3), (5, 5), (10, 10), (32, 32),
+                    (3, 5), (5, 3), (8, 4), (4, 8), (20, 3), (3, 20)]:
+        M = np.random.randn(r, c)
+        ok, mx, fr = run_test_ns_directional(f"randn({r},{c})", M)
+        ns_all_passed &= ok; ns_max_dev = max(ns_max_dev, mx)
+        ns_max_frob = max(ns_max_frob, fr); ns_count += 1
+
+    # --- 2b. 100 random matrices (statistical sweep) ---
+    print()
+    print("  [2b] 100 random matrices (mixed shapes, directional idempotency)")
+    np.random.seed(123)
+    shapes_ns = [(np.random.randint(2, 33), np.random.randint(2, 33)) for _ in range(100)]
+    worst_ns_max = 0.0
+    worst_ns_frob = 0.0
+    all_ok_ns = True
+    for r, c in shapes_ns:
+        M = np.random.randn(r, c)
+        Q1 = ortho_ns(M)
+        Q2 = ortho_ns(Q1)
+        P1 = ortho_svd(Q1)
+        P2 = ortho_svd(Q2)
+        mx = np.max(np.abs(P2 - P1))
+        fr = np.linalg.norm(P2 - P1, 'fro')
+        worst_ns_max = max(worst_ns_max, mx)
+        worst_ns_frob = max(worst_ns_frob, fr)
+        if mx >= 1e-10:
+            all_ok_ns = False
+    status = "PASS" if all_ok_ns else "FAIL"
+    print(f"  [{status}]  100 random matrices (shapes 2..32)        "
+          f"worst max|err|={worst_ns_max:.2e}  worst ||err||_F={worst_ns_frob:.2e}")
+    ns_all_passed &= all_ok_ns
+    ns_max_dev = max(ns_max_dev, worst_ns_max)
+    ns_max_frob = max(ns_max_frob, worst_ns_frob)
+    ns_count += 100
+
+    # --- 2c. Identity and negative identity ---
+    print()
+    print("  [2c] Identity and negative identity matrices")
+    for n in [2, 3, 5, 10]:
+        ok, mx, fr = run_test_ns_directional(f"I_{n}", np.eye(n))
+        ns_all_passed &= ok; ns_max_dev = max(ns_max_dev, mx)
+        ns_max_frob = max(ns_max_frob, fr); ns_count += 1
+    for n in [3, 5]:
+        ok, mx, fr = run_test_ns_directional(f"-I_{n}", -np.eye(n))
+        ns_all_passed &= ok; ns_max_dev = max(ns_max_dev, mx)
+        ns_max_frob = max(ns_max_frob, fr); ns_count += 1
+
+    # --- 2d. Already-orthogonal matrices ---
+    print()
+    print("  [2d] Already-orthogonal matrices")
+    np.random.seed(42)
+    for n in [3, 5, 10, 20, 32]:
+        Q, _ = np.linalg.qr(np.random.randn(n, n))
+        ok, mx, fr = run_test_ns_directional(f"random orthogonal Q ({n}x{n})", Q)
+        ns_all_passed &= ok; ns_max_dev = max(ns_max_dev, mx)
+        ns_max_frob = max(ns_max_frob, fr); ns_count += 1
+    P = np.eye(5)[np.random.permutation(5)]
+    ok, mx, fr = run_test_ns_directional("permutation 5x5", P)
+    ns_all_passed &= ok; ns_max_dev = max(ns_max_dev, mx)
+    ns_max_frob = max(ns_max_frob, fr); ns_count += 1
+    v = np.random.randn(4); v = v / np.linalg.norm(v)
+    H = np.eye(4) - 2 * np.outer(v, v)
+    ok, mx, fr = run_test_ns_directional("Householder reflection 4x4", H)
+    ns_all_passed &= ok; ns_max_dev = max(ns_max_dev, mx)
+    ns_max_frob = max(ns_max_frob, fr); ns_count += 1
+
+    # --- 2e. Matrices with controlled condition number ---
+    print()
+    print("  [2e] Matrices with controlled condition number (simulating Muon's regime)")
+    np.random.seed(55)
+    for (r, c) in [(5, 5), (10, 10), (8, 4), (4, 8), (16, 16), (32, 32)]:
+        M = np.random.randn(r, c)
+        U_m, S_m, Vt_m = np.linalg.svd(M, full_matrices=False)
+        k = min(r, c)
+        S_new = np.linspace(1.0, 3.0, k)
+        M_cond = U_m @ np.diag(S_new) @ Vt_m
+        ok, mx, fr = run_test_ns_directional(f"cond~3 ({r}x{c})", M_cond)
+        ns_all_passed &= ok; ns_max_dev = max(ns_max_dev, mx)
+        ns_max_frob = max(ns_max_frob, fr); ns_count += 1
+
+    # --- 2f. Verify NS finds the correct direction (matches SVD) ---
+    print()
+    print("  [2f] Direction accuracy: ortho_svd(ortho_ns(M)) = ortho_svd(M)")
+    print("       (NS finds the same polar factor as exact SVD)")
+    np.random.seed(88)
+    for (r, c) in [(5, 5), (10, 10), (3, 7), (7, 3), (32, 32)]:
+        M = np.random.randn(r, c)
+        Q_ns = ortho_ns(M)
+        P_ns = ortho_svd(Q_ns)
+        P_direct = ortho_svd(M)
+        frob_err = np.linalg.norm(P_ns - P_direct, 'fro')
+        max_err = np.max(np.abs(P_ns - P_direct))
+        status = "PASS" if max_err < 1e-10 else "FAIL"
+        print(f"  [{status}]  randn({r},{c}){'':<36s}  shape=({r:>2d},{c:>2d})  "
+              f"max|err|={max_err:.2e}  ||err||_F={frob_err:.2e}")
+        ns_all_passed &= (max_err < 1e-10)
+        ns_count += 1
+
+    # ==================================================================
+    # PART 3: WHY NS IS NOT RAW-IDEMPOTENT (educational)
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 3: WHY NS IS NOT RAW-IDEMPOTENT (educational analysis)")
+    print("-" * 95)
+    print()
+
+    np.random.seed(77)
+    print("  The NS iteration maps singular values to ~[0.68, 1.13], not exactly 1.")
+    print("  When reapplied, the normalization X/||X||_F remaps these to ~[0.3, 0.5],")
+    print("  and the iteration maps them BACK to [0.68, 1.13] at different values.")
+    print("  The DIRECTION (UV^T) is preserved, but the SCALE (S) oscillates.")
+    print()
+    print("  Singular values after ortho_ns(M):")
+    for (r, c) in [(5, 5), (10, 10), (32, 32)]:
+        M = np.random.randn(r, c)
+        Q = ortho_ns(M)
+        sv = np.linalg.svd(Q, compute_uv=False)
+        print(f"    randn({r:>2d},{c:>2d}): sv range = [{sv.min():.4f}, {sv.max():.4f}], "
+              f"mean = {sv.mean():.4f}")
+
+    print()
+    print("  Raw idempotency error ||ortho_ns(ortho_ns(M)) - ortho_ns(M)||_F:")
+    for (r, c) in [(5, 5), (10, 10), (32, 32)]:
+        M = np.random.randn(r, c)
+        Q1 = ortho_ns(M)
+        Q2 = ortho_ns(Q1)
+        raw_err = np.linalg.norm(Q2 - Q1, 'fro')
+        print(f"    randn({r:>2d},{c:>2d}): ||err||_F = {raw_err:.4f}  (NOT small -- expected)")
+
+    print()
+    print("  Directional idempotency error ||ortho_svd(NS^2(M)) - ortho_svd(NS(M))||_F:")
+    for (r, c) in [(5, 5), (10, 10), (32, 32)]:
+        M = np.random.randn(r, c)
+        Q1 = ortho_ns(M)
+        Q2 = ortho_ns(Q1)
+        P1 = ortho_svd(Q1)
+        P2 = ortho_svd(Q2)
+        dir_err = np.linalg.norm(P2 - P1, 'fro')
+        print(f"    randn({r:>2d},{c:>2d}): ||err||_F = {dir_err:.2e}  (machine precision)")
+
+    # ==================================================================
+    # PART 4: COMPARATIVE ANALYSIS -- SVD vs Newton-Schulz
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 4: COMPARATIVE ANALYSIS  --  100 random matrices")
+    print("-" * 95)
+    print()
+
+    np.random.seed(999)
+    svd_idems = []
+    ns_dir_idems = []
+    ns_raw_idems = []
+    ns_direction_accuracy = []
+    for i in range(100):
+        r = np.random.randint(2, 33)
+        c = np.random.randint(2, 33)
+        M = np.random.randn(r, c)
+
+        # SVD idempotency
+        Q_svd = ortho_svd(M)
+        QQ_svd = ortho_svd(Q_svd)
+        svd_idems.append(np.linalg.norm(QQ_svd - Q_svd, 'fro'))
+
+        # NS directional idempotency
+        Q_ns = ortho_ns(M)
+        QQ_ns = ortho_ns(Q_ns)
+        P1 = ortho_svd(Q_ns)
+        P2 = ortho_svd(QQ_ns)
+        ns_dir_idems.append(np.linalg.norm(P2 - P1, 'fro'))
+
+        # NS raw idempotency
+        ns_raw_idems.append(np.linalg.norm(QQ_ns - Q_ns, 'fro'))
+
+        # NS direction accuracy (does NS find the same UV^T as SVD?)
+        P_direct = ortho_svd(M)
+        ns_direction_accuracy.append(np.linalg.norm(P1 - P_direct, 'fro'))
+
+    svd_idems = np.array(svd_idems)
+    ns_dir_idems = np.array(ns_dir_idems)
+    ns_raw_idems = np.array(ns_raw_idems)
+    ns_direction_accuracy = np.array(ns_direction_accuracy)
+
+    print(f"  SVD idempotency ||ortho_svd^2(M) - ortho_svd(M)||_F:")
+    print(f"    mean={svd_idems.mean():.2e}  max={svd_idems.max():.2e}  "
+          f"median={np.median(svd_idems):.2e}")
+    print()
+    print(f"  NS DIRECTIONAL idempotency ||svd(NS^2(M)) - svd(NS(M))||_F:")
+    print(f"    mean={ns_dir_idems.mean():.2e}  max={ns_dir_idems.max():.2e}  "
+          f"median={np.median(ns_dir_idems):.2e}")
+    print()
+    print(f"  NS RAW idempotency ||NS^2(M) - NS(M)||_F  (expected large):")
+    print(f"    mean={ns_raw_idems.mean():.4f}  max={ns_raw_idems.max():.4f}  "
+          f"median={np.median(ns_raw_idems):.4f}")
+    print()
+    print(f"  NS direction accuracy ||svd(NS(M)) - svd(M)||_F:")
+    print(f"    mean={ns_direction_accuracy.mean():.2e}  max={ns_direction_accuracy.max():.2e}  "
+          f"median={np.median(ns_direction_accuracy):.2e}")
+
+    ns_dir_ok = ns_dir_idems.max() < 1e-10
+    ns_acc_ok = ns_direction_accuracy.max() < 1e-10
+    print()
+    print(f"  NS directional idempotency (max < 1e-10):  {'PASS' if ns_dir_ok else 'FAIL'}")
+    print(f"  NS direction accuracy (max < 1e-10):       {'PASS' if ns_acc_ok else 'FAIL'}")
+
+    # ==================================================================
+    # PART 5: STEP COUNT SENSITIVITY
+    # ==================================================================
+    print()
+    print("-" * 95)
+    print("  PART 5: NS STEP COUNT SENSITIVITY")
+    print("-" * 95)
+    print()
+
+    np.random.seed(42)
+    M_test = np.random.randn(10, 10)
+    print(f"  Test matrix: randn(10,10)")
+    print(f"  Measuring directional idempotency and singular value range vs step count")
+    print()
+    for k in range(1, 11):
+        Q = ortho_ns(M_test, steps=k)
+        QQ = ortho_ns(Q, steps=k)
+        P1 = ortho_svd(Q)
+        P2 = ortho_svd(QQ)
+        dir_err = np.linalg.norm(P2 - P1, 'fro')
+        raw_err = np.linalg.norm(QQ - Q, 'fro')
+        sv = np.linalg.svd(Q, compute_uv=False)
+        print(f"  steps={k:>2d}:  dir_idem={dir_err:.2e}  raw_idem={raw_err:.4f}  "
+              f"sv=[{sv.min():.4f}, {sv.max():.4f}]")
+
+    print()
+    print("  Directional idempotency is near machine-eps for all step counts >= 1.")
+    print("  Raw idempotency never converges because NS does not produce sv=1.")
+    print("  This is by design: Muon prioritizes speed over exactness.")
+
+    # ==================================================================
+    # SUMMARY
+    # ==================================================================
+    print()
+    print(SEP)
+    print("SUMMARY")
+    print(SEP)
+    print()
+    total_svd = svd_count
+    total_ns = ns_count
+    total = total_svd + total_ns
+    overall = svd_all_passed and ns_all_passed and ns_dir_ok and ns_acc_ok
+
+    print(f"  SVD exact tests:         {total_svd:>4d}   "
+          f"{'ALL PASSED' if svd_all_passed else 'SOME FAILED'}   "
+          f"max Frobenius error: {svd_max_frob:.2e}")
+    print(f"  NS directional tests:    {total_ns:>4d}   "
+          f"{'ALL PASSED' if ns_all_passed else 'SOME FAILED'}   "
+          f"max Frobenius error: {ns_max_frob:.2e}")
+    print(f"  Total tests:             {total:>4d}")
+    print(f"  Overall:                 {'ALL PASSED' if overall else 'SOME FAILED'}")
+
+    print()
+    print(SEP)
+    if overall:
+        print("CONCLUSION")
+        print(SEP)
+        print()
+        print("  1. EXACT (SVD): ortho_svd(ortho_svd(M)) = ortho_svd(M) to machine precision.")
+        print("     The SVD polar factor is a true idempotent projection.  QED.")
+        print()
+        print("  2. APPROXIMATE (Newton-Schulz, Muon's 5th-order, 5 steps):")
+        print("     a) RAW idempotency FAILS: ortho_ns(ortho_ns(M)) != ortho_ns(M).")
+        print("        This is because NS does not produce orthogonal matrices -- the")
+        print("        output has singular values in ~[0.68, 1.13], and the normalization")
+        print("        step remaps them differently each time.")
+        print()
+        print("     b) DIRECTIONAL idempotency HOLDS to machine precision:")
+        print("        ortho_svd(NS(NS(M))) = ortho_svd(NS(M))")
+        print("        Both applications produce the SAME polar factor UV^T.")
+        print("        The gauge-fixing DIRECTION is idempotent.")
+        print()
+        print("     c) NS finds the EXACT same direction as SVD:")
+        print("        ortho_svd(NS(M)) = ortho_svd(M) to machine precision.")
+        print("        NS is a perfect direction finder, just an imperfect scaler.")
+        print()
+        print("  GAUGE THEORY INTERPRETATION:")
+        print("    The gauge-fixing map selects a direction on the Stiefel manifold.")
+        print("    Exact SVD is idempotent in both direction and scale (true projection).")
+        print("    Muon's NS is idempotent in DIRECTION -- the gauge choice is the same")
+        print("    after one or two applications.  The singular value oscillation is")
+        print("    irrelevant because Muon rescales the update afterward:")
+        print("      update *= sqrt(max(m,n)/min(m,n))")
+        print("    The gauge slice is fixed.  Once you choose the right UV^T, you stay.")
+    else:
+        print("WARNING: Some tests failed. Investigate above.")
+
+    print()
+    return 0 if overall else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.4a -- Verify: ortho(cM) = ortho(M) numerically for c > 0.
+
+Scale invariance of the orthogonal projection
+==============================================
+
+The orthogonal projection ortho(M) = UV^T from the SVD of M is exactly
+scale-invariant for positive scalars:  ortho(cM) = ortho(M) for all c > 0.
+
+Proof (one line):
+    M = U Sigma V^T  =>  cM = U (c Sigma) V^T  =>  ortho(cM) = U V^T = ortho(M)
+
+Scaling only multiplies the singular values by c; the singular vectors U
+and V are unchanged.  Since ortho() depends only on U and V, it is blind
+to the scale of M.
+
+This experiment verifies this numerically, then contrasts with SGD and Adam:
+
+  - SGD:  sgd(cG) = eta * cG = c * sgd(G).  NOT scale-invariant (scales linearly).
+  - Adam: adam(cG) = cG / (|c| sqrt(G^2) + eps).  Approximately invariant for
+    large c (eps becomes negligible), but breaks for small c (eps dominates).
+  - Muon (SVD):  exactly invariant.
+  - Muon (Newton-Schulz):  invariant by construction (normalizes by ||M||_F first).
+
+Hypothesis
+----------
+ortho is exactly scale-invariant.  SGD is NOT (step scales linearly with c).
+Adam is approximately scale-invariant for large c but breaks for small c
+(eps term dominates).  This 3-line test separates the three optimizers by
+a single algebraic property.
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+RNG = np.random.default_rng(42)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def sep(title: str) -> None:
+    """Print a section separator."""
+    print(f"\n{'=' * 72}")
+    print(f"  {title}")
+    print(f"{'=' * 72}\n")
+
+
+def mat(name: str, A: np.ndarray) -> None:
+    """Pretty-print a labelled matrix."""
+    print(f"{name} =")
+    for row in np.atleast_2d(A):
+        print("  [" + "  ".join(f"{v: .8f}" for v in row) + "]")
+    print()
+
+
+def ortho_svd(M: np.ndarray) -> np.ndarray:
+    """Orthogonal projection via SVD: ortho(M) = U V^T."""
+    U, _, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def ortho_ns(M: np.ndarray, n_iters: int = 10) -> np.ndarray:
+    """
+    Orthogonal projection via Newton-Schulz iteration.
+    Normalizes by ||M||_F first (this is what makes it scale-invariant).
+    Uses the cubic iteration: X_{k+1} = (3/2) X_k - (1/2) X_k X_k^T X_k
+    which converges to U V^T when singular values of X_0 are in (0, sqrt(3)).
+    """
+    norm = np.linalg.norm(M, 'fro')
+    if norm < 1e-15:
+        return np.zeros_like(M)
+    # Normalize so singular values lie in a safe range for convergence
+    X = M / norm
+    for _ in range(n_iters):
+        X = 1.5 * X - 0.5 * X @ (X.T @ X)
+    return X
+
+
+EPS_ADAM = 1e-8
+
+def sgd_step(G: np.ndarray, lr: float = 1.0) -> np.ndarray:
+    """SGD step: f(G) = lr * G."""
+    return lr * G
+
+
+def adam_step(G: np.ndarray, eps: float = EPS_ADAM) -> np.ndarray:
+    """
+    Simplified single-step Adam: f(G) = G / (sqrt(G^2) + eps).
+    This is the core element-wise normalization of Adam (with beta2 -> 0).
+    """
+    return G / (np.sqrt(G ** 2) + eps)
+
+
+def relative_deviation(A: np.ndarray, B: np.ndarray) -> float:
+    """||A - B||_F / ||B||_F, with protection against zero denominator."""
+    norm_b = np.linalg.norm(B, 'fro')
+    if norm_b < 1e-15:
+        return 0.0
+    return np.linalg.norm(A - B, 'fro') / norm_b
+
+
+# ===================================================================
+# PART 1: The 3-line proof
+# ===================================================================
+
+sep("PART 1: The 3-line proof -- ortho(cM) = ortho(M)")
+
+print("  Line 1: M = np.random.randn(4, 4)")
+print("  Line 2: for c in [0.001, 0.01, ..., 1000]:")
+print("  Line 3:     assert np.allclose(ortho(c*M), ortho(M))")
+print()
+
+M = RNG.standard_normal((4, 4))
+mat("M (4x4 random)", M)
+
+c_values = [0.001, 0.01, 0.1, 1, 10, 100, 1000]
+
+print(f"  {'c':>10s}  {'||ortho(cM) - ortho(M)||_F':>28s}  {'Status'}")
+print(f"  {'-'*10}  {'-'*28}  {'-'*6}")
+
+part1_pass = True
+for c in c_values:
+    O_cM = ortho_svd(c * M)
+    O_M  = ortho_svd(M)
+    dev  = np.linalg.norm(O_cM - O_M, 'fro')
+    ok   = dev < 1e-12
+    if not ok:
+        part1_pass = False
+    print(f"  {c:10.3f}  {dev:28.2e}  {'PASS' if ok else 'FAIL'}")
+
+print()
+if part1_pass:
+    print("  ALL PASS: ortho(cM) = ortho(M) to machine epsilon for all c > 0.")
+else:
+    print("  FAIL: unexpected deviation detected.")
+print()
+
+
+# ===================================================================
+# PART 2: Why it works -- algebraic proof via SVD
+# ===================================================================
+
+sep("PART 2: Why it works -- SVD of M vs cM side by side")
+
+print("  Algebraic proof:")
+print("    M = U Sigma V^T")
+print("    cM = U (c * Sigma) V^T")
+print("    ortho(cM) = U V^T = ortho(M)")
+print()
+print("  Scaling only affects singular values, not singular vectors U, V.")
+print("  We verify this numerically by showing U and V are identical")
+print("  for M and cM, while Sigma scales by c.")
+print()
+
+c_demo = 7.3  # arbitrary non-trivial scale factor
+U_M, s_M, Vt_M = np.linalg.svd(M, full_matrices=False)
+U_cM, s_cM, Vt_cM = np.linalg.svd(c_demo * M, full_matrices=False)
+
+# SVD may flip signs of corresponding columns of U and rows of Vt.
+# Align signs for comparison: for each singular vector pair, ensure
+# the dot product is positive by flipping if needed.
+n_sv = len(s_M)
+for i in range(n_sv):
+    if np.dot(U_M[:, i], U_cM[:, i]) < 0:
+        U_cM[:, i]  *= -1
+        Vt_cM[i, :] *= -1
+
+print(f"  Using c = {c_demo}")
+print()
+
+print("  Singular values of M:")
+print(f"    {s_M}")
+print(f"  Singular values of cM  (c = {c_demo}):")
+print(f"    {s_cM}")
+print(f"  Ratio s(cM) / s(M):")
+ratios = s_cM / s_M
+print(f"    {ratios}")
+print(f"  Expected ratio: {c_demo} for all entries.")
+ratio_dev = np.max(np.abs(ratios - c_demo))
+print(f"  Max |ratio - c| = {ratio_dev:.2e}")
+print()
+
+u_dev = np.linalg.norm(U_cM - U_M, 'fro')
+v_dev = np.linalg.norm(Vt_cM - Vt_M, 'fro')
+
+print("  Left singular vectors (U):")
+mat("U from M", U_M)
+mat("U from cM", U_cM)
+print(f"  ||U(cM) - U(M)||_F = {u_dev:.2e}")
+print()
+
+print("  Right singular vectors (V^T):")
+mat("V^T from M", Vt_M)
+mat("V^T from cM", Vt_cM)
+print(f"  ||V^T(cM) - V^T(M)||_F = {v_dev:.2e}")
+print()
+
+part2_pass = (ratio_dev < 1e-10 and u_dev < 1e-12 and v_dev < 1e-12)
+print(f"  Singular values scale by c: {'PASS' if ratio_dev < 1e-10 else 'FAIL'}")
+print(f"  U unchanged:                {'PASS' if u_dev < 1e-12 else 'FAIL'}")
+print(f"  V^T unchanged:              {'PASS' if v_dev < 1e-12 else 'FAIL'}")
+print()
+if part2_pass:
+    print("  CONFIRMED: Scaling M -> cM changes only Sigma, not U or V.")
+    print("  Therefore ortho(cM) = U V^T = ortho(M).  QED.")
+else:
+    print("  FAIL: unexpected deviation in singular vectors.")
+print()
+
+
+# ===================================================================
+# PART 3: SGD is NOT scale-invariant
+# ===================================================================
+
+sep("PART 3: SGD is NOT scale-invariant")
+
+print("  SGD step: sgd(G) = eta * G")
+print("  sgd(cG) = eta * cG = c * sgd(G)")
+print("  => ||sgd(cG) - sgd(G)||_F / ||sgd(G)||_F = |c - 1|")
+print()
+print("  The step scales linearly with the gradient magnitude.")
+print("  This means SGD is sensitive to the learning rate / gradient scale:")
+print("  rescaling gradients by 2x is equivalent to doubling the learning rate.")
+print()
+
+print(f"  {'c':>10s}  {'||sgd(cM)-sgd(M)||/||sgd(M)||':>32s}  "
+      f"{'|c-1| (predicted)':>18s}  {'Match'}")
+print(f"  {'-'*10}  {'-'*32}  {'-'*18}  {'-'*5}")
+
+part3_pass = True
+for c in c_values:
+    sgd_cM = sgd_step(c * M)
+    sgd_M  = sgd_step(M)
+    rel_dev  = relative_deviation(sgd_cM, sgd_M)
+    predicted = abs(c - 1.0)
+    match = abs(rel_dev - predicted) / max(predicted, 1e-15) < 1e-10 if predicted > 0 else rel_dev < 1e-15
+    if not match:
+        part3_pass = False
+    print(f"  {c:10.3f}  {rel_dev:32.6f}  {predicted:18.6f}  "
+          f"{'PASS' if match else 'FAIL'}")
+
+print()
+if part3_pass:
+    print("  CONFIRMED: SGD relative deviation = |c - 1| exactly.")
+    print("  SGD is NOT scale-invariant (deviation grows linearly with |c - 1|).")
+else:
+    print("  FAIL: unexpected mismatch in SGD scaling.")
+print()
+
+
+# ===================================================================
+# PART 4: Adam is PARTIALLY scale-invariant
+# ===================================================================
+
+sep("PART 4: Adam is PARTIALLY scale-invariant")
+
+print("  Single-step Adam: adam(G) = G / (sqrt(G^2) + eps)")
+print()
+print("  adam(cG) = cG / (sqrt(c^2 G^2) + eps)")
+print("           = cG / (|c| sqrt(G^2) + eps)")
+print()
+print("  For c > 0:")
+print("    adam(cG) = cG / (c sqrt(G^2) + eps)")
+print("            = G / (sqrt(G^2) + eps/c)")
+print()
+print("  Compared to adam(G) = G / (sqrt(G^2) + eps):")
+print("    - For large c: eps/c -> 0, so adam(cG) -> G/sqrt(G^2) = sign(G)")
+print("      and adam(G) -> G/sqrt(G^2) = sign(G). Approximately equal.")
+print("    - For small c: eps/c >> eps, denominator grows -> adam(cG) -> cG/eps")
+print("      which is like SGD. Scale invariance breaks.")
+print()
+
+c_values_adam = [1e-6, 1e-3, 0.01, 0.1, 1, 10, 100, 1e3, 1e6]
+
+print(f"  {'c':>10s}  {'||adam(cM)-adam(M)||/||adam(M)||':>34s}  {'Regime'}")
+print(f"  {'-'*10}  {'-'*34}  {'-'*20}")
+
+part4_pass = True
+adam_deviations = {}
+for c in c_values_adam:
+    adam_cM = adam_step(c * M)
+    adam_M  = adam_step(M)
+    rel_dev = relative_deviation(adam_cM, adam_M)
+    adam_deviations[c] = rel_dev
+
+    if c < 1:
+        regime = "BREAKS (eps dominates)"
+    elif c == 1:
+        regime = "exact (c = 1)"
+    else:
+        regime = "approx invariant"
+
+    print(f"  {c:10.3g}  {rel_dev:34.6e}  {regime}")
+
+# Verify the asymmetry: small c should have LARGER deviation than large c
+small_c_dev = adam_deviations[1e-3]
+large_c_dev = adam_deviations[1e3]
+asymmetry_ok = small_c_dev > large_c_dev
+# Verify large c approaches invariance
+large_c_approx = adam_deviations[1e6] < 1e-4
+# Verify small c is far from invariant
+small_c_breaks = adam_deviations[1e-6] > 0.1
+
+part4_pass = asymmetry_ok and large_c_approx and small_c_breaks
+
+print()
+print(f"  Asymmetry check (dev at c=0.001 > dev at c=1000): "
+      f"{'PASS' if asymmetry_ok else 'FAIL'}")
+print(f"    dev(c=0.001) = {small_c_dev:.6e}")
+print(f"    dev(c=1000)  = {large_c_dev:.6e}")
+print()
+print(f"  Large c approaches invariance (dev at c=1e6 < 1e-4): "
+      f"{'PASS' if large_c_approx else 'FAIL'}  ({adam_deviations[1e6]:.2e})")
+print(f"  Small c breaks invariance (dev at c=1e-6 > 0.1):     "
+      f"{'PASS' if small_c_breaks else 'FAIL'}  ({adam_deviations[1e-6]:.2e})")
+print()
+print("  INTERPRETATION: Adam's scale invariance is partial and asymmetric.")
+print("  It holds approximately for large c (eps negligible) but breaks badly")
+print("  for small c (eps dominates, Adam degenerates to SGD-like behavior).")
+print()
+
+
+# ===================================================================
+# PART 5: Muon's Newton-Schulz iteration is scale-invariant
+# ===================================================================
+
+sep("PART 5: Muon's Newton-Schulz iteration is scale-invariant")
+
+print("  Muon normalizes by ||M||_F before the Newton-Schulz iteration:")
+print("    X_0 = M / ||M||_F")
+print("    X_{k+1} = (3/2) X_k - (1/2) X_k (X_k^T X_k)")
+print()
+print("  For cM: X_0 = cM / ||cM||_F = cM / (c ||M||_F) = M / ||M||_F")
+print("  The normalization step absorbs the scale factor c entirely.")
+print("  So the NS iteration sees the same input regardless of c.")
+print()
+
+print(f"  {'c':>10s}  {'||ortho_ns(cM)-ortho_ns(M)||_F':>32s}  {'Status'}")
+print(f"  {'-'*10}  {'-'*32}  {'-'*6}")
+
+part5_pass = True
+for c in c_values:
+    ons_cM = ortho_ns(c * M)
+    ons_M  = ortho_ns(M)
+    dev = np.linalg.norm(ons_cM - ons_M, 'fro')
+    ok = dev < 1e-10
+    if not ok:
+        part5_pass = False
+    print(f"  {c:10.3f}  {dev:32.2e}  {'PASS' if ok else 'FAIL'}")
+
+print()
+
+# Also show the normalization step explicitly
+print("  Explicit normalization demonstration:")
+for c in [0.001, 1, 1000]:
+    norm_cM = np.linalg.norm(c * M, 'fro')
+    X0 = (c * M) / norm_cM
+    norm_M = np.linalg.norm(M, 'fro')
+    X0_ref = M / norm_M
+    dev = np.linalg.norm(X0 - X0_ref, 'fro')
+    print(f"    c = {c:8.3f}:  ||cM||_F = {norm_cM:12.6f},  "
+          f"||X_0(cM) - X_0(M)||_F = {dev:.2e}")
+
+print()
+if part5_pass:
+    print("  CONFIRMED: Newton-Schulz iteration is scale-invariant by construction.")
+    print("  The normalization step X_0 = M / ||M||_F absorbs any scalar factor.")
+else:
+    print("  FAIL: unexpected deviation in Newton-Schulz results.")
+print()
+
+
+# ===================================================================
+# PART 6: Three-way comparison table
+# ===================================================================
+
+sep("PART 6: Three-way comparison table -- SGD vs Adam vs Muon(SVD) vs Muon(NS)")
+
+c_values_full = [1e-6, 1e-3, 0.01, 0.1, 1, 10, 100, 1e3, 1e6]
+
+print(f"  {'c':>10s}  {'SGD':>14s}  {'Adam':>14s}  {'Muon(SVD)':>14s}  {'Muon(NS)':>14s}")
+print(f"  {'-'*10}  {'-'*14}  {'-'*14}  {'-'*14}  {'-'*14}")
+
+part6_data = []
+for c in c_values_full:
+    sgd_dev  = relative_deviation(sgd_step(c * M), sgd_step(M))
+    adam_dev = relative_deviation(adam_step(c * M), adam_step(M))
+    svd_dev  = relative_deviation(ortho_svd(c * M), ortho_svd(M))
+    ns_dev   = relative_deviation(ortho_ns(c * M), ortho_ns(M))
+
+    part6_data.append((c, sgd_dev, adam_dev, svd_dev, ns_dev))
+    print(f"  {c:10.3g}  {sgd_dev:14.6e}  {adam_dev:14.6e}  "
+          f"{svd_dev:14.6e}  {ns_dev:14.6e}")
+
+print()
+print("  Key observations:")
+print("    - SGD: deviation = |c - 1|, grows without bound. Linear scaling.")
+print("    - Adam: asymmetric. Large c -> small deviation. Small c -> large deviation.")
+print("    - Muon (SVD): deviation ~ 0 (machine epsilon) for all c > 0.")
+print("    - Muon (NS): deviation ~ 0 (machine epsilon) for all c > 0.")
+print()
+print("  This table cleanly separates the four optimizers by a single property:")
+print("  exact scale invariance. Only Muon (both SVD and NS variants) achieves it.")
+print()
+
+# Verify the structural claims
+part6_pass = True
+for (c, sgd_d, adam_d, svd_d, ns_d) in part6_data:
+    if c != 1:
+        # SGD should be proportional to |c-1|
+        if abs(sgd_d - abs(c - 1)) / max(abs(c - 1), 1e-15) > 1e-6:
+            part6_pass = False
+    # Muon should be near zero
+    if svd_d > 1e-10:
+        part6_pass = False
+    if ns_d > 1e-8:
+        part6_pass = False
+
+print(f"  Structural claims verified: {'PASS' if part6_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 7: Statistical confirmation over 500 random matrices
+# ===================================================================
+
+sep("PART 7: Statistical confirmation -- 500 random matrices at multiple sizes")
+
+N_STAT = 500
+SIZES = [(3, 3), (5, 5), (10, 10)]
+C_TEST = [0.001, 1000]
+
+part7_pass = True
+
+for (rows, cols) in SIZES:
+    print(f"  Size: {rows}x{cols}  ({N_STAT} trials)")
+    print(f"  {'c':>10s}  {'Optimizer':>10s}  {'worst dev':>14s}  "
+          f"{'mean dev':>14s}  {'Status'}")
+    print(f"  {'-'*10}  {'-'*10}  {'-'*14}  {'-'*14}  {'-'*6}")
+
+    for c in C_TEST:
+        for opt_name, opt_fn in [("SGD", sgd_step), ("Adam", adam_step),
+                                 ("Muon_SVD", ortho_svd), ("Muon_NS", ortho_ns)]:
+            devs = []
+            for _ in range(N_STAT):
+                Mi = RNG.standard_normal((rows, cols))
+                f_cM = opt_fn(c * Mi)
+                f_M  = opt_fn(Mi)
+                devs.append(relative_deviation(f_cM, f_M))
+
+            worst = max(devs)
+            mean  = np.mean(devs)
+
+            if opt_name.startswith("Muon"):
+                ok = worst < 1e-8
+            elif opt_name == "SGD":
+                ok = abs(worst - abs(c - 1)) / abs(c - 1) < 0.01
+            else:  # Adam
+                ok = True  # just report
+
+            if opt_name.startswith("Muon") and not ok:
+                part7_pass = False
+
+            print(f"  {c:10.3g}  {opt_name:>10s}  {worst:14.6e}  "
+                  f"{mean:14.6e}  {'PASS' if ok else 'FAIL'}")
+
+    print()
+
+print(f"  Muon scale-invariance holds across all sizes and scales: "
+      f"{'PASS' if part7_pass else 'FAIL'}")
+print()
+
+
+# ===================================================================
+# PART 8: Negative c -- sign equivariance
+# ===================================================================
+
+sep("PART 8: Negative c -- sign equivariance, not invariance")
+
+print("  For c > 0:  ortho(cM) = ortho(M)           (scale invariance)")
+print("  For c < 0:  ortho(cM) = -ortho(M)          (sign flips)")
+print()
+print("  Why? If c < 0, then cM = U (c Sigma) V^T.  The singular values")
+print("  must be non-negative, so SVD of cM absorbs the sign into U:")
+print("    cM = (-U) (|c| Sigma) V^T")
+print("    ortho(cM) = (-U) V^T = -(U V^T) = -ortho(M)")
+print()
+print("  More precisely, ortho(cM) = sign(c) * ortho(M) for c != 0.")
+print("  This is sign equivariance: the map respects the sign but is")
+print("  invariant to the magnitude.")
+print()
+
+# Test c = -1
+M_test = RNG.standard_normal((4, 4))
+O_M    = ortho_svd(M_test)
+O_negM = ortho_svd(-M_test)
+
+print("  Test: c = -1")
+mat("ortho(M)", O_M)
+mat("ortho(-M)", O_negM)
+mat("-ortho(M)", -O_M)
+
+dev_neg = np.linalg.norm(O_negM - (-O_M), 'fro')
+print(f"  ||ortho(-M) - (-ortho(M))||_F = {dev_neg:.2e}")
+
+neg1_pass = dev_neg < 1e-12
+print(f"  ortho(-M) = -ortho(M): {'PASS' if neg1_pass else 'FAIL'}")
+print()
+
+# Test a range of negative c values
+print("  Extended test: negative c values")
+print(f"  {'c':>10s}  {'||ortho(cM) - sign(c)*ortho(M)||_F':>38s}  {'Status'}")
+print(f"  {'-'*10}  {'-'*38}  {'-'*6}")
+
+neg_c_values = [-1000, -100, -10, -1, -0.1, -0.01, -0.001]
+
+part8_pass = True
+for c in neg_c_values:
+    O_cM = ortho_svd(c * M_test)
+    expected = np.sign(c) * O_M
+    dev = np.linalg.norm(O_cM - expected, 'fro')
+    ok = dev < 1e-12
+    if not ok:
+        part8_pass = False
+    print(f"  {c:10.3f}  {dev:38.2e}  {'PASS' if ok else 'FAIL'}")
+
+print()
+
+# Also verify positive c for completeness
+print("  Positive c (for comparison):")
+print(f"  {'c':>10s}  {'||ortho(cM) - ortho(M)||_F':>38s}  {'Status'}")
+print(f"  {'-'*10}  {'-'*38}  {'-'*6}")
+
+pos_c_values = [0.001, 0.01, 0.1, 1, 10, 100, 1000]
+for c in pos_c_values:
+    O_cM = ortho_svd(c * M_test)
+    dev = np.linalg.norm(O_cM - O_M, 'fro')
+    ok = dev < 1e-12
+    if not ok:
+        part8_pass = False
+    print(f"  {c:10.3f}  {dev:38.2e}  {'PASS' if ok else 'FAIL'}")
+
+print()
+part8_pass = part8_pass and neg1_pass
+
+print(f"  Summary: ortho(cM) = sign(c) * ortho(M) for all c != 0: "
+      f"{'PASS' if part8_pass else 'FAIL'}")
+print()
+print("  The full symmetry is:")
+print("    ortho(cM) = ortho(M)     for c > 0   (scale invariance)")
+print("    ortho(cM) = -ortho(M)    for c < 0   (sign equivariance)")
+print("    ortho(0)  = undefined    (zero matrix has no SVD direction)")
+print()
+
+
+# ===================================================================
+# FINAL VERDICT
+# ===================================================================
+
+sep("FINAL VERDICT")
+
+all_pass = (part1_pass and part2_pass and part3_pass and part4_pass
+            and part5_pass and part6_pass and part7_pass and part8_pass)
+
+print(f"  Part 1 (3-line proof):                      {'PASS' if part1_pass else 'FAIL'}")
+print(f"  Part 2 (algebraic proof via SVD):            {'PASS' if part2_pass else 'FAIL'}")
+print(f"  Part 3 (SGD is NOT scale-invariant):         {'PASS' if part3_pass else 'FAIL'}")
+print(f"  Part 4 (Adam is PARTIALLY scale-invariant):  {'PASS' if part4_pass else 'FAIL'}")
+print(f"  Part 5 (Muon NS is scale-invariant):         {'PASS' if part5_pass else 'FAIL'}")
+print(f"  Part 6 (three-way comparison table):         {'PASS' if part6_pass else 'FAIL'}")
+print(f"  Part 7 (statistical confirmation):           {'PASS' if part7_pass else 'FAIL'}")
+print(f"  Part 8 (negative c / sign equivariance):     {'PASS' if part8_pass else 'FAIL'}")
+print()
+
+if all_pass:
+    print("  ============================================")
+    print("  =            ALL TESTS PASSED              =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.4a VERIFIED:")
+    print("    ortho(cM) = ortho(M) for all c > 0, exactly (to machine epsilon).")
+    print("    ortho(cM) = -ortho(M) for all c < 0 (sign equivariance).")
+    print()
+    print("  Three-way separation of optimizers by scale invariance:")
+    print("    SGD:   NOT scale-invariant.  Step scales as c * sgd(G).")
+    print("    Adam:  PARTIALLY scale-invariant.  Breaks for small c (eps dominates).")
+    print("    Muon:  EXACTLY scale-invariant.  Both SVD and NS variants.")
+    print()
+    print("  This single algebraic property -- scale invariance -- cleanly separates")
+    print("  Muon from SGD and Adam.  It is a direct consequence of the fact that")
+    print("  ortho() depends only on the singular vectors of M, not the singular")
+    print("  values.  Scaling M changes only the singular values, so ortho() is blind")
+    print("  to it.  This is the gauge-fixing perspective: Muon projects onto the")
+    print("  Stiefel manifold (the 'gauge slice'), and the projection is invariant")
+    print("  under the scale gauge.")
+else:
+    print("  ============================================")
+    print("  =          SOME TESTS FAILED               =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.4a: VERIFICATION FAILED on some parts. Investigate above.")
+
+print()

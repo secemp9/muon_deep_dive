@@ -1,0 +1,898 @@
+[
+  {
+    "id": "bfbe2c7e-adb2-4013-972a-3b1691f47fca",
+    "title": "Muon_as_RG_Gauge_Fixing",
+    "children": [
+      {
+        "id": "8304e0ab-a806-4491-b74c-f82c7983802b",
+        "title": "Cross-Cutting_Theoretical_Connections",
+        "children": [
+          {
+            "id": "9487bc72-d02a-4f58-a1d3-d9965c73e90e",
+            "title": "C1_Information_Geometry_Natural_Gradient",
+            "children": [
+              {
+                "id": "d0b9a877-2f0f-4e50-8ed0-f1fbe7ac912e",
+                "title": "C1a_Muon_vs_Natural_Gradient_update_direction_comparison"
+              },
+              {
+                "id": "470c7849-dd9d-4575-9bf1-78728985d47c",
+                "title": "C1b_Muon_vs_KFAC_operator-aware_preconditioning"
+              },
+              {
+                "id": "a450ef4a-a492-4b0a-b00a-54b0735bb289",
+                "title": "C1c_Is_Muon_a_cheap_natural_gradient_approximation"
+              }
+            ]
+          },
+          {
+            "id": "032713ff-88c9-4f12-bf8e-d1e164534289",
+            "title": "C2_Muonic_Adam_Compose_Spectral_Per-Coordinate",
+            "children": [
+              {
+                "id": "3abb27dd-bb53-4d94-83c3-e93287978d11",
+                "title": "C2a_Implementation_and_benchmark"
+              },
+              {
+                "id": "b576ed84-4c7f-4294-a64a-91bbb92eee30",
+                "title": "C2b_Does_composition_help_on_ill-conditioned_data"
+              }
+            ]
+          },
+          {
+            "id": "ce2dd1fb-a2b9-4327-95ca-f13e74d8138c",
+            "title": "C3_Connection_to_Spectral_Normalization_Miyato"
+          },
+          {
+            "id": "59aa0f65-9202-4fdc-98ce-f9be23f39f44",
+            "title": "C4_Connection_to_SAM_Sharpness-Aware_Minimization",
+            "children": [
+              {
+                "id": "61a47265-e681-4ed6-9988-74dbb116a6ac",
+                "title": "C4a_SAM_Muon_double_perturbation_sharpness"
+              }
+            ]
+          },
+          {
+            "id": "fbb76d31-4ee9-4f23-85c0-272927a88f6b",
+            "title": "C5_Connection_to_LoRA_Low-Rank_Adaptation"
+          },
+          {
+            "id": "b3f7ddc1-47f9-4068-bf9f-ef037061974e",
+            "title": "C6_Convergence_Rate_Theory",
+            "children": [
+              {
+                "id": "be26df9a-aab0-4c94-a299-0ea33c62b921",
+                "title": "C6a_Convergence_rate_Muon_vs_SGD_on_deep_linear_proof_sketch"
+              },
+              {
+                "id": "3d3f36e5-3840-40fd-b3ec-4ada63346152",
+                "title": "C6b_Does_speedup_11-gauge_fraction"
+              }
+            ]
+          },
+          {
+            "id": "05a077a3-b97a-450a-bc09-84c97520acf2",
+            "title": "C7_Gradient_Compression_Connection"
+          },
+          {
+            "id": "7d48ee15-6f32-484f-b825-dd34e194eb0c",
+            "title": "C8_Pruning_Lottery_Ticket_Incompatibility"
+          }
+        ]
+      },
+      {
+        "id": "7b1d25b1-d59f-43a8-af6b-f13a19cbc053",
+        "title": "Tier_0_Pure_Math_Proofs_zero_compute_pen_paper",
+        "children": [
+          {
+            "id": "2f5f360f-5c68-4ebd-b683-fe08a8d08e38",
+            "title": "Axiom_0.10_Gauge_redundancy_fraction_nn12mn_for_mxn_matrices",
+            "children": [
+              {
+                "id": "bc7ff0ef-811b-48d2-8caa-de0853b4964f",
+                "title": "0.10a_Tabulate_redundancy_fraction_for_all_common_NN_layer_shapes"
+              },
+              {
+                "id": "4f7ac00e-1b77-4aa3-ae65-95d22c7c2c57",
+                "title": "0.10b_Does_Muons_LR_need_to_scale_with_redundancy_fraction"
+              },
+              {
+                "id": "4bed94f2-09d2-4dd2-8126-fac2607269fd",
+                "title": "0.10c_Count_how_many_gauge_DOF_in_a_full_transformer"
+              }
+            ]
+          },
+          {
+            "id": "60085d37-e028-4a11-9166-5541118ed623",
+            "title": "Axiom_0.1_GLn_On_x_Symn_polar_decomposition_is_a_diffeomorphism",
+            "children": [
+              {
+                "id": "25b9193c-4900-414e-a267-4ea13d9e6e4e",
+                "title": "0.1a_Verify_Q_MMTM-12_on_a_2x2_matrix_by_hand"
+              },
+              {
+                "id": "2a5c4b30-8511-4b1e-b684-878436c40d66",
+                "title": "0.1b_Verify_Polar_decomposition_fails_for_singular_M_det0"
+              }
+            ]
+          },
+          {
+            "id": "92f9f6d7-f2ab-464d-a47a-8a6cc43864d1",
+            "title": "Axiom_0.2_orthoM_argmin_Q_in_On_M-Q_F_closest_orthogonal_matrix",
+            "children": [
+              {
+                "id": "1ce08f06-a1e6-435f-a68c-32093be3917b",
+                "title": "0.2a_Verify_idempotency_orthoorthoM_orthoM_projection_property"
+              }
+            ]
+          },
+          {
+            "id": "12374db9-aa9f-4193-9744-2dc8171cca25",
+            "title": "Axiom_0.3_orthoRMST_RorthoMST_equivariance_under_OnxOn",
+            "children": [
+              {
+                "id": "4b3b422b-b318-4833-870e-39b273fe94aa",
+                "title": "0.3a_Verify_equivariance_breaks_for_Adam_compute_RMSTsqrtveps_vs_RMsqrtvepsST"
+              },
+              {
+                "id": "cc4540d3-adc0-44f8-a961-20fd7026eae3",
+                "title": "0.3b_Which_symmetries_does_Adam_PRESERVE_diagonal_scaling_group"
+              }
+            ]
+          },
+          {
+            "id": "e039a64f-b73e-4e4e-954e-965494bffedf",
+            "title": "Axiom_0.4_orthocM_orthoM_for_c_0_scale_invariance",
+            "children": [
+              {
+                "id": "e307ef35-7305-4947-834c-a82938ff746e",
+                "title": "0.4a_Verify_orthocM_orthoM_numerically_for_c_in_0.001_1_1000"
+              },
+              {
+                "id": "babfbc32-2e3a-43c6-b589-806bf5ee3ebd",
+                "title": "0.4b_Does_orthoMeE_approx_orthoM_for_small_additive_perturbation"
+              }
+            ]
+          },
+          {
+            "id": "70a31b5e-37ed-43f6-a432-cb4b42c818c8",
+            "title": "Axiom_0.5_orthoM_op_1_always_bounded_operator_norm",
+            "children": [
+              {
+                "id": "b85bd55c-c07d-453b-8384-229e3e188a12",
+                "title": "0.5a_Verify_UVT_op_1_for_rectangular_M_partial_isometry"
+              },
+              {
+                "id": "ffb5ecd7-f9bd-479c-b79a-e7dc1e4e6dad",
+                "title": "0.5b_Compare_orthoM_F_sqrtminmn_vs_M_F_what_changes"
+              }
+            ]
+          },
+          {
+            "id": "062c446b-2dc8-4e96-94c0-1e7604d82768",
+            "title": "Axiom_0.6_Muon_steepest_descent_under_op_spectral_norm",
+            "children": [
+              {
+                "id": "836dfa03-2ca3-4d30-ad95-557b5a63ed44",
+                "title": "0.6a_Von_Neumann_trace_inequality_verify_on_2x2_and_3x3"
+              },
+              {
+                "id": "f8305564-f6ea-40fc-bca6-7a6c064fa22b",
+                "title": "0.6b_Compare_step_norms_Delta_SGD_F_vs_Delta_Muon_F_vs_Delta_Adam_F_for_same_loss_decrease"
+              }
+            ]
+          },
+          {
+            "id": "79bc4a7b-160c-4ad3-a15c-60ffacf6371a",
+            "title": "Axiom_0.7_NS_fixed_points_fsigma_3sigma-sigma32_has_sigma_in_0-1_classify_stability",
+            "children": [
+              {
+                "id": "86c59241-a5d7-4934-87a3-1cd9f287b24c",
+                "title": "0.7a_Plot_fsigma_3sigma-sigma32_and_its_iterates_cobweb_diagram"
+              },
+              {
+                "id": "f293e376-af1e-4c3e-8ec3-410c3d32afb5",
+                "title": "0.7b_Compute_fksigma_0_for_k1..10_tabulate_convergence_rate"
+              }
+            ]
+          },
+          {
+            "id": "0491b868-685c-4109-9bad-60d796a46ec0",
+            "title": "Axiom_0.8_The_nuclear_norm_dual_M_orthoM_M_nuclear_norm",
+            "children": [
+              {
+                "id": "d3f41104-12d2-498c-a326-451a3db1ec08",
+                "title": "0.8a_Nuclear_vs_Frobenius_vs_Spectral_which_norm_favors_which_directions"
+              },
+              {
+                "id": "0657812d-ab56-4ede-a3b7-400ef1d37f5e",
+                "title": "0.8b_Verify_M_orthoM_M_on_100_random_matrices"
+              }
+            ]
+          },
+          {
+            "id": "7f4ce561-a794-46d6-9ebb-676a3b8f6992",
+            "title": "Axiom_0.9_Stiefel_manifold_Stnm_as_a_gauge_slice_of_GLmn",
+            "children": [
+              {
+                "id": "ea6e62fe-37be-460e-a4ce-e062edd16224",
+                "title": "0.9a_Compute_tangent_space_of_Stiefel_at_UVT_what_directions_are_physical"
+              },
+              {
+                "id": "e8ada783-6445-46e6-8406-98ab2c56427a",
+                "title": "0.9b_Does_Muons_update_LIE_in_the_tangent_space_of_St_or_just_near_it"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "5015df49-0352-47f7-803a-2da918fda158",
+        "title": "Tier_1_Core_Mechanism_Tests",
+        "children": [
+          {
+            "id": "d1af4dfd-6716-4994-941d-fbf573788185",
+            "title": "Exp_1.1_Deep_Linear_Net_Balance_Condition",
+            "children": [
+              {
+                "id": "3c1ea33b-baab-495f-b3d5-46764620c179",
+                "title": "1.1a_Balance_Vary_Depth_L246816",
+                "children": [
+                  {
+                    "id": "baa05199-9dbd-4abe-bd55-1cd21c725bb4",
+                    "title": "1.1a-i_Depth_Scaling_Product_Singular_Value_Distribution"
+                  },
+                  {
+                    "id": "42432478-e10d-4650-81c6-063351458cbb",
+                    "title": "1.1a-ii_Depth_Scaling_Loss_Landscape_Sharpness_vs_Depth"
+                  }
+                ]
+              },
+              {
+                "id": "f1a833b4-582a-4bc9-a4b3-3d792a9cf8db",
+                "title": "1.1b_Balance_Intentionally_Unbalanced_Init",
+                "children": [
+                  {
+                    "id": "762167d2-6c19-4095-9714-2ced1f371b4f",
+                    "title": "1.1b-i_Rebalancing_Time-to-Balance_vs_Imbalance_Ratio"
+                  },
+                  {
+                    "id": "895b5064-5dd0-4f94-ab7f-062f3076a304",
+                    "title": "1.1b-ii_Rebalancing_Does_Muons_Balance_Survive_Nonlinearity"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "5fc6b851-35df-4213-a131-08408af194e7",
+            "title": "Exp_1.2_Spectrum_Perturbation_Invariance",
+            "children": [
+              {
+                "id": "3b531ca8-f255-4001-859e-bbbc8166d073",
+                "title": "1.2a_Perturbation_Orthogonal_vs_PSD_vs_General",
+                "children": [
+                  {
+                    "id": "b594a303-049d-4a0b-aecc-5be64ce0fcfd",
+                    "title": "1.2a-i_Pure_Math_orthoM_orthoMP_for_PSD_P_prove_analytically"
+                  }
+                ]
+              },
+              {
+                "id": "d45e260f-a95c-44ef-b5e3-1103b91e56c1",
+                "title": "1.2b_Perturbation_Accumulation_Over_Trajectory",
+                "children": [
+                  {
+                    "id": "06cef100-ae7c-42e4-acf9-d3c147f51833",
+                    "title": "1.2b-i_Lyapunov_Exponent_of_Gauge_Direction_Under_Each_Optimizer"
+                  },
+                  {
+                    "id": "9c649f55-c9e6-470e-935b-8ab755e09ba0",
+                    "title": "1.2b-ii_Trajectory_in_Polar_Coordinates_Q_t_P_t_Decomposition"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "a3a57924-fc3f-4547-94e5-2913ad25d35e",
+            "title": "Exp_1.3_Singular_Value_Spectrum_Evolution",
+            "children": [
+              {
+                "id": "d4833a3b-b9e5-417f-a768-85bd547d58b8",
+                "title": "1.3a_Spectrum_Effective_Rank_Over_Training",
+                "children": [
+                  {
+                    "id": "6df1b3f8-d4c6-4588-81fb-86f389503bba",
+                    "title": "1.3a-i_Effective_Rank_Layer-by-Layer_vs_Aggregate"
+                  },
+                  {
+                    "id": "b5768328-769e-4caa-85d6-a07456000ad3",
+                    "title": "1.3a-ii_Effective_Rank_Momentum_vs_Weight_Spectrum"
+                  }
+                ]
+              },
+              {
+                "id": "d7cda6ee-60ff-44a2-a3de-55c74d7e8a4c",
+                "title": "1.3b_Spectrum_Gradient_vs_Weight_Spectrum_Correlation",
+                "children": [
+                  {
+                    "id": "5c7bf268-3740-4a51-b0b9-7b94e3eb324c",
+                    "title": "1.3b-i_Feedback_Loop_Does_SGDs_Anisotropy_Self-Amplify",
+                    "children": [
+                      {
+                        "id": "35353bd8-e069-4aaf-a9b0-e08a2760b30e",
+                        "title": "1.3b-i-A_Feedback_Measure_sigma1W_Growth_Rate_Under_Each_Optimizer"
+                      }
+                    ]
+                  },
+                  {
+                    "id": "02266d26-7c08-4257-8fd9-9d30f7aedda1",
+                    "title": "1.3b-ii_Hessian_Alignment_Does_Muons_Update_Avoid_Flat_Directions",
+                    "children": [
+                      {
+                        "id": "a8836ebe-1964-408a-ba2b-ef1f82720e86",
+                        "title": "1.3b-ii-A_Hessian_Top-5_Eigenvector_Alignment_With_Update_2x2_net"
+                      },
+                      {
+                        "id": "7c14b8cd-8cfb-481f-9723-8a94de75b821",
+                        "title": "1.3b-ii-B_Hessian_Null_Space_Dimension_vs_Network_Symmetry_Count"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "66ab203c-fec6-47b3-990f-a61eca1e9d7f",
+                "title": "1.3c_Spectrum_Connection_to_WeightWatcher_alpha",
+                "children": [
+                  {
+                    "id": "14b8584a-7524-4add-95b9-71f699ddc96b",
+                    "title": "1.3c-i_Isolate_lambda_max_from_alpha_Track_Both_Independently"
+                  },
+                  {
+                    "id": "4098a5a9-572f-4235-8707-0124f96f0ee4",
+                    "title": "1.3c-ii_ERG_Fixed_Point_Does_Gauge_Fixing_DELAY_or_PREVENT_alpha_to_2",
+                    "children": [
+                      {
+                        "id": "e500275a-74f1-4133-a0c9-a36402e0f3b7",
+                        "title": "1.3c-ii-A_Compare_Eigenvalue_DISTRIBUTIONS_at_alpha_approx_2_Muon_vs_AdamW"
+                      },
+                      {
+                        "id": "a06b40df-c182-43a6-ab79-57b40cfaad4e",
+                        "title": "1.3c-ii-B_Entropy_of_Eigenvalue_Distribution_Muon_vs_AdamW"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "dfd0a652-bdbe-41c7-9743-eea3c750a43e",
+            "title": "Exp_1.4_Newton-Schulz_as_RG_Flow_direct_verification",
+            "children": [
+              {
+                "id": "811993af-4f8c-4c1b-8332-3e8e0fa3fd40",
+                "title": "1.4a_NS_Flow_Convergence_Basin_Map",
+                "children": [
+                  {
+                    "id": "1c5ade96-3397-41f7-99d3-c0ad21d6c4fc",
+                    "title": "1.4a-i_Basin_Map_What_Happens_at_sigmasqrt3_the_critical_boundary"
+                  },
+                  {
+                    "id": "36afd925-219d-404a-8225-c62479cac899",
+                    "title": "1.4a-ii_Basin_Map_Multi-Dimensional_Phase_Portrait"
+                  }
+                ]
+              },
+              {
+                "id": "954416db-f561-4bc0-9677-c01d584dc282",
+                "title": "1.4b_NS_Flow_UV_Preservation_to_Machine_Epsilon",
+                "children": [
+                  {
+                    "id": "882a48f4-df6e-46c9-bd4e-ddcea7c9b019",
+                    "title": "1.4b-i_UV_Drift_Float32_vs_Float64_Accumulation"
+                  },
+                  {
+                    "id": "b1c864cf-0b9a-4990-9bcb-b9ddc1420c0e",
+                    "title": "1.4b-ii_UV_Drift_Rectangular_vs_Square_Matrices"
+                  }
+                ]
+              },
+              {
+                "id": "95d40488-4605-4f71-a48f-39950a2b9725",
+                "title": "1.4c_NS_Flow_Comparison_with_Other_Iterations",
+                "children": [
+                  {
+                    "id": "a33901f1-561c-4605-ade9-fb7ea2adf7bf",
+                    "title": "1.4c-i_NS_vs_Halley_Convergence_Rate_Per_FLOP"
+                  },
+                  {
+                    "id": "6de8bc9e-8fe3-481a-a855-17561353eed5",
+                    "title": "1.4c-ii_What_If_We_Use_FewerMore_NS_Steps_12351020"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "075881e2-4e1d-4bc2-811b-c04fa4e9ed8b",
+            "title": "Exp_1.5_Loss_Landscape_Geometry_Under_Muon_vs_SGD"
+          },
+          {
+            "id": "39846f97-2210-40c6-a471-af680340a90f",
+            "title": "H6_LR_Artifact_Confirmed_Residual_Directional_Advantage",
+            "children": [
+              {
+                "id": "0852c071-6457-476e-b450-f8f9b5da5fa9",
+                "title": "H6a_LR_confound_audit_depth_exponent_and_balance_results"
+              },
+              {
+                "id": "cf16bfba-166b-4f75-b294-515eff33fbef",
+                "title": "H6b_Residual_7x_directional_advantage_across_activations"
+              },
+              {
+                "id": "b279fab3-3b17-4ea4-a5c6-1fa88443607a",
+                "title": "H18a_Muon_LR_stability_from_spectral_norm_bounded_updates_optimal_LR_varies_O1_vs_SGD_O1_over_L2"
+              },
+              {
+                "id": "d0eea789-5043-4aeb-927c-5158c7a97001",
+                "title": "H18b_30x_constant_factor_is_LR_independent_exhaustive_LR_sweep_at_depths_2_4_8_16_confirms_flat_ratio"
+              }
+            ]
+          },
+          {
+            "id": "7b0c6290-cd48-4e88-867e-4a6ae2e01377",
+            "title": "H3_Polar_Factor_Not_Scale_Normalization_SV_Equalization",
+            "children": [
+              {
+                "id": "ec9046be-fbef-409b-9e85-ed071a33a23c",
+                "title": "H3a_Per_SV_gradient_utilization_Muon_vs_normalized_SGD"
+              },
+              {
+                "id": "52f63e95-d647-4db9-9bfb-109439ac0671",
+                "title": "H3b_Partial_equalization_top_k_SVs_capture_Muon_advantage"
+              },
+              {
+                "id": "e372b838-7d1c-40aa-9cc6-48200c869e17",
+                "title": "H19a_Partial_SV_eq_creates_spurious_saddles_measure_Hessian_negative_eigenvalues_at_k_4_vs_k_0_vs_k_32"
+              },
+              {
+                "id": "7f0c25f6-4a38-40c7-8749-45a041f07d6b",
+                "title": "H19b_Hessian_basis_partial_eq_works_because_it_preserves_curvature_alignment_SV_basis_destroys_it"
+              }
+            ]
+          },
+          {
+            "id": "b8c1ab5a-d229-46c8-8015-dff6ff98e559",
+            "title": "H15_Direction_Quality_Not_Conditioning_Improvement",
+            "children": [
+              {
+                "id": "b4ad9084-8559-4ce5-a320-1a5651ff0362",
+                "title": "H15a_Direction_quality_cosine_sim_Muon_update_vs_Newton_step"
+              },
+              {
+                "id": "423a616f-7242-440a-8d42-4420c764e081",
+                "title": "H15b_Explicit_SVD_clamping_matches_Muon_loss_or_not"
+              },
+              {
+                "id": "4a9b633c-23a8-49cc-89ec-3e610761c92d",
+                "title": "H20a_Cosine_advantage_compounds_geometrically_measure_cumulative_trajectory_divergence_at_50_100_200_500_steps"
+              },
+              {
+                "id": "75d6a56d-4053-45af-a808-3130e1cf87ee",
+                "title": "H20b_Compounding_requires_loss_landscape_curvature_test_on_quadratic_vs_nonconvex_loss_surfaces"
+              }
+            ]
+          },
+          {
+            "id": "5e174f25-b945-4cb6-956b-71e855befd97",
+            "title": "Exp_1.6_Muon_on_BiasScalar_Parameters_hybrid_optimizer"
+          }
+        ]
+      },
+      {
+        "id": "a0a6352f-d831-45f9-8837-00e18fd71292",
+        "title": "Tier_2_Symmetry_Reparametrization_Tests",
+        "children": [
+          {
+            "id": "3091b27a-7a49-4508-a885-185f7aa048c0",
+            "title": "Exp_2.1_Conjugation_Covariance",
+            "children": [
+              {
+                "id": "99275b13-93f8-4b09-9dc4-fc8ec5673547",
+                "title": "2.1a_Conjugation_Single-Step_Exact_Covariance_no_training"
+              },
+              {
+                "id": "a7723a5b-36e1-40c8-9f74-4d22cf51772f",
+                "title": "2.1b_Conjugation_Does_Covariance_Persist_Through_Momentum",
+                "children": [
+                  {
+                    "id": "2a39a0e9-39f6-46dc-b4f0-29cc4b34d70d",
+                    "title": "2.1b-i_Equivariance_error_vs_depth_layer_distance_from_data"
+                  },
+                  {
+                    "id": "a2753875-26bd-442f-b1c4-8ebc1e1a2274",
+                    "title": "2.1b-ii_Equivariance_violation_correlates_with_per_layer_Muon_advantage"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "cd5ee186-7b83-4d95-ace9-ef2078e8f5e2",
+            "title": "Exp_2.2_Layerwise_Rescaling_Robustness",
+            "children": [
+              {
+                "id": "c399171e-b048-47c4-9c9b-f11dd7fe0669",
+                "title": "2.2a_Rescaling_Per-Layer_vs_Global_Scale_Invariance"
+              },
+              {
+                "id": "a1d22173-9c17-49c5-b687-3037d3355fb4",
+                "title": "2.2b_Rescaling_What_Breaks_at_c1000_extreme_stress"
+              },
+              {
+                "id": "aa5bf775-2c57-46c4-852c-effd0c1a0fc2",
+                "title": "2.2c_Self_correction_timescale_steps_to_halve_imbalance_vs_c"
+              },
+              {
+                "id": "d7e3c1a4-5b82-4f09-a1d3-9f8e2c7b4a56",
+                "title": "2.2d_Muon_as_implicit_per_layer_LR_compare_SGD_with_tuned_per_layer_LR"
+              },
+              {
+                "id": "ae007d92-7cdd-4722-b2d7-05d306e1ef9d",
+                "title": "H21a_Direction_vs_scale_crossover_sweep_c_from_1_to_1000_find_c_star_where_oracle_SGD_overtakes_Muon"
+              },
+              {
+                "id": "6b963d2e-e401-41f4-9fbe-5de878096523",
+                "title": "H21b_Balance_ratio_predicts_direction_value_Muon_directional_advantage_correlates_with_max_layer_norm_ratio_below_threshold"
+              }
+            ]
+          },
+          {
+            "id": "c3e8b2b0-65e9-48f5-845c-9a15ab74fdc1",
+            "title": "Exp_2.3_Width_Scaling_\u03bcP-style",
+            "children": [
+              {
+                "id": "35e99c8b-b9b2-47f6-87a9-a6c7924172d7",
+                "title": "2.3a_LR_Transfer_Coefficient_log-log_slope"
+              },
+              {
+                "id": "1d8312c8-e740-4591-b80e-e1e6a7586102",
+                "title": "2.3b_Gauge-fixing_benefit_scaling_with_width"
+              },
+              {
+                "id": "d3e0f3a2-0009-4fe0-977b-67a4c8f83cf7",
+                "title": "2.3c_Spectral_norm_of_updates_vs_width"
+              }
+            ]
+          },
+          {
+            "id": "78b9305b-cb67-481c-a37f-813f11c7d183",
+            "title": "Exp_2.4_Depth_Scaling_nonlinear_nets",
+            "children": [
+              {
+                "id": "6751a250-a168-486c-9b69-e3901f6cc330",
+                "title": "2.4a_Optimal_LR_vs_depth"
+              },
+              {
+                "id": "0415d8f2-cf37-41f7-b778-503ba1983e11",
+                "title": "2.4b_Gauge_fraction_accumulation_with_depth"
+              }
+            ]
+          },
+          {
+            "id": "c010acbb-f12c-4532-bf94-6851220b5cc8",
+            "title": "Exp_2.5_Interaction_with_BatchNorm_LayerNorm",
+            "children": [
+              {
+                "id": "4e59c7fd-e00f-4cba-8abe-a92b1d3e8994",
+                "title": "2.5a_BN_Muon_additive_or_redundant",
+                "children": [
+                  {
+                    "id": "90a4ec20-f7fb-4204-8686-8be91aac2b9b",
+                    "title": "2.5a_BN_Muon_additive_or_redundant_branch"
+                  }
+                ]
+              },
+              {
+                "id": "3fad326b-83c9-4174-972a-6a96e78ee9cd",
+                "title": "2.5b_LayerNorm_Muon_in_Transformers"
+              }
+            ]
+          },
+          {
+            "id": "dc14b46d-4508-4d7e-b9b1-63556b361a90",
+            "title": "Exp_2.6_Interaction_with_Weight_Decay",
+            "children": [
+              {
+                "id": "4c3a2271-78b4-4cdf-a280-fc826530953e",
+                "title": "2.6a_WD_sweep_Pareto_frontier"
+              },
+              {
+                "id": "0a0982ad-cf75-4139-abb0-56d4a507d876",
+                "title": "2.6b_WD_Muon_spectral_regularization"
+              },
+              {
+                "id": "a001535a-63a1-443b-9ff9-5e3d082ca32c",
+                "title": "2.6c_Decoupled_WD_AdamW-style_vs_L2_under_Muon"
+              }
+            ]
+          },
+          {
+            "id": "bb42a204-773b-4dc0-a011-fb0b030d0a40",
+            "title": "Exp_2.7_Permutation_Equivariance_the_nonlinear_gauge"
+          }
+        ]
+      },
+      {
+        "id": "a64fe2a6-6b1c-4784-beee-d6492f1ac5b9",
+        "title": "Tier_3_Task_Sweep_does_it_generalize",
+        "children": [
+          {
+            "id": "f22659f1-fe3b-4ccf-8792-c51387ae8a79",
+            "title": "Exp_3.10_RL_Policy_Gradient_Matrices"
+          },
+          {
+            "id": "3840e16f-cbc7-4056-a7f9-bc579ecaf531",
+            "title": "Exp_3.11_Fine-Tuning_Pre-Trained_Model_LoRA_Muon"
+          },
+          {
+            "id": "9c310df8-10b0-42fb-a73f-1db07cbf0dab",
+            "title": "Exp_3.1_Tiny_Transformer_LM",
+            "children": [
+              {
+                "id": "1a579d25-1552-4b62-9daa-f17060124495",
+                "title": "3.1a_Transformer_Geometric_Diagnostics_spectrum_balance_perturbation"
+              },
+              {
+                "id": "d77ecb5c-0699-467e-a3ec-f2350c9cf045",
+                "title": "3.1b_Transformer_Performance_Comparison_loss_curves_compute-matched"
+              },
+              {
+                "id": "210b5f25-22ad-4d33-846f-0c50e39449a3",
+                "title": "3.1c_Transformer_Per-Layer_Analysis_gauge_fraction_vs_speedup_correlation"
+              }
+            ]
+          },
+          {
+            "id": "b93dc895-0142-4e6a-9064-dfd3c8ee8cd9",
+            "title": "Exp_3.2_CNN_on_CIFAR-10_ResNet-20",
+            "children": [
+              {
+                "id": "4d16ad49-0c4f-4089-9519-84bb59184e21",
+                "title": "3.2a_CNN_Geometric_Diagnostics_spectrum_balance_perturbation"
+              },
+              {
+                "id": "da057183-2eae-4c8a-a49e-129af65625b9",
+                "title": "3.2b_CNN_Performance_Comparison_loss_curves_compute-matched"
+              },
+              {
+                "id": "b9c6566c-4630-4ee5-bbec-4de052d313ff",
+                "title": "3.2c_CNN_Per-Layer_Analysis_gauge_fraction_vs_speedup_correlation"
+              }
+            ]
+          },
+          {
+            "id": "33f60aaa-11ce-4e23-80df-d381dc562581",
+            "title": "Exp_3.3_MLP_on_Tabular_California_Housing",
+            "children": [
+              {
+                "id": "5a6117b4-9258-4117-96d1-0e6d5c6bebf7",
+                "title": "3.3a_Tabular_Geometric_Diagnostics_spectrum_balance_perturbation"
+              },
+              {
+                "id": "85c9a030-1f55-45f3-bf52-47ee234f08b9",
+                "title": "3.3b_Tabular_Performance_Comparison_loss_curves_compute-matched"
+              },
+              {
+                "id": "a0fbbfbe-9ce1-43b7-b3d7-20e8196fbae5",
+                "title": "3.3c_Tabular_Per-Layer_Analysis_gauge_fraction_vs_speedup_correlation"
+              }
+            ]
+          },
+          {
+            "id": "cd4d7d6b-4d2e-4937-9db2-ca11638d2b16",
+            "title": "Exp_3.4_RNNSSM_on_Copy_Task",
+            "children": [
+              {
+                "id": "feccefb5-1877-4ff8-bf91-a4041bd01a08",
+                "title": "3.4a_RNN_Geometric_Diagnostics_spectrum_balance_perturbation"
+              },
+              {
+                "id": "2855b209-0c31-471d-8943-61e4c4be0bce",
+                "title": "3.4b_RNN_Performance_Comparison_loss_curves_compute-matched"
+              },
+              {
+                "id": "7f6bfff2-46e7-4c84-962a-5df581211333",
+                "title": "3.4c_RNN_Per-Layer_Analysis_gauge_fraction_vs_speedup_correlation"
+              }
+            ]
+          },
+          {
+            "id": "d250a55d-9e61-4b75-8981-b691b90407df",
+            "title": "Exp_3.5_Small_ViT_on_CIFAR-100",
+            "children": [
+              {
+                "id": "d99d3f7e-6691-4a00-9de5-c6350b11ddbf",
+                "title": "3.5a_ViT_Geometric_Diagnostics_spectrum_balance_perturbation"
+              },
+              {
+                "id": "17fed791-4e4f-4b01-9001-cc2364f56566",
+                "title": "3.5b_ViT_Performance_Comparison_loss_curves_compute-matched"
+              },
+              {
+                "id": "1063cf94-242f-42f5-90b1-7066649041cb",
+                "title": "3.5c_ViT_Per-Layer_Analysis_gauge_fraction_vs_speedup_correlation"
+              }
+            ]
+          },
+          {
+            "id": "d91822e8-c447-4a08-a28b-c357ad2d2395",
+            "title": "Exp_3.6_Sparse_Autoencoder_on_Frozen_LM",
+            "children": [
+              {
+                "id": "66d94168-f748-4357-b582-4b26d8569867",
+                "title": "3.6a_SAE_Geometric_Diagnostics_spectrum_balance_perturbation"
+              },
+              {
+                "id": "a09a4ee7-fe19-4be5-a4ec-5b0b446b3b8e",
+                "title": "3.6b_SAE_Performance_Comparison_loss_curves_compute-matched"
+              },
+              {
+                "id": "3e252b0a-f4cd-4c56-8d38-1ebf6de1567c",
+                "title": "3.6c_SAE_Per-Layer_Analysis_gauge_fraction_vs_speedup_correlation"
+              }
+            ]
+          },
+          {
+            "id": "90d3ae80-ebbf-4e97-ba51-a9bb99740ef5",
+            "title": "Exp_3.7_GNN_on_Node_Classification"
+          },
+          {
+            "id": "06546048-5ff4-4309-8b80-266959f55033",
+            "title": "Exp_3.8_Diffusion_Model_UNet_on_Image_Generation"
+          },
+          {
+            "id": "152c51d7-8bf0-4a1e-9f7c-71095e9cfca1",
+            "title": "Exp_3.9_GAN_DiscriminatorGenerator_Training"
+          }
+        ]
+      },
+      {
+        "id": "493d508b-fbcb-42b1-a7f8-27b522cd0be3",
+        "title": "Tier_4_Falsification_Stress_Tests",
+        "children": [
+          {
+            "id": "45bc1268-e536-438f-aa1e-3c70e88f211a",
+            "title": "Exp_4.1_Ill-Conditioned_Data_should_BREAK_Muon",
+            "children": [
+              {
+                "id": "601b1612-0511-4d95-a059-a1942fa59488",
+                "title": "4.1a_Ill-Conditioned_Sweep_Condition_Number_\u03ba_\u2208_1_10\u2078"
+              },
+              {
+                "id": "cef957ab-153a-43f5-bbf4-a337a159937a",
+                "title": "4.1b_Ill-Conditioned_Muon_Data_Whitening_best_of_both"
+              }
+            ]
+          },
+          {
+            "id": "afb1a1c1-c550-407c-af2d-674ed6b650e8",
+            "title": "Exp_4.2_Heavy-Tailed_Gradients",
+            "children": [
+              {
+                "id": "05adfc78-2545-4a03-8862-f4420898b4d4",
+                "title": "4.2a_Heavy_Tails_orthoM_as_Implicit_Clip_no_training"
+              },
+              {
+                "id": "7d0f3eef-23c2-418c-8a36-9440fd8a0656",
+                "title": "4.2b_Heavy_Tails_Inject_Pareto_Noise_Measure_Loss_Stability"
+              }
+            ]
+          },
+          {
+            "id": "1dd8c2a4-65b9-4321-9bc2-824aaa5f0a3c",
+            "title": "Exp_4.3_Tiny_Batch_High_Noise",
+            "children": [
+              {
+                "id": "ae0009a0-8a92-4bc2-a677-4f19c9256c77",
+                "title": "4.3a_Tiny_Batch_Gradient_SVD_Noise_Floor"
+              },
+              {
+                "id": "b3f74482-9feb-42fa-9326-742cbf76c9ad",
+                "title": "4.3b_Tiny_Batch_Signal-to-Noise_Ratio_of_Update_Direction"
+              }
+            ]
+          },
+          {
+            "id": "d633fff0-833b-40dc-b5e2-8abdf657584d",
+            "title": "Exp_4.4_When_Does_Muon_HURT_Negative_Results_Catalog",
+            "children": [
+              {
+                "id": "49638268-0129-442c-83da-90d5c172f54f",
+                "title": "4.4a_Extremely_rectangular_aspect_1001"
+              },
+              {
+                "id": "90c9e780-881e-4418-b3ee-cba2e1d97c48",
+                "title": "4.4b_Fine-tuning_pre-trained_weights"
+              },
+              {
+                "id": "b39f3f72-2788-4c17-99dc-e0f3ccaf874f",
+                "title": "4.4c_Very_small_nets_2x2_layers"
+              }
+            ]
+          },
+          {
+            "id": "55d56124-9e74-46ab-957c-234bffd68961",
+            "title": "Exp_4.5_Learning_Rate_Schedule_Interaction",
+            "children": [
+              {
+                "id": "213560ab-43df-4309-8a7d-e3b8b9697a39",
+                "title": "4.5a_Does_Muon_need_warmup"
+              },
+              {
+                "id": "047eb702-fbfa-42f5-a547-62f3b778c01b",
+                "title": "4.5b_Cosine_decay_interaction"
+              },
+              {
+                "id": "6f7bc5fa-0b41-441f-95b9-baa6847ca916",
+                "title": "4.5c_Step_decay_vs_smooth_decay"
+              }
+            ]
+          },
+          {
+            "id": "f404832a-e187-48aa-ae5e-64fca236169c",
+            "title": "Exp_4.6_Mixed-Precision_Training_fp16bf16",
+            "children": [
+              {
+                "id": "09c2e3f1-7456-4341-8330-f1d5f1c8f4a0",
+                "title": "4.6a_NS_convergence_in_bf16"
+              },
+              {
+                "id": "53ce2cbc-bc0b-450d-a4bc-3d72d236eafc",
+                "title": "4.6b_fp32_accumulate_bf16_apply"
+              }
+            ]
+          },
+          {
+            "id": "eb706a58-f9df-4e84-8b90-02d302e63676",
+            "title": "Exp_4.7_Distributed_Training_Gradient_Averaging",
+            "children": [
+              {
+                "id": "c4743c7c-3f53-404f-9e59-6826dc9b05e4",
+                "title": "4.7a_orthomeanG_vs_meanorthoG"
+              },
+              {
+                "id": "f00c1c7a-1160-4d3d-80e7-5b091887f5e9",
+                "title": "4.7b_Large-worker-count_scaling"
+              }
+            ]
+          },
+          {
+            "id": "9a016123-1087-4d12-a6e3-c234d3dadda0",
+            "title": "Exp_4.8_Gradient_Accumulation_Steps"
+          },
+          {
+            "id": "e3f4a5b6-7c89-4d01-b2e3-f4a5b6c7d8e9",
+            "title": "H16_LR_confound_audit_spectral_democracy_and_alpha_results"
+          },
+          {
+            "id": "f4a5b6c7-8d90-4e12-c3f4-a5b6c7d8e9f0",
+            "title": "H17_Direction_vs_conditioning_split_predicts_architecture_benefit"
+          },
+          {
+            "id": "22812075-b275-4be8-86f4-26c76e4423b2",
+            "title": "H22a_Anisotropy_sweet_spot_Muon_benefit_peaks_when_effective_rank_is_30_to_70_pct_of_full_rank"
+          },
+          {
+            "id": "c7f3d27d-e8f2-45ef-80a4-e812c167e81d",
+            "title": "H22b_Extreme_anisotropy_gradient_is_near_rank_1_polar_factor_wastes_budget_equalizing_noise_SVs"
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+Experiment 1.4b-ii: UV Drift -- Rectangular vs Square Matrices
+
+Compare UV drift for square (n x n) vs rectangular (m x n with m >> n) matrices.
+Hypothesis: rectangular matrices have less drift because the UV direction
+is more constrained (fewer degrees of freedom in the thin SVD).
+
+Test configurations: 32x32, 64x32, 128x32, 256x32
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def ns_iteration_rect(W, n_iters=20):
+    """
+    NS iteration for rectangular matrices: X_{k+1} = X_k (3I - X_k^T X_k) / 2
+    For m x n matrix with m >= n, X_k^T X_k is n x n.
+
+    Track UV drift and orthogonality at each step.
+    """
+    m, n = W.shape
+    k = min(m, n)
+
+    # Ground truth polar factor
+    U0, S0, Vt0 = np.linalg.svd(W, full_matrices=False)
+    UV_true = U0 @ Vt0  # m x n
+
+    X = W.copy()
+    uv_drifts = []
+    ortho_errors = []
+
+    for step in range(n_iters + 1):
+        # Measure UV drift
+        Uk, Sk, Vtk = np.linalg.svd(X, full_matrices=False)
+        UV_k = Uk @ Vtk
+        drift = np.linalg.norm(UV_k - UV_true, 'fro')
+        uv_drifts.append(drift)
+
+        # Orthogonality error: ||X^T X - I||_F (should be n x n identity)
+        XtX = X.T @ X
+        ortho_err = np.linalg.norm(XtX - np.eye(n), 'fro')
+        ortho_errors.append(ortho_err)
+
+        if step < n_iters:
+            # NS step
+            XtX = X.T @ X
+            X = X @ (3 * np.eye(n) - XtX) / 2
+
+    return uv_drifts, ortho_errors
+
+def main():
+    np.random.seed(42)
+    print("=" * 70)
+    print("Experiment 1.4b-ii: UV Drift -- Rectangular vs Square")
+    print("=" * 70)
+    print()
+
+    configs = [(32, 32), (64, 32), (128, 32), (256, 32)]
+    n_iters = 20
+    n_trials = 5  # average over multiple random matrices
+
+    all_results = {}
+
+    for (m, n) in configs:
+        print(f"--- Matrix size: {m}x{n} (aspect ratio {m/n:.1f}) ---")
+
+        trial_drifts = []
+        trial_ortho = []
+
+        for trial in range(n_trials):
+            W = np.random.randn(m, n)
+            W = W / np.linalg.norm(W, 'fro')  # normalize
+            uv_drifts, ortho_errors = ns_iteration_rect(W, n_iters=n_iters)
+            trial_drifts.append(uv_drifts)
+            trial_ortho.append(ortho_errors)
+
+        # Average over trials
+        avg_drifts = np.mean(trial_drifts, axis=0)
+        std_drifts = np.std(trial_drifts, axis=0)
+        avg_ortho = np.mean(trial_ortho, axis=0)
+
+        all_results[(m, n)] = {
+            'avg_drift': avg_drifts,
+            'std_drift': std_drifts,
+            'avg_ortho': avg_ortho,
+            'all_drifts': trial_drifts
+        }
+
+        print(f"  {'Step':>4s}  {'Avg UV drift':>14s}  {'Std':>12s}  {'Avg ortho err':>14s}")
+        for step in [0, 1, 2, 3, 5, 10, 15, 20]:
+            if step <= n_iters:
+                print(f"  {step:>4d}  {avg_drifts[step]:14.6e}  {std_drifts[step]:12.6e}  {avg_ortho[step]:14.6e}")
+        print()
+
+    # ── Summary comparison ──────────────────────────────────────────────
+    print("=" * 70)
+    print("SUMMARY: Final UV drift (averaged over 5 trials)")
+    print("=" * 70)
+    print(f"  {'Shape':>8s}  {'Aspect':>7s}  {'Drift @step10':>14s}  {'Drift @step20':>14s}  {'Ortho @step20':>14s}")
+    for (m, n) in configs:
+        r = all_results[(m, n)]
+        aspect = m / n
+        print(f"  {m:>3d}x{n:<3d}  {aspect:>7.1f}  {r['avg_drift'][10]:14.6e}  {r['avg_drift'][-1]:14.6e}  {r['avg_ortho'][-1]:14.6e}")
+    print()
+
+    # Compare square vs most rectangular
+    drift_square = all_results[configs[0]]['avg_drift'][-1]
+    drift_rect = all_results[configs[-1]]['avg_drift'][-1]
+    print(f"  Square ({configs[0][0]}x{configs[0][1]}) drift:      {drift_square:.6e}")
+    print(f"  Rectangular ({configs[-1][0]}x{configs[-1][1]}) drift: {drift_rect:.6e}")
+    if drift_rect > 0:
+        print(f"  Ratio (square/rect): {drift_square/drift_rect:.2f}x")
+    print()
+
+    # ── Convergence speed comparison ────────────────────────────────────
+    print("Convergence speed comparison (iterations to ||X^TX - I|| < 1e-10):")
+    for (m, n) in configs:
+        r = all_results[(m, n)]
+        conv_step = n_iters
+        for step in range(n_iters + 1):
+            if r['avg_ortho'][step] < 1e-10:
+                conv_step = step
+                break
+        print(f"  {m:>3d}x{n:<3d}: converges at step {conv_step}")
+    print()
+
+    # ── Plot ────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle("Exp 1.4b-ii: UV Drift -- Rectangular vs Square", fontsize=14, fontweight='bold')
+
+    # Left: UV drift comparison
+    ax = axes[0]
+    colors = ['blue', 'orange', 'green', 'red']
+    for idx, (m, n) in enumerate(configs):
+        r = all_results[(m, n)]
+        steps = range(n_iters + 1)
+        drift_plot = [max(d, 1e-17) for d in r['avg_drift']]
+        ax.semilogy(steps, drift_plot, 'o-', color=colors[idx], markersize=3,
+                   linewidth=1.5, label=f'{m}x{n} (ratio={m/n:.0f})')
+        # Error band
+        lo = [max(d - s, 1e-17) for d, s in zip(r['avg_drift'], r['std_drift'])]
+        hi = [max(d + s, 1e-17) for d, s in zip(r['avg_drift'], r['std_drift'])]
+        ax.fill_between(steps, lo, hi, alpha=0.15, color=colors[idx])
+
+    ax.set_xlabel('NS iteration', fontsize=12)
+    ax.set_ylabel('UV drift $||U_kV_k^T - U_0V_0^T||_F$', fontsize=12)
+    ax.set_title('UV drift: Rectangular vs Square')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Right: Orthogonality convergence
+    ax = axes[1]
+    for idx, (m, n) in enumerate(configs):
+        r = all_results[(m, n)]
+        steps = range(n_iters + 1)
+        ortho_plot = [max(o, 1e-17) for o in r['avg_ortho']]
+        ax.semilogy(steps, ortho_plot, 'o-', color=colors[idx], markersize=3,
+                   linewidth=1.5, label=f'{m}x{n}')
+
+    ax.set_xlabel('NS iteration', fontsize=12)
+    ax.set_ylabel('$||X^TX - I||_F$', fontsize=12)
+    ax.set_title('Orthogonality convergence')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(SCRIPT_DIR, "uv_drift_rectangular_vs_square.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"Plot saved: {plot_path}")
+    print()
+
+    # ── PASS/FAIL ───────────────────────────────────────────────────────
+    print("=" * 70)
+    test_results = []
+
+    # Test 1: UV drift is small (< 1e-10) for all configs after convergence
+    max_drift = max(all_results[(m, n)]['avg_drift'][-1] for (m, n) in configs)
+    t1 = max_drift < 1e-10
+    test_results.append(t1)
+    print(f"TEST 1 - UV drift negligible after convergence: {'PASS' if t1 else 'FAIL'}  (max: {max_drift:.2e})")
+
+    # Test 2: Rectangular has less UV drift than square
+    drift_sq = all_results[configs[0]]['avg_drift'][-1]
+    drift_re = all_results[configs[-1]]['avg_drift'][-1]
+    t2 = drift_re < drift_sq
+    test_results.append(t2)
+    print(f"TEST 2 - Rectangular drift < square drift:     {'PASS' if t2 else 'FAIL'}  ({drift_re:.2e} vs {drift_sq:.2e})")
+
+    # Test 3: All configs converge to orthogonal (ortho error decreases)
+    all_converge = True
+    for (m, n) in configs:
+        r = all_results[(m, n)]
+        if r['avg_ortho'][-1] >= r['avg_ortho'][0]:
+            all_converge = False
+    t3 = all_converge
+    test_results.append(t3)
+    print(f"TEST 3 - All configs converge toward orthogonal: {'PASS' if t3 else 'FAIL'}")
+
+    # Test 4: UV drift is bounded (not growing unboundedly)
+    all_bounded = True
+    for (m, n) in configs:
+        drifts = all_results[(m, n)]['avg_drift']
+        # After convergence (step 5+), drift should be roughly stable
+        late = drifts[5:]
+        if max(late) > 100 * min(d for d in late if d > 0):
+            all_bounded = False
+    t4 = all_bounded
+    test_results.append(t4)
+    print(f"TEST 4 - UV drift bounded (stable):             {'PASS' if t4 else 'FAIL'}")
+
+    # Test 5: Rectangular converges to orthogonal faster than square
+    # (measured by iterations to reach ||X^TX - I|| < 1e-10)
+    conv_steps = []
+    for (m, n) in configs:
+        r = all_results[(m, n)]
+        conv_step = n_iters
+        for step in range(n_iters + 1):
+            if r['avg_ortho'][step] < 1e-10:
+                conv_step = step
+                break
+        conv_steps.append(conv_step)
+    # Most rectangular should converge faster (fewer steps) than square
+    t5 = conv_steps[-1] < conv_steps[0]
+    test_results.append(t5)
+    print(f"TEST 5 - Rectangular converges faster:         {'PASS' if t5 else 'FAIL'}  (steps: {dict(zip([f'{m}x{n}' for m,n in configs], conv_steps))})")
+
+    print("=" * 70)
+    all_tests = all(test_results)
+    print(f"\nOVERALL: {'PASS' if all_tests else 'FAIL'} ({sum(test_results)}/{len(test_results)} tests passed)")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""
+1.1b-ii -- Rebalancing: Does Muon's Balance Survive Nonlinearity?
+=================================================================
+PREDICTION (from RG gauge-fixing / per-layer spectral structure):
+  Muon still rebalances faster than SGD even with ReLU nonlinearity.
+  The polar-decomposition orthogonalization acts on each W_i independently,
+  so it doesn't depend on the inter-layer symmetry being exact GL(n).
+  ReLU breaks the exact GL gauge to permutation+sign symmetry, but the
+  spectral per-layer structure remains. The prediction weakens but
+  shouldn't disappear.
+
+CONTEXT from 1.1b-i:
+  Linear net: Muon rebalances in O(log c), SGD NEVER rebalances
+  (converges to imbalanced fixed points / compensates for imbalance).
+
+Setup:
+  4-layer net: y = W4 @ relu(W3 @ relu(W2 @ relu(W1 @ x)))
+  Width 32, random target regression (100 samples, 32->32).
+  Imbalance: W1 *= c, W4 *= 1/c for c in {2, 5, 10, 50}.
+  Train 500 steps.
+  Balance metric: max(||Wi||_F) / min(||Wi||_F) across all 4 layers.
+
+Comparison axes:
+  (a) Linear (no ReLU) vs ReLU -- does nonlinearity slow down rebalancing?
+  (b) Muon vs SGD in the nonlinear case -- does Muon still win?
+  (c) Ratio of Muon's advantage -- does it change with nonlinearity?
+"""
+
+import numpy as np
+
+np.random.seed(42)
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+DIM = 32
+N_SAMPLES = 100
+N_LAYERS = 4
+MAX_STEPS = 500
+IMBALANCE_RATIOS = [2, 5, 10, 50]
+
+LR_SGD = 0.005
+LR_MUON = 0.01
+MOMENTUM = 0.9
+NS_ITERS = 5
+
+BALANCE_THRESHOLD = 2.0  # max/min norm ratio < 2.0 means "balanced"
+
+# Fixed data
+X_data = np.random.randn(DIM, N_SAMPLES) * 0.3
+W_target = np.random.randn(DIM, DIM) * 0.3
+Y_target = W_target @ X_data  # (DIM, N_SAMPLES)
+
+
+# =============================================================================
+# NETWORK FUNCTIONS
+# =============================================================================
+
+def relu(x):
+    return np.maximum(0, x)
+
+
+def init_weights(c):
+    """
+    Initialize 4-layer net with Gaussian weights, then apply imbalance:
+    W1 *= c, W4 *= 1/c.  Middle layers (W2, W3) untouched.
+    All layers DIM x DIM.
+    """
+    rng = np.random.RandomState(123)  # deterministic init per call
+    Ws = [rng.randn(DIM, DIM) * (1.0 / np.sqrt(DIM)) for _ in range(N_LAYERS)]
+    Ws[0] = Ws[0] * c
+    Ws[N_LAYERS - 1] = Ws[N_LAYERS - 1] * (1.0 / c)
+    return Ws
+
+
+def forward_pass(Ws, X, use_relu=True):
+    """
+    Forward pass through 4-layer net.
+    Returns (output, list_of_pre_activations, list_of_post_activations).
+    pre_activations[i] = W_i @ a_{i-1}  (before ReLU)
+    post_activations[i] = relu(pre_activations[i]) or pre_activations[i]
+    post_activations[-1] is the network output (no ReLU on last layer).
+    """
+    pre_acts = []
+    post_acts = []
+    a = X  # input to first layer
+
+    for i in range(N_LAYERS):
+        z = Ws[i] @ a               # pre-activation
+        pre_acts.append(z)
+        if use_relu and i < N_LAYERS - 1:  # ReLU on all but last layer
+            a = relu(z)
+        else:
+            a = z  # linear pass-through (last layer, or linear mode)
+        post_acts.append(a)
+
+    return post_acts[-1], pre_acts, post_acts
+
+
+def compute_loss(Ws, X, Y, use_relu=True):
+    """Loss = 0.5 * mean over samples of ||pred - target||^2."""
+    pred, _, _ = forward_pass(Ws, X, use_relu)
+    diff = pred - Y
+    return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
+
+
+def compute_gradients(Ws, X, Y, use_relu=True):
+    """
+    Manual backprop through 4-layer net with optional ReLU.
+    Returns list of gradients [grad_W1, grad_W2, grad_W3, grad_W4].
+    """
+    N = X.shape[1]
+
+    # Forward pass: store activations
+    # a[0] = X (input)
+    # For i = 0..3: z[i] = W[i] @ a[i], a[i+1] = relu(z[i]) or z[i]
+    a = [None] * (N_LAYERS + 1)
+    z = [None] * N_LAYERS
+    a[0] = X
+
+    for i in range(N_LAYERS):
+        z[i] = Ws[i] @ a[i]
+        if use_relu and i < N_LAYERS - 1:
+            a[i + 1] = relu(z[i])
+        else:
+            a[i + 1] = z[i]
+
+    # Backward pass
+    # delta for output layer
+    delta = (a[N_LAYERS] - Y) / N  # (DIM, N)
+
+    grads = [None] * N_LAYERS
+
+    for i in range(N_LAYERS - 1, -1, -1):
+        # Gradient for W_i: delta @ a[i].T
+        grads[i] = delta @ a[i].T  # (DIM, DIM)
+
+        if i > 0:
+            # Propagate delta backward through W_i
+            delta = Ws[i].T @ delta  # (DIM, N)
+
+            # Apply ReLU derivative if needed
+            if use_relu and (i - 1) < N_LAYERS - 1:
+                # The activation a[i] came from relu(z[i-1])
+                # ReLU derivative: mask where z[i-1] > 0
+                mask = (z[i - 1] > 0).astype(float)
+                delta = delta * mask
+
+    return grads
+
+
+def balance_metric(Ws):
+    """max(||Wi||_F) / min(||Wi||_F) across all layers."""
+    norms = [np.linalg.norm(W, 'fro') for W in Ws]
+    mn = min(norms)
+    mx = max(norms)
+    if mn < 1e-15:
+        return float('inf')
+    return mx / mn
+
+
+def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
+    """
+    Newton-Schulz iteration to approximate the orthogonal polar factor.
+    """
+    norm = np.linalg.norm(G, ord='fro')
+    if norm < 1e-12:
+        return G
+    X = G / norm
+    for _ in range(num_iters):
+        A = X.T @ X
+        X = 1.5 * X - 0.5 * X @ A
+    return X
+
+
+# =============================================================================
+# TRAINING FUNCTIONS
+# =============================================================================
+
+def train_sgd(Ws_init, use_relu=True, max_steps=MAX_STEPS):
+    """Train with SGD + momentum."""
+    Ws = [W.copy() for W in Ws_init]
+    Vs = [np.zeros_like(W) for W in Ws]
+
+    trajectory = [balance_metric(Ws)]
+    loss_traj = [compute_loss(Ws, X_data, Y_target, use_relu)]
+
+    for step in range(1, max_steps + 1):
+        grads = compute_gradients(Ws, X_data, Y_target, use_relu)
+
+        for i in range(N_LAYERS):
+            # Gradient clipping
+            gn = np.linalg.norm(grads[i])
+            if gn > 100.0:
+                grads[i] = grads[i] * (100.0 / gn)
+
+            Vs[i] = MOMENTUM * Vs[i] + grads[i]
+            Ws[i] = Ws[i] - LR_SGD * Vs[i]
+
+        # NaN check
+        if any(np.isnan(W).any() for W in Ws):
+            trajectory.extend([float('inf')] * (max_steps - step + 1))
+            loss_traj.extend([float('inf')] * (max_steps - step + 1))
+            return {'trajectory': trajectory, 'loss': loss_traj, 'diverged': True}
+
+        trajectory.append(balance_metric(Ws))
+        loss_traj.append(compute_loss(Ws, X_data, Y_target, use_relu))
+
+    return {'trajectory': trajectory, 'loss': loss_traj, 'diverged': False}
+
+
+def train_muon(Ws_init, use_relu=True, max_steps=MAX_STEPS):
+    """Train with Muon (orthogonalized gradients + momentum)."""
+    Ws = [W.copy() for W in Ws_init]
+    Vs = [np.zeros_like(W) for W in Ws]
+
+    trajectory = [balance_metric(Ws)]
+    loss_traj = [compute_loss(Ws, X_data, Y_target, use_relu)]
+
+    for step in range(1, max_steps + 1):
+        grads = compute_gradients(Ws, X_data, Y_target, use_relu)
+
+        for i in range(N_LAYERS):
+            # Orthogonalize: THIS is the key -- ortho(c*G) = ortho(G)
+            ortho_g = newton_schulz_orthogonalize(grads[i])
+
+            Vs[i] = MOMENTUM * Vs[i] + ortho_g
+            Ws[i] = Ws[i] - LR_MUON * Vs[i]
+
+        # NaN check
+        if any(np.isnan(W).any() for W in Ws):
+            trajectory.extend([float('inf')] * (max_steps - step + 1))
+            loss_traj.extend([float('inf')] * (max_steps - step + 1))
+            return {'trajectory': trajectory, 'loss': loss_traj, 'diverged': True}
+
+        trajectory.append(balance_metric(Ws))
+        loss_traj.append(compute_loss(Ws, X_data, Y_target, use_relu))
+
+    return {'trajectory': trajectory, 'loss': loss_traj, 'diverged': False}
+
+
+# =============================================================================
+# MAIN EXPERIMENT
+# =============================================================================
+
+print("=" * 100)
+print("1.1b-ii: REBALANCING -- Does Muon's Balance Survive Nonlinearity?")
+print("=" * 100)
+print(f"Setup: 4-layer net (dim={DIM}), {N_SAMPLES} samples, quadratic loss")
+print(f"       Modes: (A) Linear (no ReLU) and (B) ReLU between layers")
+print(f"       Imbalance: W1 *= c, W4 *= 1/c for c in {IMBALANCE_RATIOS}")
+print(f"       Balance metric: max(||Wi||_F) / min(||Wi||_F)")
+print(f"       Threshold: balance_metric < {BALANCE_THRESHOLD}")
+print(f"       Steps: {MAX_STEPS}")
+print(f"       SGD:  lr={LR_SGD}, momentum={MOMENTUM}")
+print(f"       Muon: lr={LR_MUON}, momentum={MOMENTUM}, NS_iters={NS_ITERS}")
+print("=" * 100)
+
+# ---- Verify initial conditions ----
+print("\nInitial conditions verification:")
+print(f"{'c':>4} | {'balance_metric':>15} | {'||W1||':>8} | {'||W2||':>8} | {'||W3||':>8} | {'||W4||':>8} | {'loss(linear)':>12} | {'loss(relu)':>12}")
+print("-" * 105)
+for c in IMBALANCE_RATIOS:
+    Ws = init_weights(c)
+    bm = balance_metric(Ws)
+    norms = [np.linalg.norm(W, 'fro') for W in Ws]
+    loss_lin = compute_loss(Ws, X_data, Y_target, use_relu=False)
+    loss_relu = compute_loss(Ws, X_data, Y_target, use_relu=True)
+    print(f"{c:4d} | {bm:15.4f} | {norms[0]:8.4f} | {norms[1]:8.4f} | {norms[2]:8.4f} | {norms[3]:8.4f} | {loss_lin:12.6f} | {loss_relu:12.6f}")
+
+# ---- Run all experiments ----
+print(f"\n{'=' * 100}")
+print("TRAINING...")
+print(f"{'=' * 100}")
+
+# Store results: results[mode][optimizer][c]
+# mode in {'linear', 'relu'}, optimizer in {'sgd', 'muon'}
+results = {}
+for mode, use_relu in [('linear', False), ('relu', True)]:
+    results[mode] = {}
+    for opt_name in ['sgd', 'muon']:
+        results[mode][opt_name] = {}
+
+for c in IMBALANCE_RATIOS:
+    Ws_init = init_weights(c)
+    init_bm = balance_metric(Ws_init)
+    print(f"\n  c = {c:4d} (initial balance_metric = {init_bm:.4f}):")
+
+    for mode, use_relu in [('linear', False), ('relu', True)]:
+        for opt_name, train_fn in [('sgd', train_sgd), ('muon', train_muon)]:
+            res = train_fn(Ws_init, use_relu=use_relu, max_steps=MAX_STEPS)
+            results[mode][opt_name][c] = res
+
+            final_bm = res['trajectory'][-1] if np.isfinite(res['trajectory'][-1]) else float('inf')
+            final_loss = res['loss'][-1] if np.isfinite(res['loss'][-1]) else float('inf')
+            div_str = " [DIVERGED]" if res.get('diverged', False) else ""
+
+            # Find steps to balance
+            steps_to_bal = MAX_STEPS
+            for s in range(len(res['trajectory'])):
+                if res['trajectory'][s] < BALANCE_THRESHOLD:
+                    steps_to_bal = s
+                    break
+
+            res['steps_to_balance'] = steps_to_bal
+            res['final_balance'] = final_bm
+            res['final_loss'] = final_loss
+
+            label = f"{mode:>6s}/{opt_name:>4s}"
+            bal_str = f"{steps_to_bal:>4d}" if steps_to_bal < MAX_STEPS else "NEVER"
+            print(f"    {label}: balance@end={final_bm:8.4f}  loss@end={final_loss:10.6f}  "
+                  f"steps_to_bal={bal_str:>5s}{div_str}")
+
+
+# =============================================================================
+# TABLE 1: BALANCE METRIC TRAJECTORIES
+# =============================================================================
+
+print("\n\n" + "=" * 100)
+print("TABLE 1: BALANCE METRIC TRAJECTORIES (balance_metric at selected steps)")
+print("=" * 100)
+
+snapshot_steps = [0, 10, 50, 100, 200, 300, 500]
+
+for mode in ['linear', 'relu']:
+    for opt_name in ['sgd', 'muon']:
+        label = f"{mode}/{opt_name}"
+        print(f"\n  {label.upper()}:")
+        header = f"  {'c':>4} |"
+        for ss in snapshot_steps:
+            header += f" step={ss:>3d} |"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for c in IMBALANCE_RATIOS:
+            traj = results[mode][opt_name][c]['trajectory']
+            row = f"  {c:4d} |"
+            for ss in snapshot_steps:
+                if ss < len(traj) and np.isfinite(traj[ss]):
+                    row += f" {traj[ss]:8.3f} |"
+                elif ss < len(traj):
+                    row += f" {'INF':>8} |"
+                else:
+                    row += f" {'---':>8} |"
+            print(row)
+
+
+# =============================================================================
+# TABLE 2: SUMMARY COMPARISON -- LINEAR vs RELU
+# =============================================================================
+
+print("\n\n" + "=" * 100)
+print("TABLE 2: LINEAR vs RELU COMPARISON (final balance metric after 500 steps)")
+print("=" * 100)
+
+print(f"\n{'c':>4} | {'SGD/Lin':>10} | {'SGD/ReLU':>10} | {'Muon/Lin':>10} | {'Muon/ReLU':>10} | "
+      f"{'SGD slowdown':>12} | {'Muon slowdown':>13}")
+print("-" * 90)
+
+for c in IMBALANCE_RATIOS:
+    sgd_lin = results['linear']['sgd'][c]['final_balance']
+    sgd_relu = results['relu']['sgd'][c]['final_balance']
+    muon_lin = results['linear']['muon'][c]['final_balance']
+    muon_relu = results['relu']['muon'][c]['final_balance']
+
+    # "Slowdown": ratio of ReLU final_balance / linear final_balance
+    # Higher means nonlinearity makes it harder to balance
+    sgd_slow = sgd_relu / sgd_lin if sgd_lin > 1e-10 and np.isfinite(sgd_relu) else float('inf')
+    muon_slow = muon_relu / muon_lin if muon_lin > 1e-10 and np.isfinite(muon_relu) else float('inf')
+
+    def fmt(v):
+        if not np.isfinite(v):
+            return "INF"
+        return f"{v:.4f}"
+
+    print(f"{c:4d} | {fmt(sgd_lin):>10s} | {fmt(sgd_relu):>10s} | {fmt(muon_lin):>10s} | {fmt(muon_relu):>10s} | "
+          f"{fmt(sgd_slow):>12s} | {fmt(muon_slow):>13s}")
+
+
+# =============================================================================
+# TABLE 3: MUON vs SGD IN THE RELU CASE
+# =============================================================================
+
+print("\n\n" + "=" * 100)
+print("TABLE 3: MUON vs SGD IN THE RELU CASE")
+print("=" * 100)
+print("Balance reduction: (init_bm - final_bm) / (init_bm - 1.0) * 100%")
+print("(How much of the excess imbalance was removed; 100% = perfectly balanced)")
+
+print(f"\n{'c':>4} | {'init_bm':>9} | {'SGD final':>10} | {'SGD %red':>9} | "
+      f"{'Muon final':>11} | {'Muon %red':>10} | {'Muon wins?':>10}")
+print("-" * 85)
+
+muon_wins_count = 0
+total_comparisons = 0
+
+for c in IMBALANCE_RATIOS:
+    Ws = init_weights(c)
+    init_bm = balance_metric(Ws)
+
+    sgd_final = results['relu']['sgd'][c]['final_balance']
+    muon_final = results['relu']['muon'][c]['final_balance']
+
+    # Percent of excess imbalance removed
+    excess = init_bm - 1.0
+    if excess > 0:
+        sgd_pct = (init_bm - sgd_final) / excess * 100 if np.isfinite(sgd_final) else float('-inf')
+        muon_pct = (init_bm - muon_final) / excess * 100 if np.isfinite(muon_final) else float('-inf')
+    else:
+        sgd_pct = 0.0
+        muon_pct = 0.0
+
+    muon_better = muon_final < sgd_final
+    if muon_better:
+        muon_wins_count += 1
+    total_comparisons += 1
+
+    def fmt_pct(v):
+        if not np.isfinite(v):
+            return "N/A"
+        return f"{v:.1f}%"
+
+    def fmt_v(v):
+        if not np.isfinite(v):
+            return "INF"
+        return f"{v:.4f}"
+
+    print(f"{c:4d} | {init_bm:9.4f} | {fmt_v(sgd_final):>10s} | {fmt_pct(sgd_pct):>9s} | "
+          f"{fmt_v(muon_final):>11s} | {fmt_pct(muon_pct):>10s} | {'YES' if muon_better else 'no':>10s}")
+
+
+# =============================================================================
+# TABLE 4: RATIO OF MUON'S ADVANTAGE -- does it change with nonlinearity?
+# =============================================================================
+
+print("\n\n" + "=" * 100)
+print("TABLE 4: RATIO OF MUON'S ADVANTAGE (balance reduction at step 200)")
+print("=" * 100)
+print("Advantage ratio = (SGD balance_metric @ step 200) / (Muon balance_metric @ step 200)")
+print("If > 1.0: Muon is more balanced. KEY: does ratio change Linear -> ReLU?")
+
+check_step = 200
+print(f"\n{'c':>4} | {'Lin SGD@200':>12} | {'Lin Muon@200':>13} | {'Lin ratio':>10} | "
+      f"{'ReLU SGD@200':>13} | {'ReLU Muon@200':>14} | {'ReLU ratio':>11} | {'Ratio change':>12}")
+print("-" * 115)
+
+lin_ratios = []
+relu_ratios = []
+
+for c in IMBALANCE_RATIOS:
+    sgd_lin_val = results['linear']['sgd'][c]['trajectory'][check_step] if check_step < len(results['linear']['sgd'][c]['trajectory']) else float('inf')
+    muon_lin_val = results['linear']['muon'][c]['trajectory'][check_step] if check_step < len(results['linear']['muon'][c]['trajectory']) else float('inf')
+    sgd_relu_val = results['relu']['sgd'][c]['trajectory'][check_step] if check_step < len(results['relu']['sgd'][c]['trajectory']) else float('inf')
+    muon_relu_val = results['relu']['muon'][c]['trajectory'][check_step] if check_step < len(results['relu']['muon'][c]['trajectory']) else float('inf')
+
+    lin_r = sgd_lin_val / muon_lin_val if muon_lin_val > 1e-10 and np.isfinite(sgd_lin_val) and np.isfinite(muon_lin_val) else float('inf')
+    relu_r = sgd_relu_val / muon_relu_val if muon_relu_val > 1e-10 and np.isfinite(sgd_relu_val) and np.isfinite(muon_relu_val) else float('inf')
+
+    if np.isfinite(lin_r):
+        lin_ratios.append(lin_r)
+    if np.isfinite(relu_r):
+        relu_ratios.append(relu_r)
+
+    # Ratio change: ReLU ratio / Linear ratio -- if ~1.0 advantage is preserved
+    ratio_change = relu_r / lin_r if lin_r > 1e-10 and np.isfinite(lin_r) and np.isfinite(relu_r) else float('nan')
+
+    def fmt_f(v, w=10):
+        if not np.isfinite(v):
+            return "INF".rjust(w)
+        return f"{v:.4f}".rjust(w)
+
+    print(f"{c:4d} | {fmt_f(sgd_lin_val, 12)} | {fmt_f(muon_lin_val, 13)} | {fmt_f(lin_r, 10)} | "
+          f"{fmt_f(sgd_relu_val, 13)} | {fmt_f(muon_relu_val, 14)} | {fmt_f(relu_r, 11)} | "
+          f"{fmt_f(ratio_change, 12)}")
+
+
+# =============================================================================
+# TABLE 5: LOSS TRAJECTORIES (sanity check: is the net actually learning?)
+# =============================================================================
+
+print("\n\n" + "=" * 100)
+print("TABLE 5: LOSS TRAJECTORIES (sanity check)")
+print("=" * 100)
+
+loss_steps = [0, 50, 100, 200, 500]
+for mode in ['linear', 'relu']:
+    for opt_name in ['sgd', 'muon']:
+        label = f"{mode}/{opt_name}"
+        print(f"\n  {label.upper()}:")
+        header = f"  {'c':>4} |"
+        for ss in loss_steps:
+            header += f" step={ss:>3d} |"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for c in IMBALANCE_RATIOS:
+            loss = results[mode][opt_name][c]['loss']
+            row = f"  {c:4d} |"
+            for ss in loss_steps:
+                if ss < len(loss) and np.isfinite(loss[ss]):
+                    row += f" {loss[ss]:8.4f} |"
+                elif ss < len(loss):
+                    row += f" {'INF':>8} |"
+                else:
+                    row += f" {'---':>8} |"
+            print(row)
+
+
+# =============================================================================
+# ANALYSIS & VERDICT
+# =============================================================================
+
+print("\n\n" + "=" * 100)
+print("ANALYSIS")
+print("=" * 100)
+
+# (1) Does nonlinearity slow down rebalancing?
+print("\n--- (1) Does nonlinearity slow down rebalancing? ---")
+print("Comparing final balance metric: ReLU vs Linear for each optimizer/c")
+
+nonlin_slows_sgd = 0
+nonlin_slows_muon = 0
+total_pairs = 0
+
+for c in IMBALANCE_RATIOS:
+    sgd_lin_final = results['linear']['sgd'][c]['final_balance']
+    sgd_relu_final = results['relu']['sgd'][c]['final_balance']
+    muon_lin_final = results['linear']['muon'][c]['final_balance']
+    muon_relu_final = results['relu']['muon'][c]['final_balance']
+
+    if np.isfinite(sgd_relu_final) and np.isfinite(sgd_lin_final):
+        if sgd_relu_final > sgd_lin_final * 1.05:  # 5% worse
+            nonlin_slows_sgd += 1
+    if np.isfinite(muon_relu_final) and np.isfinite(muon_lin_final):
+        if muon_relu_final > muon_lin_final * 1.05:
+            nonlin_slows_muon += 1
+    total_pairs += 1
+
+print(f"  SGD:  nonlinearity worsens balance in {nonlin_slows_sgd}/{total_pairs} cases")
+print(f"  Muon: nonlinearity worsens balance in {nonlin_slows_muon}/{total_pairs} cases")
+
+# (2) Does Muon still win in the nonlinear case?
+print("\n--- (2) Does Muon still win (ReLU case)? ---")
+print(f"  Muon has better final balance in {muon_wins_count}/{total_comparisons} c values")
+
+# (3) Does the ratio of Muon's advantage change?
+print("\n--- (3) Does the advantage ratio change with nonlinearity? ---")
+if lin_ratios and relu_ratios:
+    avg_lin_ratio = np.mean(lin_ratios)
+    avg_relu_ratio = np.mean(relu_ratios)
+    print(f"  Average advantage ratio (SGD_bm / Muon_bm @ step {check_step}):")
+    print(f"    Linear: {avg_lin_ratio:.4f}")
+    print(f"    ReLU:   {avg_relu_ratio:.4f}")
+    ratio_preserved = avg_relu_ratio > 1.0  # Muon still better
+    ratio_reduced = avg_relu_ratio < avg_lin_ratio * 0.5  # significantly less advantage
+    print(f"    Muon advantage preserved in ReLU: {'YES' if ratio_preserved else 'NO'}")
+    print(f"    Advantage significantly reduced (>50%): {'YES' if ratio_reduced else 'NO'}")
+else:
+    avg_lin_ratio = float('nan')
+    avg_relu_ratio = float('nan')
+    ratio_preserved = False
+    ratio_reduced = False
+    print("  Insufficient data for ratio comparison.")
+
+
+# =============================================================================
+# FINAL VERDICT
+# =============================================================================
+
+print("\n\n" + "=" * 100)
+print("FINAL VERDICT")
+print("=" * 100)
+
+evidence = []
+
+# Evidence 1: Muon wins in ReLU case
+muon_wins_all = muon_wins_count == total_comparisons
+muon_wins_most = muon_wins_count >= total_comparisons * 0.75
+if muon_wins_all:
+    evidence.append(f"[MUON WINS ALL] Muon achieves better balance than SGD for ALL c values with ReLU")
+elif muon_wins_most:
+    evidence.append(f"[MUON WINS MOST] Muon wins {muon_wins_count}/{total_comparisons} c values with ReLU")
+else:
+    evidence.append(f"[MUON PARTIAL] Muon wins only {muon_wins_count}/{total_comparisons} c values with ReLU")
+
+# Evidence 2: Advantage ratio preserved
+if np.isfinite(avg_relu_ratio) and avg_relu_ratio > 1.0:
+    evidence.append(f"[ADVANTAGE PRESERVED] Muon advantage ratio in ReLU = {avg_relu_ratio:.4f} (>1.0)")
+    if np.isfinite(avg_lin_ratio) and not ratio_reduced:
+        evidence.append(f"[ROBUST] Advantage not significantly reduced by nonlinearity "
+                        f"(linear: {avg_lin_ratio:.4f}, ReLU: {avg_relu_ratio:.4f})")
+elif np.isfinite(avg_relu_ratio):
+    evidence.append(f"[ADVANTAGE LOST] Muon advantage ratio in ReLU = {avg_relu_ratio:.4f} (<1.0)")
+
+# Evidence 3: Nonlinearity effect
+if nonlin_slows_muon <= 1:
+    evidence.append(f"[MUON ROBUST] Nonlinearity barely affects Muon's rebalancing "
+                    f"({nonlin_slows_muon}/{total_pairs} cases worse)")
+elif nonlin_slows_muon == total_pairs:
+    evidence.append(f"[NONLINEARITY HURTS] Nonlinearity worsens Muon's balance in ALL cases "
+                    f"but Muon may still outperform SGD")
+
+# Evidence 4: SGD behavior
+sgd_never_balances_relu = all(
+    results['relu']['sgd'][c]['steps_to_balance'] >= MAX_STEPS
+    for c in IMBALANCE_RATIOS
+)
+if sgd_never_balances_relu:
+    evidence.append(f"[SGD FAILS] SGD never reaches balance threshold in ReLU case "
+                    f"within {MAX_STEPS} steps")
+
+# Determine overall verdict
+if muon_wins_all and np.isfinite(avg_relu_ratio) and avg_relu_ratio > 1.0:
+    verdict = "PASS"
+    verdict_summary = (
+        "Muon's rebalancing advantage SURVIVES nonlinearity.\n"
+        "  Muon achieves better balance than SGD for ALL imbalance ratios c\n"
+        "  even with ReLU activations. The per-layer spectral gauge-fixing\n"
+        "  (polar decomposition) acts independently on each layer, so the\n"
+        "  exact GL symmetry is not required.")
+elif muon_wins_most and np.isfinite(avg_relu_ratio) and avg_relu_ratio > 1.0:
+    verdict = "PARTIAL PASS"
+    verdict_summary = (
+        "Muon's advantage partially survives nonlinearity.\n"
+        "  Muon wins in most but not all cases. The benefit is real but\n"
+        "  somewhat weakened by the symmetry breaking.")
+else:
+    verdict = "FAIL"
+    verdict_summary = (
+        "Muon's rebalancing advantage does NOT clearly survive nonlinearity.\n"
+        "  The approximate gauge structure is insufficient to maintain\n"
+        "  Muon's advantage over SGD when ReLU breaks the exact GL symmetry.")
+
+# Check if nonlinearity weakens but doesn't eliminate the advantage
+if verdict == "PASS" and np.isfinite(avg_lin_ratio) and np.isfinite(avg_relu_ratio):
+    if avg_relu_ratio < avg_lin_ratio * 0.5:
+        verdict_summary += (
+            "\n  NOTE: While Muon still wins, nonlinearity DOES reduce the\n"
+            "  advantage ratio significantly (by >50%). The gauge-fixing\n"
+            "  benefit is partially eroded when the symmetry is approximate.")
+    else:
+        verdict_summary += (
+            "\n  The advantage ratio is well-preserved, confirming that\n"
+            "  orthogonalization's per-layer action is the key mechanism,\n"
+            "  not the exact inter-layer GL symmetry.")
+
+print(f"""
+  {'=' * 72}
+  VERDICT: {verdict}
+  {'=' * 72}
+  {verdict_summary}
+  {'_' * 72}
+
+  Evidence:""")
+for ev in evidence:
+    print(f"    - {ev}")
+
+print(f"""
+  {'_' * 72}
+  Key numbers:
+    Imbalance ratios tested:    c in {IMBALANCE_RATIOS}
+    Muon wins (ReLU case):      {muon_wins_count}/{total_comparisons}
+    Avg advantage ratio:
+      Linear:  {f'{avg_lin_ratio:.4f}' if np.isfinite(avg_lin_ratio) else 'N/A'}
+      ReLU:    {f'{avg_relu_ratio:.4f}' if np.isfinite(avg_relu_ratio) else 'N/A'}
+    Nonlinearity worsens Muon:  {nonlin_slows_muon}/{total_pairs}
+    Nonlinearity worsens SGD:   {nonlin_slows_sgd}/{total_pairs}
+
+  Physics interpretation:
+    - ortho(c*G) = ortho(G) is a per-layer property (independent of
+      inter-layer symmetry), so it should survive ReLU breaking GL -> Perm+Sign.
+    - The spectral gauge-fixing via polar decomposition doesn't require
+      the layers to compose linearly.
+    - Nonlinearity may slow convergence overall but shouldn't eliminate
+      the relative advantage of orthogonalized updates.
+
+  Hypothesis status:
+    "Muon still rebalances faster even with nonlinearity" -> {verdict}
+  {'=' * 72}
+""")
+
+print("=" * 100)
+print("EXPERIMENT COMPLETE")
+print("=" * 100)

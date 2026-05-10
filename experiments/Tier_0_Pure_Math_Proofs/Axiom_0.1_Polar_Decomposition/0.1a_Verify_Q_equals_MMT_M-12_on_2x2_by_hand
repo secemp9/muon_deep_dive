@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.1a -- Verify: Q = M (M^T M)^{-1/2} on a 2x2 matrix by hand.
+
+Polar decomposition says every invertible real matrix M factors as M = QP
+where Q is orthogonal and P is symmetric positive-definite.  The explicit
+formula is:
+    P = (M^T M)^{1/2}       (the unique PSD square root)
+    Q = M P^{-1} = M (M^T M)^{-1/2}
+
+Part 1 walks through M = [[3,1],[0,2]] step by step, printing every
+intermediate quantity so it reads like a pen-and-paper proof.
+
+Part 2 batch-tests the same identities on hundreds of random square and
+rectangular matrices.
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+def sep(title: str) -> None:
+    """Print a section separator."""
+    print(f"\n{'=' * 72}")
+    print(f"  {title}")
+    print(f"{'=' * 72}\n")
+
+
+def mat(name: str, A: np.ndarray) -> None:
+    """Pretty-print a labelled matrix."""
+    print(f"{name} =")
+    for row in np.atleast_2d(A):
+        print("  [" + "  ".join(f"{v: .8f}" for v in row) + "]")
+    print()
+
+
+def polar_via_eigen(M: np.ndarray):
+    """
+    Compute the right polar decomposition M = Q P via eigen-decomposition
+    of M^T M.  Returns (Q, P, P_inv).
+    Works for square invertible M only.
+    """
+    G = M.T @ M                          # Gram matrix (symmetric PSD)
+    eigvals, V = np.linalg.eigh(G)      # eigh guarantees sorted real eigenvalues
+    sqrt_eigvals = np.sqrt(np.maximum(eigvals, 0.0))
+    P = V @ np.diag(sqrt_eigvals) @ V.T  # (M^T M)^{1/2}
+    inv_sqrt_eigvals = 1.0 / sqrt_eigvals
+    P_inv = V @ np.diag(inv_sqrt_eigvals) @ V.T  # (M^T M)^{-1/2}
+    Q = M @ P_inv
+    return Q, P, P_inv
+
+
+def polar_via_svd(M: np.ndarray):
+    """
+    Compute the right polar decomposition via SVD.
+    M = U S V^T  =>  Q_svd = U V^T,  P_svd = V S V^T.
+    Works for square invertible M.
+    """
+    U, s, Vt = np.linalg.svd(M)
+    Q_svd = U @ Vt
+    P_svd = Vt.T @ np.diag(s) @ Vt
+    return Q_svd, P_svd
+
+
+def verify_polar(M: np.ndarray, label: str = "", verbose: bool = False):
+    """
+    Run all polar-decomposition checks on M (square invertible).
+    Returns a dict of pass/fail booleans.
+    """
+    tol = 1e-8   # tight but accounts for condition-number amplification
+    n = M.shape[0]
+    Q, P, _ = polar_via_eigen(M)
+    Q_svd, P_svd = polar_via_svd(M)
+
+    # Checks
+    orth_dev   = np.max(np.abs(Q.T @ Q - np.eye(n)))
+    sym_dev    = np.max(np.abs(P - P.T))
+    psd_eigmin = np.min(np.linalg.eigvalsh(P))
+    recon_dev  = np.max(np.abs(Q @ P - M))
+    svd_dev    = np.max(np.abs(Q - Q_svd))
+
+    ok_orth  = orth_dev  < tol
+    ok_sym   = sym_dev   < tol
+    ok_psd   = psd_eigmin > -tol
+    ok_recon = recon_dev < tol
+    ok_svd   = svd_dev   < tol
+
+    if verbose:
+        print(f"  Q^T Q - I  max deviation : {orth_dev:.2e}  {'PASS' if ok_orth else 'FAIL'}")
+        print(f"  P - P^T    max deviation : {sym_dev:.2e}  {'PASS' if ok_sym else 'FAIL'}")
+        print(f"  min eigenvalue of P      : {psd_eigmin:.8f}  {'PASS' if ok_psd else 'FAIL'}")
+        print(f"  Q P - M    max deviation : {recon_dev:.2e}  {'PASS' if ok_recon else 'FAIL'}")
+        print(f"  Q vs Q_svd max deviation : {svd_dev:.2e}  {'PASS' if ok_svd else 'FAIL'}")
+
+    return {
+        "orth": ok_orth,
+        "sym":  ok_sym,
+        "psd":  ok_psd,
+        "recon": ok_recon,
+        "svd":  ok_svd,
+    }
+
+
+# ===================================================================
+#  PART 1 -- Pen-and-paper walkthrough on M = [[3,1],[0,2]]
+# ===================================================================
+
+sep("PART 1: Pen-and-paper walkthrough  --  M = [[3,1],[0,2]]")
+
+M = np.array([[3.0, 1.0],
+              [0.0, 2.0]])
+
+# ---- Step 1: Print M ----
+print("STEP 1  Define M")
+mat("M", M)
+
+# ---- Step 2: Compute G = M^T M ----
+print("STEP 2  Compute G = M^T M")
+print("  G = M^T M")
+print("      = [[3,0],[1,2]]^T . [[3,1],[0,2]]")
+print()
+print("  Row-by-row:")
+print("    G[0,0] = 3*3 + 0*0 = 9")
+print("    G[0,1] = 3*1 + 0*2 = 3")
+print("    G[1,0] = 1*3 + 2*0 = 3")
+print("    G[1,1] = 1*1 + 2*2 = 5")
+print()
+G = M.T @ M
+mat("G = M^T M", G)
+print("  Expected: [[9, 3], [3, 5]]")
+assert np.allclose(G, [[9, 3], [3, 5]]), "G computation mismatch!"
+print("  Confirmed.\n")
+
+# ---- Step 3: Eigenvalues of G analytically ----
+print("STEP 3  Eigenvalues of G (analytically and numerically)")
+print()
+print("  For a 2x2 symmetric matrix [[a,b],[b,c]], the eigenvalues are:")
+print("    lambda = (a+c)/2  +/-  sqrt( ((a-c)/2)^2 + b^2 )")
+print()
+a, b, c = G[0, 0], G[0, 1], G[1, 1]
+print(f"  a = {a:.1f},  b = {b:.1f},  c = {c:.1f}")
+half_sum  = (a + c) / 2.0
+disc      = np.sqrt(((a - c) / 2.0) ** 2 + b ** 2)
+lam1_analytic = half_sum - disc   # smaller eigenvalue first
+lam2_analytic = half_sum + disc
+print(f"  (a+c)/2                  = {half_sum:.6f}")
+print(f"  ((a-c)/2)^2              = {((a - c) / 2.0) ** 2:.6f}")
+print(f"  b^2                      = {b ** 2:.6f}")
+print(f"  ((a-c)/2)^2 + b^2       = {((a - c) / 2.0) ** 2 + b ** 2:.6f}")
+print(f"  sqrt(((a-c)/2)^2 + b^2) = {disc:.6f}")
+print()
+print(f"  lambda_1 (analytic) = {half_sum:.6f} - {disc:.6f} = {lam1_analytic:.6f}")
+print(f"  lambda_2 (analytic) = {half_sum:.6f} + {disc:.6f} = {lam2_analytic:.6f}")
+print()
+
+eigvals_num, V_num = np.linalg.eigh(G)
+print(f"  lambda_1 (numpy eigh) = {eigvals_num[0]:.6f}")
+print(f"  lambda_2 (numpy eigh) = {eigvals_num[1]:.6f}")
+print()
+assert np.allclose(sorted([lam1_analytic, lam2_analytic]),
+                   sorted(eigvals_num)), "Eigenvalue mismatch!"
+print("  Analytic and numeric eigenvalues agree.  Both positive => G is PD.")
+print()
+
+# ---- Step 4: Eigenvectors ----
+print("STEP 4  Eigenvectors of G")
+print()
+print("  For eigenvalue lambda, solve (G - lambda I) v = 0.")
+print(f"  numpy eigh gives orthonormal eigenvectors as columns of V:")
+mat("V  (columns are eigenvectors, from eigh)", V_num)
+print("  Check V^T V = I:")
+mat("V^T V", V_num.T @ V_num)
+print("  Check V diag(lambda) V^T = G:")
+G_rebuilt = V_num @ np.diag(eigvals_num) @ V_num.T
+mat("V diag(lambda) V^T", G_rebuilt)
+G_rebuild_dev = np.max(np.abs(G_rebuilt - G))
+print(f"  max |V diag(lambda) V^T - G| = {G_rebuild_dev:.2e}")
+print("  Confirmed: eigendecomposition is correct.\n")
+
+# ---- Step 5: (M^T M)^{1/2} via eigen-decomposition ----
+print("STEP 5  Compute P = (M^T M)^{1/2}")
+print()
+print("  P = V diag(sqrt(lambda_i)) V^T")
+sqrt_eigvals = np.sqrt(eigvals_num)
+print(f"  sqrt(lambda_1) = sqrt({eigvals_num[0]:.6f}) = {sqrt_eigvals[0]:.8f}")
+print(f"  sqrt(lambda_2) = sqrt({eigvals_num[1]:.6f}) = {sqrt_eigvals[1]:.8f}")
+print()
+print("  diag(sqrt(lambda_i)) =")
+print(f"    [{sqrt_eigvals[0]:.8f}   0.00000000]")
+print(f"    [ 0.00000000  {sqrt_eigvals[1]:.8f}]")
+print()
+P = V_num @ np.diag(sqrt_eigvals) @ V_num.T
+mat("P = (M^T M)^{1/2}", P)
+
+print("  Sanity check:  P^2 should equal G = M^T M")
+mat("P^2", P @ P)
+P2_dev = np.max(np.abs(P @ P - G))
+print(f"  max |P^2 - G| = {P2_dev:.2e}")
+assert P2_dev < 1e-12, "P^2 != G"
+print("  Confirmed: P^2 = M^T M.\n")
+
+# ---- Step 6: (M^T M)^{-1/2} ----
+print("STEP 6  Compute (M^T M)^{-1/2}")
+print()
+print("  (M^T M)^{-1/2} = V diag(1/sqrt(lambda_i)) V^T")
+inv_sqrt_eigvals = 1.0 / sqrt_eigvals
+print(f"  1/sqrt(lambda_1) = {inv_sqrt_eigvals[0]:.8f}")
+print(f"  1/sqrt(lambda_2) = {inv_sqrt_eigvals[1]:.8f}")
+print()
+P_inv = V_num @ np.diag(inv_sqrt_eigvals) @ V_num.T
+mat("(M^T M)^{-1/2}", P_inv)
+
+print("  Sanity check:  P . (M^T M)^{-1/2} should be I")
+mat("P @ (M^T M)^{-1/2}", P @ P_inv)
+PPinv_dev = np.max(np.abs(P @ P_inv - np.eye(2)))
+print(f"  max |P (M^T M)^{{-1/2}} - I| = {PPinv_dev:.2e}")
+assert PPinv_dev < 1e-12
+print("  Confirmed.\n")
+
+# ---- Step 7: Q = M (M^T M)^{-1/2} ----
+print("STEP 7  Compute Q = M @ (M^T M)^{-1/2}")
+print()
+print("  This is the key formula: Q = M (M^T M)^{-1/2}")
+Q = M @ P_inv
+mat("Q", Q)
+
+# ---- Step 8: Verify Q^T Q = I ----
+print("STEP 8  Verify Q^T Q = I  (Q is orthogonal)")
+QtQ = Q.T @ Q
+mat("Q^T Q", QtQ)
+orth_dev = np.max(np.abs(QtQ - np.eye(2)))
+print(f"  max |Q^T Q - I| = {orth_dev:.2e}")
+if orth_dev < 1e-10:
+    print("  PASS: Q is orthogonal.\n")
+else:
+    print("  FAIL: Q is NOT orthogonal!\n")
+
+# ---- Step 9: det(Q) ----
+det_Q = np.linalg.det(Q)
+print(f"STEP 9  det(Q) = {det_Q:.8f}")
+if abs(det_Q - 1.0) < 1e-10:
+    print("  Q is a proper rotation (det = +1), so Q in SO(2).\n")
+elif abs(det_Q + 1.0) < 1e-10:
+    print("  Q is an improper rotation (det = -1), so Q in O(2) \\ SO(2).\n")
+else:
+    print("  WARNING: det(Q) is not +/-1!\n")
+
+# ---- Step 10: Verify P is symmetric and PSD ----
+print("STEP 10  Verify P is symmetric and positive semi-definite")
+sym_dev = np.max(np.abs(P - P.T))
+print(f"  max |P - P^T| = {sym_dev:.2e}")
+P_eigs = np.linalg.eigvalsh(P)
+print(f"  Eigenvalues of P: {P_eigs}")
+if sym_dev < 1e-10 and np.all(P_eigs > -1e-10):
+    print("  PASS: P is symmetric positive (semi-)definite.\n")
+else:
+    print("  FAIL!\n")
+
+# ---- Step 11: Verify Q P = M ----
+print("STEP 11  Verify Q P = M  (reconstruction)")
+QP = Q @ P
+mat("Q @ P", QP)
+mat("M (original)", M)
+recon_dev = np.max(np.abs(QP - M))
+print(f"  max |Q P - M| = {recon_dev:.2e}")
+if recon_dev < 1e-10:
+    print("  PASS: QP = M exactly (up to floating point).\n")
+else:
+    print("  FAIL: QP != M!\n")
+
+# ---- Step 12: Cross-check via SVD ----
+print("STEP 12  Cross-check via SVD")
+print()
+print("  SVD:  M = U S V^T")
+U, s, Vt = np.linalg.svd(M)
+mat("U", U)
+print(f"  Singular values: {s}")
+mat("V^T", Vt)
+print()
+
+print("  From SVD, the polar factors are:")
+print("    Q_svd = U V^T")
+print("    P_svd = V S V^T")
+print()
+Q_svd = U @ Vt
+P_svd = Vt.T @ np.diag(s) @ Vt
+mat("Q_svd = U V^T", Q_svd)
+mat("P_svd = V S V^T", P_svd)
+
+svd_Q_dev = np.max(np.abs(Q - Q_svd))
+svd_P_dev = np.max(np.abs(P - P_svd))
+print(f"  max |Q_eigen - Q_svd| = {svd_Q_dev:.2e}")
+print(f"  max |P_eigen - P_svd| = {svd_P_dev:.2e}")
+if svd_Q_dev < 1e-10 and svd_P_dev < 1e-10:
+    print("  PASS: Eigen-decomposition and SVD methods agree.\n")
+else:
+    print("  FAIL: Methods disagree!\n")
+
+
+# ===================================================================
+#  PART 2 -- Batch verification on random matrices
+# ===================================================================
+
+sep("PART 2: Batch verification on random matrices")
+
+rng = np.random.default_rng(42)
+all_pass = True
+total_tested = 0
+total_failed = 0
+
+# --- Square matrices: 2x2, 3x3, 5x5 ---
+for n in [2, 3, 5]:
+    n_trials = 100
+    passed = 0
+    failed = 0
+    max_orth_dev  = 0.0
+    max_recon_dev = 0.0
+    max_svd_dev   = 0.0
+    worst_psd_eig = np.inf
+
+    for trial in range(n_trials):
+        # Generate a random invertible matrix (reject ill-conditioned ones
+        # where floating-point error in eigen vs SVD paths diverges)
+        while True:
+            M_rand = rng.standard_normal((n, n))
+            if np.linalg.cond(M_rand) < 1e4:
+                break
+
+        results = verify_polar(M_rand)
+        total_tested += 1
+
+        if all(results.values()):
+            passed += 1
+        else:
+            failed += 1
+            total_failed += 1
+            all_pass = False
+
+        # Track worst-case deviations for summary
+        Q_r, P_r, _ = polar_via_eigen(M_rand)
+        orth_d  = np.max(np.abs(Q_r.T @ Q_r - np.eye(n)))
+        recon_d = np.max(np.abs(Q_r @ P_r - M_rand))
+        Q_svd_r, _ = polar_via_svd(M_rand)
+        svd_d   = np.max(np.abs(Q_r - Q_svd_r))
+        psd_eig = np.min(np.linalg.eigvalsh(P_r))
+
+        max_orth_dev  = max(max_orth_dev, orth_d)
+        max_recon_dev = max(max_recon_dev, recon_d)
+        max_svd_dev   = max(max_svd_dev, svd_d)
+        worst_psd_eig = min(worst_psd_eig, psd_eig)
+
+    print(f"  {n}x{n} random matrices  ({n_trials} trials)")
+    print(f"    Passed: {passed}/{n_trials}")
+    print(f"    Worst |Q^T Q - I|  : {max_orth_dev:.2e}")
+    print(f"    Worst |QP - M|     : {max_recon_dev:.2e}")
+    print(f"    Worst |Q - Q_svd|  : {max_svd_dev:.2e}")
+    print(f"    Min eigenvalue of P: {worst_psd_eig:.6f}")
+    print()
+
+# --- Rectangular matrices (m > n): use thin polar decomposition ---
+# For m x n with m >= n, M = Q P where Q is m x n with Q^T Q = I_n
+# and P is n x n symmetric PSD.
+print("  Rectangular matrices (m > n, thin polar decomposition):")
+print("  For m x n (m >= n): M = Q P, Q^T Q = I_n, P is n x n Sym+(n).\n")
+
+rect_shapes = [(4, 2), (6, 3), (10, 5), (8, 4)]
+for (m, n) in rect_shapes:
+    n_trials = 25
+    passed = 0
+    failed = 0
+    max_orth_dev  = 0.0
+    max_recon_dev = 0.0
+    worst_psd_eig = np.inf
+
+    for trial in range(n_trials):
+        M_rect = rng.standard_normal((m, n))
+
+        # Thin polar decomposition via SVD: M = U S V^T
+        # U is m x n (thin), S is n x n, V^T is n x n
+        # Q = U V^T (m x n, columns orthonormal), P = V S V^T (n x n, SPD)
+        U_r, s_r, Vt_r = np.linalg.svd(M_rect, full_matrices=False)
+        Q_rect = U_r @ Vt_r           # m x n
+        P_rect = Vt_r.T @ np.diag(s_r) @ Vt_r  # n x n
+
+        # Checks
+        tol = 1e-10
+        orth_d  = np.max(np.abs(Q_rect.T @ Q_rect - np.eye(n)))
+        sym_d   = np.max(np.abs(P_rect - P_rect.T))
+        psd_eig = np.min(np.linalg.eigvalsh(P_rect))
+        recon_d = np.max(np.abs(Q_rect @ P_rect - M_rect))
+
+        ok = (orth_d < tol and sym_d < tol and psd_eig > -tol and recon_d < tol)
+        total_tested += 1
+
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+            total_failed += 1
+            all_pass = False
+
+        max_orth_dev  = max(max_orth_dev, orth_d)
+        max_recon_dev = max(max_recon_dev, recon_d)
+        worst_psd_eig = min(worst_psd_eig, psd_eig)
+
+    print(f"  {m}x{n} random matrices  ({n_trials} trials)")
+    print(f"    Passed: {passed}/{n_trials}")
+    print(f"    Worst |Q^T Q - I|  : {max_orth_dev:.2e}")
+    print(f"    Worst |QP - M|     : {max_recon_dev:.2e}")
+    print(f"    Min eigenvalue of P: {worst_psd_eig:.6f}")
+    print()
+
+
+# ===================================================================
+#  FINAL VERDICT
+# ===================================================================
+
+sep("FINAL VERDICT")
+
+print(f"  Total matrices tested: {total_tested}")
+print(f"  Total failures       : {total_failed}")
+print()
+
+if all_pass and orth_dev < 1e-10 and recon_dev < 1e-10:
+    print("  ============================================")
+    print("  =            ALL TESTS PASSED              =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.1a VERIFIED:")
+    print("    For M = [[3,1],[0,2]] and for hundreds of random matrices,")
+    print("    Q = M (M^T M)^{-1/2} is orthogonal, P = (M^T M)^{1/2} is")
+    print("    symmetric positive-definite, and Q P = M exactly.")
+    print("    The polar decomposition holds constructively.")
+else:
+    print("  ============================================")
+    print("  =          SOME TESTS FAILED               =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.1a: VERIFICATION FAILED on some cases.")
+
+print()

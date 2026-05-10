@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""
+Experiment 1.4a-ii: Basin Map -- Multi-Dimensional Phase Portrait
+
+NS iteration on matrices with MULTIPLE singular values.
+Key insight: each singular value sigma_i evolves INDEPENDENTLY under NS iteration.
+The matrix iteration X_{k+1} = X_k (3I - X_k^T X_k) / 2
+acts on each sigma_i via the scalar map f(sigma) = (3*sigma - sigma^3)/2.
+
+This experiment:
+1. Verifies that singular values decouple (evolve independently)
+2. Plots (sigma_1, sigma_2) trajectories for various starting points
+3. Shows the phase portrait converges to (1,1) from the convergence basin
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def ns_matrix_iteration(X, n_iters=10):
+    """
+    Cubic NS iteration on matrix: X_{k+1} = X_k (3I - X_k^T X_k) / 2
+    This is equivalent to acting on each singular value via f(s) = (3s - s^3)/2.
+    Returns list of singular values at each step.
+    """
+    trajectory_sv = [np.linalg.svd(X, compute_uv=False).copy()]
+    trajectory_X = [X.copy()]
+
+    for _ in range(n_iters):
+        XtX = X.T @ X
+        I = np.eye(XtX.shape[0])
+        X = X @ (3 * I - XtX) / 2
+        # Check for overflow
+        if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+            break
+        trajectory_X.append(X.copy())
+        trajectory_sv.append(np.linalg.svd(X, compute_uv=False).copy())
+
+    return trajectory_X, trajectory_sv
+
+def ns_scalar(sigma, n_iters=10):
+    """Scalar NS map applied independently."""
+    traj = [sigma]
+    s = sigma
+    for _ in range(n_iters):
+        s = (3.0 * s - s**3) / 2.0
+        traj.append(s)
+        if abs(s) > 1e15:
+            break
+    return traj
+
+def make_matrix_with_svs(m, n, target_svs):
+    """Create an m x n matrix with specified singular values."""
+    k = min(m, n)
+    assert len(target_svs) == k
+    U = np.linalg.qr(np.random.randn(m, m))[0][:, :k]
+    V = np.linalg.qr(np.random.randn(n, n))[0][:, :k]
+    S = np.diag(target_svs)
+    return U @ S @ V.T
+
+def main():
+    np.random.seed(42)
+    sqrt3 = np.sqrt(3.0)
+    print("=" * 70)
+    print("Experiment 1.4a-ii: Multi-Dimensional NS Phase Portrait")
+    print("=" * 70)
+    print()
+
+    # ── Part 1: Verify singular value decoupling ────────────────────────
+    print("Part 1: Verify that singular values evolve independently")
+    print("  (Each sigma_i should follow the scalar map exactly)")
+    print("  Using Frobenius-normalized matrices to ensure convergence basin.")
+    print()
+
+    sizes = [(4, 4), (8, 8), (16, 16), (32, 32), (8, 4), (16, 8)]
+    max_errors = []
+
+    for (m, n) in sizes:
+        W = np.random.randn(m, n)
+        # Normalize to ensure all singular values < sqrt(3)
+        W = W / np.linalg.norm(W, 'fro')
+        sv_init = np.linalg.svd(W, compute_uv=False)
+
+        # Matrix iteration
+        _, sv_traj = ns_matrix_iteration(W, n_iters=10)
+
+        # Scalar iteration on initial singular values
+        k = min(m, n)
+        scalar_trajs = [ns_scalar(sv_init[j], n_iters=10) for j in range(k)]
+
+        # Compare
+        max_err = 0.0
+        for step in range(min(11, len(sv_traj))):
+            for j in range(k):
+                matrix_sv = sv_traj[step][j]
+                scalar_sv = scalar_trajs[j][step]
+                err = abs(matrix_sv - scalar_sv)
+                max_err = max(max_err, err)
+
+        max_errors.append(max_err)
+        status = "MATCH" if max_err < 1e-10 else "MISMATCH"
+        print(f"  {m:>3d}x{n:<3d}: max |matrix_sv - scalar_sv| = {max_err:.2e}  [{status}]")
+
+    print()
+
+    # ── Part 2: 2D phase portrait (sigma_1, sigma_2) ───────────────────
+    print("Part 2: 2D Phase portrait -- (sigma_1, sigma_2) trajectories")
+    print("  All starting points in convergence basin (0, sqrt(3)).")
+    print()
+
+    n_iters = 12
+    starting_points = []
+
+    # Grid of starting points in the convergence basin (0, sqrt(3))
+    for s1 in [0.2, 0.5, 0.8, 1.0, 1.2, 1.5, 1.7]:
+        for s2 in [0.2, 0.5, 0.8, 1.0, 1.2, 1.5, 1.7]:
+            starting_points.append((s1, s2))
+
+    # Some diagonal starting points
+    for s in [0.3, 0.6, 0.9, 1.1, 1.4, 1.6]:
+        starting_points.append((s, s))
+
+    trajectories_2d = []
+    for (s1_0, s2_0) in starting_points:
+        traj1 = ns_scalar(s1_0, n_iters)
+        traj2 = ns_scalar(s2_0, n_iters)
+        trajectories_2d.append((traj1, traj2))
+
+    print(f"  Generated {len(starting_points)} trajectory pairs")
+
+    # Verify all converge to (1,1)
+    converged = 0
+    for (traj1, traj2) in trajectories_2d:
+        if abs(traj1[-1] - 1.0) < 1e-6 and abs(traj2[-1] - 1.0) < 1e-6:
+            converged += 1
+    print(f"  Converged to (1,1): {converged}/{len(starting_points)}")
+    print()
+
+    # ── Part 3: Verify decoupling on actual 3x3 matrix with known SVD ──
+    print("Part 3: Verify decoupling on 3x3 matrix with known singular values")
+
+    target_svs = np.array([1.5, 0.8, 0.3])
+    W = make_matrix_with_svs(3, 3, target_svs)
+
+    actual_sv = np.linalg.svd(W, compute_uv=False)
+    print(f"  Initial singular values: [{actual_sv[0]:.4f}, {actual_sv[1]:.4f}, {actual_sv[2]:.4f}]")
+    print(f"  Target:                  [{target_svs[0]:.4f}, {target_svs[1]:.4f}, {target_svs[2]:.4f}]")
+
+    # Run matrix NS
+    _, sv_traj_3x3 = ns_matrix_iteration(W, n_iters=15)
+
+    # Run scalar NS
+    scalar_trajs_3x3 = [ns_scalar(actual_sv[j], n_iters=15) for j in range(3)]
+
+    print(f"\n  {'Step':>4s}  {'s1(mat)':>10s}  {'s1(scl)':>10s}  {'s2(mat)':>10s}  {'s2(scl)':>10s}  {'s3(mat)':>10s}  {'s3(scl)':>10s}")
+    for step in [0, 1, 2, 3, 5, 10, 15]:
+        if step < len(sv_traj_3x3):
+            vals = []
+            for j in range(3):
+                vals.append(f"{sv_traj_3x3[step][j]:10.6f}")
+                vals.append(f"{scalar_trajs_3x3[j][step]:10.6f}")
+            print(f"  {step:>4d}  {'  '.join(vals)}")
+    print()
+
+    # ── Part 4: Verify UV directions preserved ──────────────────────────
+    print("Part 4: Verify UV directions preserved during iteration")
+    W = np.random.randn(8, 8)
+    W = W / np.linalg.norm(W, 'fro')  # normalize to ensure convergence
+    U0, S0, Vt0 = np.linalg.svd(W, full_matrices=False)
+    traj_X, traj_sv = ns_matrix_iteration(W, n_iters=10)
+
+    uv_drifts = []
+    UV_0 = U0 @ Vt0
+    for step, X_k in enumerate(traj_X):
+        Uk, Sk, Vtk = np.linalg.svd(X_k, full_matrices=False)
+        UV_k = Uk @ Vtk
+        # Handle sign ambiguity: for each singular vector, sign can flip
+        # Use the polar factor directly: polar(X) = U @ V^T where X = U S V^T
+        drift = np.linalg.norm(UV_k - UV_0, 'fro')
+        # Also try with sign flips resolved
+        drift_min = drift
+        uv_drifts.append(drift_min)
+
+    print(f"  ||U_k V_k^T - U_0 V_0^T||_F at each step:")
+    for step in range(min(11, len(uv_drifts))):
+        print(f"    Step {step:>2d}: {uv_drifts[step]:.6e}")
+    print()
+
+    # ── Part 5: Different convergence rates for different sigma_i ───────
+    print("Part 5: Convergence rates differ by singular value")
+    print("  (sigma near 1 converges fastest, sigma near 0 or sqrt(3) slowest)")
+
+    test_svs = [0.1, 0.3, 0.5, 0.8, 1.0, 1.2, 1.5, 1.7]
+    print(f"\n  {'sigma_0':>8s}  {'iters to |s-1|<1e-6':>22s}  {'rate (log ratio)':>18s}")
+    for s0 in test_svs:
+        traj = ns_scalar(s0, 50)
+        conv_iter = 50
+        for i, v in enumerate(traj):
+            if abs(v - 1.0) < 1e-6:
+                conv_iter = i
+                break
+        # Estimate convergence rate
+        errors = [abs(traj[i] - 1.0) for i in range(min(5, len(traj)))]
+        if len(errors) >= 2 and errors[0] > 1e-15 and errors[1] > 1e-15:
+            rate = np.log10(errors[1] / errors[0])
+        else:
+            rate = float('-inf')
+        print(f"  {s0:8.4f}  {conv_iter:>22d}  {rate:>18.4f}")
+    print()
+
+    # ── Plot: Phase portrait ────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    fig.suptitle("Exp 1.4a-ii: NS Multi-Dimensional Phase Portrait", fontsize=14, fontweight='bold')
+
+    # Top-left: 2D phase portrait (sigma_1, sigma_2) with trajectories
+    ax = axes[0, 0]
+    cmap = plt.cm.viridis
+    for idx, ((s1_0, s2_0), (traj1, traj2)) in enumerate(zip(starting_points, trajectories_2d)):
+        color = cmap(idx / len(starting_points))
+        ax.plot(traj1, traj2, '-', color=color, alpha=0.4, linewidth=0.8)
+        ax.plot(traj1[0], traj2[0], 'o', color=color, markersize=3)
+    ax.plot([1], [1], 'r*', markersize=15, zorder=10, label='Fixed point (1,1)')
+    ax.set_xlabel('$\\sigma_1$', fontsize=12)
+    ax.set_ylabel('$\\sigma_2$', fontsize=12)
+    ax.set_title('Phase portrait: trajectories in ($\\sigma_1$, $\\sigma_2$) space')
+    ax.set_xlim(0, 1.8)
+    ax.set_ylim(0, 1.8)
+    ax.set_aspect('equal')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Top-right: select trajectories with arrows showing flow direction
+    ax = axes[0, 1]
+    highlight_starts = [(0.2, 1.5), (1.5, 0.2), (0.5, 0.5), (1.5, 1.5),
+                        (0.2, 0.2), (1.0, 1.7), (1.7, 1.0)]
+    colors = ['blue', 'red', 'green', 'purple', 'orange', 'brown', 'cyan']
+    for (s1_0, s2_0), color in zip(highlight_starts, colors):
+        traj1 = ns_scalar(s1_0, n_iters)
+        traj2 = ns_scalar(s2_0, n_iters)
+        ax.plot(traj1, traj2, 'o-', color=color, markersize=4, linewidth=1.5,
+                label=f'({s1_0:.1f}, {s2_0:.1f})')
+        # Arrow from first to second point
+        if len(traj1) > 1:
+            dx = traj1[1] - traj1[0]
+            dy = traj2[1] - traj2[0]
+            ax.annotate('', xy=(traj1[1], traj2[1]), xytext=(traj1[0], traj2[0]),
+                       arrowprops=dict(arrowstyle='->', color=color, lw=2))
+    ax.plot([1], [1], 'r*', markersize=15, zorder=10)
+    ax.set_xlabel('$\\sigma_1$', fontsize=12)
+    ax.set_ylabel('$\\sigma_2$', fontsize=12)
+    ax.set_title('Selected trajectories with flow arrows')
+    ax.set_xlim(0, 1.8)
+    ax.set_ylim(0, 1.8)
+    ax.set_aspect('equal')
+    ax.legend(fontsize=7, loc='upper left')
+    ax.grid(True, alpha=0.3)
+
+    # Bottom-left: convergence of 3 singular values from actual matrix iteration
+    ax = axes[1, 0]
+    n_steps_plot = min(16, len(sv_traj_3x3))
+    for j in range(3):
+        mat_sv = [sv_traj_3x3[step][j] for step in range(n_steps_plot)]
+        scl_sv = [scalar_trajs_3x3[j][step] for step in range(n_steps_plot)]
+        ax.plot(range(n_steps_plot), mat_sv, 'o-', markersize=4,
+                label=f'$\\sigma_{j+1}$ matrix', linewidth=2)
+        ax.plot(range(n_steps_plot), scl_sv, 'x--', markersize=6,
+                label=f'$\\sigma_{j+1}$ scalar', alpha=0.7)
+    ax.axhline(1.0, color='black', linestyle=':', alpha=0.3)
+    ax.set_xlabel('Iteration', fontsize=12)
+    ax.set_ylabel('$\\sigma_i$', fontsize=12)
+    ax.set_title('Matrix vs scalar iteration (3x3)')
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    # Bottom-right: UV drift
+    ax = axes[1, 1]
+    valid_drifts = [d for d in uv_drifts if d > 0]
+    if valid_drifts and min(valid_drifts) > 0:
+        ax.semilogy(range(len(uv_drifts)), [max(d, 1e-16) for d in uv_drifts],
+                    'bo-', markersize=5, linewidth=2)
+    else:
+        ax.plot(range(len(uv_drifts)), uv_drifts, 'bo-', markersize=5, linewidth=2)
+    ax.set_xlabel('Iteration', fontsize=12)
+    ax.set_ylabel('$||U_k V_k^T - U_0 V_0^T||_F$', fontsize=12)
+    ax.set_title('UV direction drift (8x8 matrix)')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(SCRIPT_DIR, "phase_portrait.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"Plot saved: {plot_path}")
+    print()
+
+    # ── PASS/FAIL ───────────────────────────────────────────────────────
+    print("=" * 70)
+    test_results = []
+
+    # Test 1: Singular values decouple (matrix = scalar within floating point)
+    t1 = all(e < 1e-10 for e in max_errors)
+    test_results.append(t1)
+    print(f"TEST 1 - SV decoupling (matrix == scalar):     {'PASS' if t1 else 'FAIL'}  (max err: {max(max_errors):.2e})")
+
+    # Test 2: All trajectories in basin converge to (1,1,...,1)
+    t2 = (converged == len(starting_points))
+    test_results.append(t2)
+    print(f"TEST 2 - All basin points converge to (1,1):   {'PASS' if t2 else 'FAIL'}  ({converged}/{len(starting_points)})")
+
+    # Test 3: UV direction preserved (drift < 1e-8)
+    t3 = all(d < 1e-8 for d in uv_drifts)
+    test_results.append(t3)
+    print(f"TEST 3 - UV direction preserved:               {'PASS' if t3 else 'FAIL'}  (max drift: {max(uv_drifts):.2e})")
+
+    # Test 4: Quadratic convergence rate (NOT cubic -- the cubic NS polynomial gives order-2 convergence)
+    # f(1+e) = 1 - 3e^2/2 - e^3/2, so error_{k+1} ~ (3/2) * error_k^2
+    # log(e_{k+1}) / log(e_k) -> 2 as e_k -> 0
+    s0 = 0.99
+    traj = ns_scalar(s0, 15)
+    errors = [abs(traj[i] - 1.0) for i in range(min(10, len(traj)))]
+    ratios = []
+    for i in range(1, len(errors)):
+        if errors[i] > 1e-15 and errors[i-1] > 1e-15 and errors[i-1] < 0.1:
+            ratio = np.log(errors[i]) / np.log(errors[i-1])
+            ratios.append(ratio)
+    avg_ratio = np.mean(ratios) if ratios else 0
+    t4 = 1.8 < avg_ratio < 2.2  # quadratic convergence: ratio ~ 2
+    test_results.append(t4)
+    print(f"TEST 4 - Quadratic convergence (order 2):      {'PASS' if t4 else 'FAIL'}  (log ratio: {avg_ratio:.2f}, expect ~2)")
+
+    # Test 5: sigma_i trajectories are truly independent (off-diagonal coupling < eps)
+    # Note: SVD returns singular values sorted in descending order, so when two
+    # scalar trajectories cross each other, the matrix SVD ordering changes.
+    # We must compare sorted sets, not positional matches.
+    target = np.array([1.4, 0.6])
+    W2 = make_matrix_with_svs(2, 2, target)
+    actual_init = np.linalg.svd(W2, compute_uv=False)
+    _, sv_traj2 = ns_matrix_iteration(W2, n_iters=8)
+    scalar_t1 = ns_scalar(actual_init[0], n_iters=8)
+    scalar_t2 = ns_scalar(actual_init[1], n_iters=8)
+    coupling_err = 0.0
+    for step in range(min(9, len(sv_traj2))):
+        # Compare sorted singular values (both should be the same set)
+        mat_sorted = np.sort(sv_traj2[step])
+        scl_sorted = np.sort([scalar_t1[step], scalar_t2[step]])
+        coupling_err = max(coupling_err, np.max(np.abs(mat_sorted - scl_sorted)))
+    t5 = coupling_err < 1e-10
+    test_results.append(t5)
+    print(f"TEST 5 - No cross-coupling between sigma_i:   {'PASS' if t5 else 'FAIL'}  (coupling err: {coupling_err:.2e})")
+
+    print("=" * 70)
+    all_tests = all(test_results)
+    print(f"\nOVERALL: {'PASS' if all_tests else 'FAIL'} ({sum(test_results)}/{len(test_results)} tests passed)")
+
+if __name__ == "__main__":
+    main()

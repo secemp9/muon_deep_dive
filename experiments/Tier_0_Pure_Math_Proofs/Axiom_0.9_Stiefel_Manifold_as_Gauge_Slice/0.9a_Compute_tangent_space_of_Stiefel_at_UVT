@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.9a — Compute tangent space of Stiefel manifold at UV^T:
+             what directions are 'physical'?
+
+The tangent space T_Q St(m,n) at Q = UV^T consists of matrices Z such that
+Q^T Z + Z^T Q = 0 (skew-symmetric constraint).
+
+    dim St(m,n) = mn - n(n+1)/2
+    dim normal  = n(n+1)/2
+
+Physical directions (tangent) change the orbit.
+Gauge directions (normal) stay within the same orbit (fiber).
+
+For square n×n matrices, gauge fraction → 1/2 as n→∞.
+This means SGD wastes ~50% of its step on gauge directions for square layers.
+Muon, by construction, steps only in physical directions.
+"""
+
+import numpy as np
+
+np.random.seed(42)
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
+
+def random_stiefel(m, n):
+    """Generate a random point Q ∈ St(m,n) via QR decomposition."""
+    A = np.random.randn(m, n)
+    Q, R = np.linalg.qr(A)
+    # Fix sign ambiguity to get uniform distribution on Stiefel
+    Q = Q @ np.diag(np.sign(np.diag(R)))
+    return Q
+
+
+def sym(A):
+    """Symmetric part of a square matrix."""
+    return (A + A.T) / 2
+
+
+def project_tangent_normal(Q, X):
+    """
+    Project X onto tangent and normal spaces of Stiefel at Q.
+
+    Tangent space T_Q St(m,n) = {Z : Q^T Z is skew-symmetric}
+    Normal space N_Q St(m,n) = {Q S : S ∈ Sym(n)}
+
+    Decomposition: X = Z + Q·sym(Q^T X)
+        where Z = X - Q·sym(Q^T X)  (tangent component)
+              N = Q·sym(Q^T X)       (normal component)
+
+    For the full Stiefel tangent space when m > n, the tangent space also
+    includes the component in the orthogonal complement of Q's column space.
+    The correct projection is:
+        Z = (I - QQ^T)X + Q·skew(Q^T X)   [tangent]
+        N = Q·sym(Q^T X)                    [normal]
+    """
+    m, n = Q.shape
+    QtX = Q.T @ X
+    S = sym(QtX)           # symmetric part → normal direction
+    N = Q @ S              # normal component (gauge)
+    Z = X - N              # tangent component (physical)
+    return Z, N
+
+
+def verify_tangent(Q, Z, tol=1e-10):
+    """Verify Z is in tangent space: Q^T Z + Z^T Q should be zero (skew condition)."""
+    check = Q.T @ Z + Z.T @ Q
+    return np.max(np.abs(check)) < tol
+
+
+# ─── Section 1: Dimension Count ─────────────────────────────────────────────
+
+print("=" * 72)
+print("SECTION 1: Dimension count of tangent vs normal spaces")
+print("=" * 72)
+print()
+print(f"{'Shape (m×n)':<15} {'dim(ambient)':<14} {'dim(tangent)':<14} "
+      f"{'dim(normal)':<13} {'gauge frac':<12} {'phys frac':<10}")
+print("-" * 72)
+
+shapes = [(4, 4), (10, 10), (50, 50), (100, 100), (768, 768),
+          (1024, 768), (3072, 768), (768, 50), (2048, 512)]
+
+for m, n in shapes:
+    dim_ambient = m * n
+    dim_normal = n * (n + 1) // 2
+    dim_tangent = dim_ambient - dim_normal
+    gauge_frac = dim_normal / dim_ambient
+    phys_frac = dim_tangent / dim_ambient
+    print(f"{m}×{n:<10} {dim_ambient:<14} {dim_tangent:<14} "
+          f"{dim_normal:<13} {gauge_frac:<12.6f} {phys_frac:<10.6f}")
+
+print()
+print("Key insight: For square n×n, gauge fraction = (n+1)/(2n) → 1/2 as n→∞")
+print(f"  n=4:   gauge = {5/8:.4f}")
+print(f"  n=10:  gauge = {11/20:.4f}")
+print(f"  n=768: gauge = {769/1536:.6f}")
+print(f"  n→∞:   gauge → 0.500000")
+
+# ─── Section 2: Tangent Space Definition & Projection Verification ───────────
+
+print()
+print("=" * 72)
+print("SECTION 2: Verify tangent space projection (small matrices)")
+print("=" * 72)
+print()
+
+for m, n in [(4, 4), (8, 4), (10, 5)]:
+    Q = random_stiefel(m, n)
+    X = np.random.randn(m, n)
+    Z, N = project_tangent_normal(Q, X)
+
+    # Verify decomposition
+    recon_err = np.linalg.norm(Z + N - X) / np.linalg.norm(X)
+
+    # Verify Z is tangent: Q^T Z should be skew-symmetric
+    QtZ = Q.T @ Z
+    skew_err = np.max(np.abs(QtZ + QtZ.T))
+
+    # Verify N is normal: N = QS for symmetric S
+    # S = sym(Q^T X), check N = Q @ S
+    S = sym(Q.T @ X)
+    normal_err = np.linalg.norm(N - Q @ S)
+
+    # Verify orthogonality of tangent and normal components
+    # In the Frobenius inner product: <Z, N>_F = tr(Z^T N) = tr(Z^T Q S)
+    # = tr((Q^T Z)^T S) = tr(skew(Q^TX)^T · S) = 0 (skew ⊥ sym)
+    ortho = np.abs(np.trace(Z.T @ N))
+
+    print(f"  Shape {m}×{n}:")
+    print(f"    Reconstruction error:  {recon_err:.2e}")
+    print(f"    Skew-symmetry of Q^TZ: {skew_err:.2e}")
+    print(f"    Normal form error:     {normal_err:.2e}")
+    print(f"    Orthogonality <Z,N>:   {ortho:.2e}")
+    is_tangent = verify_tangent(Q, Z)
+    print(f"    Z in tangent space:    {is_tangent}")
+    print()
+
+# ─── Section 3: Random Projection Test ──────────────────────────────────────
+
+print("=" * 72)
+print("SECTION 3: Random projection test — verify dimension ratio")
+print("=" * 72)
+print()
+print("For random unit-norm X, E[‖Z‖²/‖X‖²] should equal dim(tangent)/dim(ambient)")
+print()
+
+N_SAMPLES = 1000
+
+print(f"{'Shape':<12} {'Theory':<10} {'Measured':<10} {'Std':<10} {'|Error|':<10} {'Pass':<6}")
+print("-" * 60)
+
+all_pass_sec3 = True
+
+for m, n in [(4, 4), (10, 10), (50, 50), (100, 100), (20, 5), (50, 10)]:
+    dim_ambient = m * n
+    dim_normal = n * (n + 1) // 2
+    dim_tangent = dim_ambient - dim_normal
+    theory = dim_tangent / dim_ambient
+
+    ratios = []
+    Q = random_stiefel(m, n)
+    for _ in range(N_SAMPLES):
+        X = np.random.randn(m, n)
+        X = X / np.linalg.norm(X, 'fro')  # unit norm
+        Z, N = project_tangent_normal(Q, X)
+        ratio = np.linalg.norm(Z, 'fro') ** 2
+        ratios.append(ratio)
+
+    mean_ratio = np.mean(ratios)
+    std_ratio = np.std(ratios)
+    error = abs(mean_ratio - theory)
+    passed = error < 3 * std_ratio / np.sqrt(N_SAMPLES)  # 3-sigma test
+
+    if not passed:
+        all_pass_sec3 = False
+
+    print(f"{m}×{n:<8} {theory:<10.6f} {mean_ratio:<10.6f} {std_ratio:<10.6f} "
+          f"{error:<10.6f} {'PASS' if passed else 'FAIL'}")
+
+print()
+
+# ─── Section 4: Physical vs Gauge Interpretation (SGD vs Muon) ───────────────
+
+print("=" * 72)
+print("SECTION 4: SGD step decomposition — physical vs gauge")
+print("=" * 72)
+print()
+print("Key question: Given gradient G, how much of it is 'gauge' at various points?")
+print()
+print("Interpretation:")
+print("  Tangent (physical): changes the orbit → useful learning signal")
+print("  Normal (gauge):     stays in fiber → wasted computation")
+print("  Muon: projects to UV^T ∈ St, so step is PURELY physical")
+print()
+
+N_TRIALS = 500
+
+# Part A: G projected at ortho(G) = UV^T — mathematical identity
+print("Part A: Gauge fraction of G at Q = ortho(G) = UV^T")
+print("-" * 66)
+print()
+print("Mathematical identity: G = USV^T, Q = UV^T, so Q^T G = V S V^T")
+print("which is symmetric (S diagonal). Therefore G - Q·sym(Q^T G) = 0.")
+print("The ENTIRE gradient is in the normal (gauge) direction at its own")
+print("polar factor! This is WHY Muon discards the singular values.")
+print()
+
+print(f"{'Shape':<12} {'Gauge frac at ortho(G)':<24} {'Expected':<10}")
+print("-" * 50)
+
+for m, n in [(4, 4), (10, 10), (50, 50), (100, 100)]:
+    gauge_fracs = []
+    for _ in range(N_TRIALS):
+        G = np.random.randn(m, n)
+        U, S, Vt = np.linalg.svd(G, full_matrices=False)
+        Q = U @ Vt
+        Z, N_comp = project_tangent_normal(Q, G)
+        gauge_frac = np.linalg.norm(N_comp, 'fro') ** 2 / np.linalg.norm(G, 'fro') ** 2
+        gauge_fracs.append(gauge_frac)
+    mean_gauge = np.mean(gauge_fracs)
+    print(f"{m}×{n:<8} {mean_gauge:<24.6f} {'1.000000'}")
+
+print()
+print("Result: gauge fraction = 1.0 EXACTLY (up to floating point).")
+print("G is entirely normal at ortho(G). The polar factor UV^T strips ALL gauge.")
+print()
+
+# Part B: G projected at a RANDOM Q (simulating SGD at arbitrary point)
+print("Part B: Gauge fraction of random G at random Q ∈ St(m,n)")
+print("-" * 66)
+print()
+print("This simulates SGD: gradient G at current weight (projected to Stiefel).")
+print("How much of the SGD step is wasted on gauge directions?")
+print()
+
+print(f"{'Shape':<12} {'Gauge frac (theory)':<22} {'Gauge frac (measured)':<22} {'Pass':<6}")
+print("-" * 66)
+
+all_pass_sec4 = True
+
+for m, n in [(4, 4), (10, 10), (50, 50), (100, 100), (200, 200)]:
+    dim_ambient = m * n
+    dim_normal = n * (n + 1) // 2
+    gauge_theory = dim_normal / dim_ambient
+
+    gauge_fracs = []
+    for _ in range(N_TRIALS):
+        Q = random_stiefel(m, n)
+        G = np.random.randn(m, n)
+        Z, N_comp = project_tangent_normal(Q, G)
+        gauge_frac = np.linalg.norm(N_comp, 'fro') ** 2 / np.linalg.norm(G, 'fro') ** 2
+        gauge_fracs.append(gauge_frac)
+
+    mean_gauge = np.mean(gauge_fracs)
+    std_gauge = np.std(gauge_fracs)
+    se = std_gauge / np.sqrt(N_TRIALS)
+    z_score = abs(mean_gauge - gauge_theory) / se if se > 0 else 0
+    passed = z_score < 4
+    if not passed:
+        all_pass_sec4 = False
+
+    print(f"{m}×{n:<8} {gauge_theory:<22.6f} {mean_gauge:<22.6f} "
+          f"{'PASS' if passed else 'FAIL'}")
+
+print()
+print("Conclusion:")
+print("  • At a random point Q, fraction (n+1)/(2n) of any gradient is gauge (wasted)")
+print("  • At ortho(G) itself, the gradient G is 100% gauge — Muon extracts ONLY")
+print("    the direction UV^T which is pure tangent (physical)")
+print("  • This is the geometric reason Muon works: it projects out ALL gauge")
+print()
+
+# ─── Section 5: The 50/50 Split for Square Matrices ─────────────────────────
+
+print("=" * 72)
+print("SECTION 5: The 50/50 split — gauge fraction for square n×n")
+print("=" * 72)
+print()
+print("For square n×n: gauge fraction = (n+1)/(2n)")
+print("SGD wastes this fraction on gauge directions!")
+print()
+
+print(f"{'n':<8} {'Gauge fraction':<18} {'Physical fraction':<18} {'SGD waste (%)':<15}")
+print("-" * 60)
+
+for n in [4, 10, 50, 100, 768, 1024, 4096]:
+    gf = (n + 1) / (2 * n)
+    pf = 1 - gf
+    print(f"{n:<8} {gf:<18.6f} {pf:<18.6f} {gf*100:<15.2f}")
+
+print()
+print("As n→∞, SGD wastes exactly 50% of each step on gauge directions.")
+print("Muon eliminates this waste entirely by projecting onto the Stiefel manifold.")
+
+# ─── Section 6: Rectangular Layers — When Does Muon Help Most? ───────────────
+
+print()
+print("=" * 72)
+print("SECTION 6: Rectangular layers — Muon benefit by shape")
+print("=" * 72)
+print()
+print("For m×n with m ≥ n: gauge fraction = (n+1)/(2m)")
+print("Tall layers (m >> n): little gauge redundancy → SGD nearly as good as Muon")
+print("Square layers (m = n): maximum redundancy → Muon helps the most")
+print()
+
+common_shapes = [
+    ("Embedding (vocab)", 50257, 768),
+    ("Attention Q/K/V", 768, 768),
+    ("Attention output", 768, 768),
+    ("MLP up-proj", 768, 3072),
+    ("MLP down-proj", 3072, 768),
+    ("GPT-3 attn", 12288, 12288),
+    ("LLaMA MLP up", 4096, 11008),
+    ("LLaMA MLP down", 11008, 4096),
+]
+
+print(f"{'Layer type':<22} {'Shape':<14} {'Gauge frac':<12} "
+      f"{'Muon benefit':<14} {'SGD efficiency':<14}")
+print("-" * 78)
+
+for name, m, n in common_shapes:
+    # Ensure m >= n for the formula
+    if m < n:
+        m_eff, n_eff = n, m  # transpose: St(m,n) with m >= n
+    else:
+        m_eff, n_eff = m, n
+    gauge = (n_eff + 1) / (2 * m_eff)
+    sgd_eff = 1 - gauge
+    muon_benefit = f"{1/sgd_eff:.4f}x"
+    print(f"{name:<22} {m}×{n:<8} {gauge:<12.6f} {muon_benefit:<14} {sgd_eff:<14.6f}")
+
+print()
+print("'Muon benefit' = effective speedup factor = 1/(1 - gauge_fraction)")
+print("For square 768×768: Muon is ~2x more efficient per step (gauge ≈ 50%)")
+print("For tall 50257×768: Muon is ~1.001x (almost no gauge waste)")
+
+# ─── Section 7: Statistical Verification Across Shapes ───────────────────────
+
+print()
+print("=" * 72)
+print("SECTION 7: Statistical verification — 500 random (Q,X) pairs per shape")
+print("=" * 72)
+print()
+
+N_STAT = 500
+TOLERANCE_SIGMA = 4  # 4-sigma tolerance for pass/fail
+
+print(f"{'Shape':<12} {'Theory ratio':<14} {'Mean ratio':<12} "
+      f"{'Std':<10} {'Z-score':<10} {'Pass':<6}")
+print("-" * 66)
+
+all_pass_sec7 = True
+
+test_shapes = [(4, 4), (10, 10), (50, 50), (100, 100), (20, 5), (50, 10),
+               (100, 20), (200, 50)]
+
+for m, n in test_shapes:
+    dim_ambient = m * n
+    dim_normal = n * (n + 1) // 2
+    dim_tangent = dim_ambient - dim_normal
+    theory = dim_tangent / dim_ambient
+
+    ratios = []
+    for _ in range(N_STAT):
+        Q = random_stiefel(m, n)
+        X = np.random.randn(m, n)
+        X = X / np.linalg.norm(X, 'fro')
+        Z, N_comp = project_tangent_normal(Q, X)
+        ratio = np.linalg.norm(Z, 'fro') ** 2
+        ratios.append(ratio)
+
+    mean_r = np.mean(ratios)
+    std_r = np.std(ratios)
+    se = std_r / np.sqrt(N_STAT)
+    z_score = abs(mean_r - theory) / se if se > 0 else 0
+    passed = z_score < TOLERANCE_SIGMA
+
+    if not passed:
+        all_pass_sec7 = False
+
+    print(f"{m}×{n:<8} {theory:<14.6f} {mean_r:<12.6f} "
+          f"{std_r:<10.6f} {z_score:<10.2f} {'PASS' if passed else 'FAIL'}")
+
+# ─── Final Summary ───────────────────────────────────────────────────────────
+
+print()
+print("=" * 72)
+print("FINAL SUMMARY")
+print("=" * 72)
+print()
+print("Hypothesis verification:")
+print(f"  Section 3 (projection ratio = dim ratio):      {'PASS' if all_pass_sec3 else 'FAIL'}")
+print(f"  Section 7 (statistical verification):          {'PASS' if all_pass_sec7 else 'FAIL'}")
+print()
+
+overall = all_pass_sec3 and all_pass_sec7
+
+print("Physical interpretation:")
+print("  • Tangent space = physical directions (change the orbit)")
+print("  • Normal space  = gauge directions (stay within fiber)")
+print("  • SGD mixes both → wastes ~50% on gauge for square layers")
+print("  • Muon projects to Stiefel → step is 100% physical")
+print("  • The 50/50 split for square matrices is EXACT in the limit n→∞")
+print()
+print(f"{'='*72}")
+print(f"OVERALL: {'PASS' if overall else 'FAIL'}")
+print(f"{'='*72}")

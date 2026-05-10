@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""
+Axiom 0.5b -- Compare: ||ortho(M)||_F = sqrt(min(m,n)) vs ||M||_F (what changes?)
+
+ortho(M) has all singular values = 1, so ||ortho(M)||_F = sqrt(min(m,n))
+regardless of M.  If M has ||M||_F = 100 and min(m,n) = 10, then
+||ortho(M)||_F = sqrt(10) ~ 3.16.  The Frobenius norm SHRINKS by a factor
+of ||M||_F / sqrt(min(m,n)).
+
+This is the "normalization" that Muon does -- it rescales the step to a
+fixed Frobenius norm.  Compare with Adam's normalization and gradient
+clipping: each normalizes differently.
+
+Hypothesis:
+  - Muon normalizes to  ||Delta||_F = eta * sqrt(min(m,n))  (fixed, independent of grad)
+  - SGD normalizes to   ||Delta||_F = eta * ||grad||_F       (proportional to gradient)
+  - Adam normalizes to  ||Delta||_F ~ eta * sqrt(m*n)        (all coords ~ 1)
+  The fixed Frobenius norm under Muon is why it needs a different LR scale
+  than SGD -- the step is always the same "size" regardless of gradient.
+
+We verify:
+  1. ||ortho(M)||_F = sqrt(min(m,n)) across shapes and scales
+  2. The shrinkage/expansion factor: implicit gradient clipping + normalization
+  3. Three-way step size comparison (SGD vs Adam vs Muon)
+  4. Why Muon needs a different learning rate
+  5. Per-singular-value view of each optimizer's update
+  6. Statistical sweep: machine-precision verification
+"""
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+def sep(title: str) -> None:
+    """Print a section separator."""
+    print(f"\n{'=' * 72}")
+    print(f"  {title}")
+    print(f"{'=' * 72}\n")
+
+
+def subsep(title: str) -> None:
+    """Print a subsection separator."""
+    print(f"\n  {'-' * 66}")
+    print(f"    {title}")
+    print(f"  {'-' * 66}\n")
+
+
+def ortho(M: np.ndarray) -> np.ndarray:
+    """Compute the polar factor Q = U V^T via thin SVD."""
+    U, _s, Vt = np.linalg.svd(M, full_matrices=False)
+    return U @ Vt
+
+
+def pf(ok: bool) -> str:
+    """Return PASS or FAIL string."""
+    return "PASS" if ok else "FAIL"
+
+
+# Global tracking
+all_pass = True
+total_checks = 0
+total_failures = 0
+
+
+def check(condition: bool, label: str) -> bool:
+    """Record a pass/fail check."""
+    global all_pass, total_checks, total_failures
+    total_checks += 1
+    if not condition:
+        all_pass = False
+        total_failures += 1
+    print(f"    [{pf(condition)}]  {label}")
+    return condition
+
+
+# ===================================================================
+#  SECTION 1 -- Basic verification: ||ortho(M)||_F = sqrt(min(m,n))
+# ===================================================================
+
+sep("SECTION 1: Basic verification -- ||ortho(M)||_F = sqrt(min(m,n))")
+
+print("  Theory: ortho(M) = UV^T has min(m,n) singular values all = 1.")
+print("  Therefore ||ortho(M)||_F = sqrt(sum of sigma_i^2) = sqrt(min(m,n)).")
+print("  This holds for ANY nonzero M, regardless of ||M||_F.\n")
+
+rng = np.random.default_rng(42)
+tol = 1e-10
+
+shapes = [(3, 3), (5, 5), (10, 10), (100, 5), (5, 100), (50, 50), (1000, 3)]
+scales = [0.001, 1.0, 100.0, 10000.0]
+
+print(f"  {'Shape':>10s}  {'Scale':>8s}  {'||M||_F':>14s}  {'||ortho(M)||_F':>16s}  "
+      f"{'sqrt(min(m,n))':>16s}  {'Deviation':>12s}  Result")
+print(f"  {'-' * 10}  {'-' * 8}  {'-' * 14}  {'-' * 16}  {'-' * 16}  {'-' * 12}  {'-' * 6}")
+
+for (m, n) in shapes:
+    k = min(m, n)
+    expected = np.sqrt(k)
+    M_base = rng.standard_normal((m, n))
+
+    for scale in scales:
+        M = scale * M_base
+        Q = ortho(M)
+        norm_M = np.linalg.norm(M, 'fro')
+        norm_Q = np.linalg.norm(Q, 'fro')
+        dev = abs(norm_Q - expected)
+        ok = dev < tol
+
+        print(f"  {m:>4d}x{n:<4d}  {scale:>8.3f}  {norm_M:>14.4f}  {norm_Q:>16.12f}  "
+              f"{expected:>16.12f}  {dev:>12.2e}  {pf(ok)}")
+        check(ok, f"||ortho({scale}*M)||_F = sqrt({k}) for {m}x{n}")
+
+print()
+print("  Key finding: regardless of whether ||M||_F is 0.003 or 300000,")
+print("  ||ortho(M)||_F is ALWAYS exactly sqrt(min(m,n)).")
+print("  The ortho() operation is completely scale-invariant.\n")
+
+
+# ===================================================================
+#  SECTION 2 -- The shrinkage/expansion factor
+# ===================================================================
+
+sep("SECTION 2: Shrinkage/expansion factor -- implicit gradient clipping")
+
+print("  Ratio = ||M||_F / ||ortho(M)||_F = ||M||_F / sqrt(min(m,n))")
+print()
+print("  If ||M||_F >> sqrt(min(m,n)):  ratio >> 1  -> ortho SHRINKS the gradient")
+print("  If ||M||_F << sqrt(min(m,n)):  ratio << 1  -> ortho EXPANDS the gradient")
+print("  If ||M||_F  = sqrt(min(m,n)):  ratio  = 1  -> ortho preserves the norm")
+print()
+print("  This is implicit gradient clipping + normalization in ONE operation.")
+print("  No hyperparameter (clip threshold) needed -- ortho always maps to")
+print("  the Stiefel manifold at Frobenius norm = sqrt(min(m,n)).\n")
+
+subsep("2a. Shrinkage table")
+
+demo_shapes = [(10, 10), (100, 5), (50, 50), (1000, 3)]
+demo_scales = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 10000.0]
+
+print(f"  {'Shape':>10s}  {'||M||_F':>12s}  {'||ortho(M)||_F':>16s}  "
+      f"{'Ratio (shrink)':>16s}  {'Effect':>14s}")
+print(f"  {'-' * 10}  {'-' * 12}  {'-' * 16}  {'-' * 16}  {'-' * 14}")
+
+for (m, n) in demo_shapes:
+    k = min(m, n)
+    M_base = rng.standard_normal((m, n))
+    # Normalize M_base so that ||M_base||_F = 1, then scale
+    M_base = M_base / np.linalg.norm(M_base, 'fro')
+
+    for scale in demo_scales:
+        M = scale * M_base
+        Q = ortho(M)
+        norm_M = np.linalg.norm(M, 'fro')
+        norm_Q = np.linalg.norm(Q, 'fro')
+        ratio = norm_M / norm_Q
+
+        if ratio > 1.01:
+            effect = "SHRINKS"
+        elif ratio < 0.99:
+            effect = "EXPANDS"
+        else:
+            effect = "~preserves"
+
+        print(f"  {m:>4d}x{n:<4d}  {norm_M:>12.4f}  {norm_Q:>16.6f}  "
+              f"{ratio:>16.4f}x  {effect:>14s}")
+    print()
+
+print("  Implications:")
+print("    - Large gradients (e.g., early training, spikes) get SHRUNK ->")
+print("      acts like gradient clipping, prevents explosive updates.")
+print("    - Small gradients (e.g., near convergence) get EXPANDED ->")
+print("      maintains update magnitude, avoids vanishing steps.")
+print("    - This is why Muon is robust to gradient scale variations:\n"
+      "      the step size is geometrically fixed by the matrix shape.\n")
+
+
+# ===================================================================
+#  SECTION 3 -- Three-way step size comparison
+# ===================================================================
+
+sep("SECTION 3: Three-way step size comparison (SGD vs Adam vs Muon)")
+
+print("  For a random gradient G (10x10) with varying ||G||_F:\n")
+print("    SGD step:   Delta = eta * G")
+print("                ||Delta||_F = eta * ||G||_F          (linear in gradient)\n")
+print("    Adam step:  Delta = eta * G / (sqrt(G^2) + eps)")
+print("                ||Delta||_F ~ eta * sqrt(m*n)        (saturates for large G)\n")
+print("    Muon step:  Delta = eta * ortho(G)")
+print("                ||Delta||_F = eta * sqrt(min(m,n))   (constant always)\n")
+
+m_test, n_test = 10, 10
+eta_sgd = 0.01
+eta_adam = 0.001
+eta_muon = 0.02
+eps_adam = 1e-8
+
+# Generate a base gradient direction
+G_base = rng.standard_normal((m_test, n_test))
+G_base = G_base / np.linalg.norm(G_base, 'fro')  # unit Frobenius norm
+
+grad_norms = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+
+print(f"  Learning rates: eta_sgd = {eta_sgd}, eta_adam = {eta_adam}, eta_muon = {eta_muon}")
+print(f"  Shape: {m_test}x{n_test},  sqrt(min(m,n)) = {np.sqrt(min(m_test, n_test)):.4f},  "
+      f"sqrt(m*n) = {np.sqrt(m_test * n_test):.4f}")
+print()
+print(f"  {'||G||_F':>10s}  {'||SGD step||_F':>16s}  {'||Adam step||_F':>18s}  "
+      f"{'||Muon step||_F':>18s}")
+print(f"  {'-' * 10}  {'-' * 16}  {'-' * 18}  {'-' * 18}")
+
+for gn in grad_norms:
+    G = gn * G_base
+
+    # SGD
+    delta_sgd = eta_sgd * G
+    norm_sgd = np.linalg.norm(delta_sgd, 'fro')
+
+    # Adam (single-step approximation: m_t ~ G, v_t ~ G^2)
+    # In steady state, Adam step ~ eta * G / (|G| + eps)
+    delta_adam = eta_adam * G / (np.abs(G) + eps_adam)
+    norm_adam = np.linalg.norm(delta_adam, 'fro')
+
+    # Muon
+    delta_muon = eta_muon * ortho(G)
+    norm_muon = np.linalg.norm(delta_muon, 'fro')
+
+    print(f"  {gn:>10.2f}  {norm_sgd:>16.6f}  {norm_adam:>18.6f}  {norm_muon:>18.6f}")
+
+print()
+
+# Verify Muon step norm is constant
+expected_muon = eta_muon * np.sqrt(min(m_test, n_test))
+print(f"  Expected Muon step norm = eta * sqrt(min(m,n)) = "
+      f"{eta_muon} * {np.sqrt(min(m_test, n_test)):.4f} = {expected_muon:.6f}")
+print()
+
+for gn in grad_norms:
+    G = gn * G_base
+    delta_muon = eta_muon * ortho(G)
+    norm_muon = np.linalg.norm(delta_muon, 'fro')
+    dev = abs(norm_muon - expected_muon)
+    check(dev < tol,
+          f"||Muon step||_F = {expected_muon:.6f} for ||G||_F = {gn:.2f}  (dev = {dev:.2e})")
+
+print()
+print("  Summary:")
+print("    SGD:   ||Delta||_F grows linearly with ||G||_F.")
+print("           Small gradient -> tiny step.  Large gradient -> huge step.")
+print("    Adam:  ||Delta||_F saturates at ~ eta*sqrt(m*n) for large ||G||_F.")
+print("           Each coordinate becomes ~+/- eta, so total ~ eta*sqrt(#params).")
+print("    Muon:  ||Delta||_F = eta*sqrt(min(m,n)) ALWAYS.")
+print("           Completely decoupled from gradient magnitude.")
+print("           This is gradient clipping + normalization in one operation.\n")
+
+
+# ===================================================================
+#  SECTION 4 -- Why Muon needs a different learning rate
+# ===================================================================
+
+sep("SECTION 4: Why Muon needs a different learning rate")
+
+print("  Consider a 768 x 768 layer (typical transformer attention/MLP).")
+print("  Assume ||G||_F ~ 10 (a typical gradient norm during training).\n")
+
+d = 768
+G_norm_typical = 10.0
+
+# SGD
+eta_sgd_demo = 0.01
+sgd_step = eta_sgd_demo * G_norm_typical
+print(f"  SGD:  eta = {eta_sgd_demo},  ||G||_F ~ {G_norm_typical}")
+print(f"        ||Delta||_F = eta * ||G||_F = {eta_sgd_demo} * {G_norm_typical} = {sgd_step:.4f}")
+print()
+
+# Adam
+eta_adam_demo = 0.001
+adam_step = eta_adam_demo * np.sqrt(d * d)
+print(f"  Adam: eta = {eta_adam_demo},  shape = {d}x{d}")
+print(f"        ||Delta||_F ~ eta * sqrt(m*n) = {eta_adam_demo} * sqrt({d*d})")
+print(f"        = {eta_adam_demo} * {np.sqrt(d * d):.2f} = {adam_step:.4f}")
+print()
+
+# Muon
+eta_muon_demo = 0.02
+muon_step = eta_muon_demo * np.sqrt(d)
+print(f"  Muon: eta = {eta_muon_demo},  shape = {d}x{d}")
+print(f"        ||Delta||_F = eta * sqrt(min(m,n)) = {eta_muon_demo} * sqrt({d})")
+print(f"        = {eta_muon_demo} * {np.sqrt(d):.4f} = {muon_step:.4f}")
+print()
+
+print(f"  Step size comparison:")
+print(f"    SGD  step norm:  {sgd_step:.4f}")
+print(f"    Adam step norm:  {adam_step:.4f}")
+print(f"    Muon step norm:  {muon_step:.4f}")
+print()
+print(f"  Ratios:")
+print(f"    Muon / SGD  = {muon_step / sgd_step:.2f}x  "
+      f"(Muon takes ~{muon_step / sgd_step:.0f}x bigger steps at this gradient scale)")
+print(f"    Muon / Adam = {muon_step / adam_step:.4f}x  "
+      f"(Muon takes ~{muon_step / adam_step:.2f}x {'bigger' if muon_step > adam_step else 'smaller'} steps)")
+print(f"    Adam / SGD  = {adam_step / sgd_step:.2f}x")
+print()
+
+print("  Crucially, the step size dependencies are DIFFERENT:")
+print()
+print("    SGD:   depends on eta AND ||G||_F           -> must tune eta for each gradient regime")
+print("    Adam:  depends on eta AND shape (m*n)        -> eta scales with 1/sqrt(m*n)")
+print("    Muon:  depends on eta AND shape (min(m,n))   -> eta scales with 1/sqrt(min(m,n))")
+print()
+print("  This explains the empirical observations:")
+print("    - Muon uses higher LR than Adam (e.g., 0.02 vs 0.001) because")
+print("      sqrt(min(m,n)) << sqrt(m*n) for square matrices.")
+print("    - Muon's LR is insensitive to gradient magnitude (no gradient-dependent scaling).")
+print("    - The optimal LR for Muon depends primarily on the layer shape.\n")
+
+# Numerical demo for various layer sizes
+subsep("4a. Step norms across typical layer sizes")
+
+layer_shapes = [
+    (768, 768,    "Attention out / MLP square"),
+    (768, 3072,   "MLP up-projection"),
+    (3072, 768,   "MLP down-projection"),
+    (768, 64,     "Attention Q/K/V head"),
+    (1024, 1024,  "Large transformer layer"),
+    (2048, 512,   "Wide tall layer"),
+]
+
+print(f"  {'Layer':>30s}  {'Shape':>12s}  "
+      f"{'SGD ||D||':>10s}  {'Adam ||D||':>10s}  {'Muon ||D||':>10s}")
+print(f"  {'-' * 30}  {'-' * 12}  {'-' * 10}  {'-' * 10}  {'-' * 10}")
+
+for (m, n, desc) in layer_shapes:
+    sgd_n = 0.01 * 10.0  # eta=0.01, ||G||=10
+    adam_n = 0.001 * np.sqrt(m * n)
+    muon_n = 0.02 * np.sqrt(min(m, n))
+
+    print(f"  {desc:>30s}  {m:>5d}x{n:<5d}  "
+          f"{sgd_n:>10.4f}  {adam_n:>10.4f}  {muon_n:>10.4f}")
+
+print()
+print("  Notice:")
+print("    - SGD step is the SAME for all shapes (depends only on ||G||_F).")
+print("    - Adam step scales with sqrt(m*n) -- bigger layers get bigger steps.")
+print("    - Muon step scales with sqrt(min(m,n)) -- depends on the 'thin' dimension.")
+print("    - For rectangular layers (e.g., 768x3072), Adam and Muon differ significantly:\n"
+      "      Adam sees sqrt(768*3072) = sqrt(2.36M) ~ 1536,\n"
+      "      Muon sees sqrt(min(768,3072)) = sqrt(768) ~ 27.7.\n")
+
+
+# ===================================================================
+#  SECTION 5 -- Per-singular-value view
+# ===================================================================
+
+sep("SECTION 5: Per-singular-value view of each optimizer")
+
+print("  For a gradient G with specific singular values [10, 5, 1, 0.1, 0.001],")
+print("  we compare what each optimizer does to the singular value structure.\n")
+
+# Construct G with prescribed singular values
+target_svs = np.array([10.0, 5.0, 1.0, 0.1, 0.001])
+m_sv, n_sv = 5, 5
+
+# Build G = U @ diag(target_svs) @ Vt with random orthogonal U, V
+U_rand, _ = np.linalg.qr(rng.standard_normal((m_sv, m_sv)))
+V_rand, _ = np.linalg.qr(rng.standard_normal((n_sv, n_sv)))
+G_sv = U_rand @ np.diag(target_svs) @ V_rand.T
+
+# Verify construction
+sv_check = np.linalg.svd(G_sv, compute_uv=False)
+print(f"  Gradient G singular values (constructed):")
+for i, sv in enumerate(sv_check):
+    print(f"    sigma_{i+1} = {sv:.6f}  (target: {target_svs[i]:.6f})")
+print()
+
+eta = 0.01
+
+# SGD step: Delta = eta * G
+delta_sgd_sv = eta * G_sv
+sv_sgd = np.linalg.svd(delta_sgd_sv, compute_uv=False)
+
+# Adam step: Delta = eta * G / (|G| + eps)  (element-wise)
+delta_adam_sv = eta * G_sv / (np.abs(G_sv) + eps_adam)
+sv_adam = np.linalg.svd(delta_adam_sv, compute_uv=False)
+
+# Muon step: Delta = eta * ortho(G)
+delta_muon_sv = eta * ortho(G_sv)
+sv_muon = np.linalg.svd(delta_muon_sv, compute_uv=False)
+
+print(f"  Step singular values (eta = {eta}):\n")
+print(f"  {'Index':>5s}  {'G sigma':>10s}  {'SGD sigma':>12s}  "
+      f"{'Adam sigma':>12s}  {'Muon sigma':>12s}")
+print(f"  {'-' * 5}  {'-' * 10}  {'-' * 12}  {'-' * 12}  {'-' * 12}")
+
+for i in range(len(target_svs)):
+    print(f"  {i + 1:>5d}  {sv_check[i]:>10.6f}  {sv_sgd[i]:>12.8f}  "
+          f"{sv_adam[i]:>12.8f}  {sv_muon[i]:>12.8f}")
+
+print()
+print("  Analysis:")
+print()
+print("    SGD preserves the singular value RATIOS:")
+sv_ratio_sgd = sv_sgd / sv_sgd[0]
+sv_ratio_G = sv_check / sv_check[0]
+print(f"      G ratios:   {', '.join(f'{r:.4f}' for r in sv_ratio_G)}")
+print(f"      SGD ratios: {', '.join(f'{r:.4f}' for r in sv_ratio_sgd)}")
+ratio_match = np.allclose(sv_ratio_G, sv_ratio_sgd, atol=1e-10)
+check(ratio_match, "SGD preserves singular value ratios (Delta = eta*G)")
+print()
+
+print("    Adam DESTROYS the singular value structure:")
+print(f"      Adam singular values: {', '.join(f'{s:.6f}' for s in sv_adam)}")
+print("      Adam acts element-wise: large entries -> sign(entry)*eta,")
+print("      small entries -> entry/eps ~ 0.  The singular value ratios")
+print("      no longer match the gradient's singular value ratios.")
+sv_ratio_adam = sv_adam / sv_adam[0] if sv_adam[0] > 0 else sv_adam
+print(f"      G ratios:    {', '.join(f'{r:.4f}' for r in sv_ratio_G)}")
+print(f"      Adam ratios: {', '.join(f'{r:.4f}' for r in sv_ratio_adam)}")
+adam_ratios_differ = not np.allclose(sv_ratio_G, sv_ratio_adam, atol=0.01)
+check(adam_ratios_differ,
+      "Adam does NOT preserve singular value ratios (structure destroyed)")
+print()
+
+print("    Muon EQUALIZES all singular values to eta:")
+print(f"      Muon singular values: {', '.join(f'{s:.8f}' for s in sv_muon)}")
+expected_muon_sv = eta * 1.0  # ortho maps all singular values to 1
+muon_all_equal = np.allclose(sv_muon, expected_muon_sv, atol=tol)
+check(muon_all_equal,
+      f"Muon maps ALL singular values to eta = {eta}  "
+      f"(max dev = {np.max(np.abs(sv_muon - expected_muon_sv)):.2e})")
+print()
+
+print("  Geometric interpretation:")
+print("    - SGD: the update ellipsoid has the SAME shape as the gradient ellipsoid.")
+print("      Directions with large gradient get large updates (can cause oscillation).")
+print("    - Adam: the update ellipsoid is more spherical (coordinate-wise normalization).")
+print("      Each parameter gets a step of ~eta regardless of gradient magnitude.")
+print("    - Muon: the update is on the STIEFEL MANIFOLD -- a perfect sphere in")
+print("      singular-value space.  All directions get EQUAL update magnitude.")
+print("      This is the strongest form of 'democratic' gradient normalization.\n")
+
+
+# ===================================================================
+#  SECTION 6 -- Statistical sweep
+# ===================================================================
+
+sep("SECTION 6: Statistical sweep (500 matrices x 6 shapes)")
+
+sweep_shapes = [(3, 3), (10, 10), (50, 50), (100, 5), (5, 100), (1000, 3)]
+n_trials = 500
+sweep_tol = 1e-9
+
+print(f"  Verifying ||ortho(M)||_F = sqrt(min(m,n)) to machine precision")
+print(f"  across {n_trials} random matrices per shape.\n")
+
+# Also vary the scale of M to stress-test scale invariance
+sweep_scales = [1e-6, 1e-3, 1.0, 1e3, 1e6]
+
+print(f"  Each trial picks a random scale from {sweep_scales}")
+print(f"  to confirm ortho() is truly scale-invariant.\n")
+
+all_sweep_pass = True
+worst_global_dev = 0.0
+
+print(f"  {'Shape':>10s}  {'Trials':>8s}  {'Passed':>8s}  "
+      f"{'Worst deviation':>18s}  {'Rel to tol':>12s}  Result")
+print(f"  {'-' * 10}  {'-' * 8}  {'-' * 8}  {'-' * 18}  {'-' * 12}  {'-' * 6}")
+
+for (m, n) in sweep_shapes:
+    k = min(m, n)
+    expected = np.sqrt(k)
+    worst_dev = 0.0
+    n_pass_local = 0
+
+    for trial in range(n_trials):
+        scale = rng.choice(sweep_scales) * rng.uniform(0.5, 2.0)
+        M = scale * rng.standard_normal((m, n))
+        Q = ortho(M)
+        norm_Q = np.linalg.norm(Q, 'fro')
+        dev = abs(norm_Q - expected)
+        worst_dev = max(worst_dev, dev)
+        if dev < sweep_tol:
+            n_pass_local += 1
+
+    worst_global_dev = max(worst_global_dev, worst_dev)
+    shape_ok = worst_dev < sweep_tol
+    if not shape_ok:
+        all_sweep_pass = False
+
+    print(f"  {m:>4d}x{n:<4d}  {n_trials:>8d}  {n_pass_local:>8d}  "
+          f"{worst_dev:>18.2e}  {worst_dev / sweep_tol:>12.4f}x  {pf(shape_ok)}")
+    check(shape_ok,
+          f"All {n_trials} trials for {m}x{n}: worst dev = {worst_dev:.2e} < {sweep_tol:.0e}")
+
+print()
+print(f"  Global worst-case deviation: {worst_global_dev:.2e}")
+print(f"  Tolerance used:              {sweep_tol:.0e}")
+print()
+
+if all_sweep_pass:
+    print("  CONFIRMED: ||ortho(M)||_F = sqrt(min(m,n)) to machine precision")
+    print("  across ALL shapes, ALL scales, ALL 3000 trials.")
+else:
+    print("  WARNING: Some trials exceeded tolerance. See above.")
+print()
+
+
+# ===================================================================
+#  SECTION 7 -- Bonus: visualizing the normalization landscape
+# ===================================================================
+
+sep("SECTION 7: Normalization landscape -- how each optimizer responds to gradient scale")
+
+print("  Sweeping ||G||_F from 0.01 to 10000 for a 10x10 gradient.\n")
+print("  This table shows the full picture of how each optimizer")
+print("  transforms gradient magnitude into update magnitude.\n")
+
+m_land, n_land = 10, 10
+G_base_land = rng.standard_normal((m_land, n_land))
+G_base_land = G_base_land / np.linalg.norm(G_base_land, 'fro')
+
+eta_s, eta_a, eta_m = 0.01, 0.001, 0.02
+
+grad_sweep = np.logspace(-2, 4, 25)
+
+print(f"  {'||G||_F':>12s}  {'SGD ||D||':>12s}  {'Adam ||D||':>12s}  "
+      f"{'Muon ||D||':>12s}  {'Muon/SGD':>10s}  {'Muon/Adam':>10s}")
+print(f"  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 12}  {'-' * 10}  {'-' * 10}")
+
+for gn in grad_sweep:
+    G = gn * G_base_land
+
+    # SGD
+    norm_sgd_l = eta_s * np.linalg.norm(G, 'fro')
+
+    # Adam (steady-state approx)
+    delta_adam_l = eta_a * G / (np.abs(G) + eps_adam)
+    norm_adam_l = np.linalg.norm(delta_adam_l, 'fro')
+
+    # Muon
+    norm_muon_l = eta_m * np.sqrt(min(m_land, n_land))
+
+    r_ms = norm_muon_l / norm_sgd_l if norm_sgd_l > 0 else float('inf')
+    r_ma = norm_muon_l / norm_adam_l if norm_adam_l > 0 else float('inf')
+
+    print(f"  {gn:>12.4f}  {norm_sgd_l:>12.6f}  {norm_adam_l:>12.6f}  "
+          f"{norm_muon_l:>12.6f}  {r_ms:>10.4f}  {r_ma:>10.4f}")
+
+print()
+print("  Key observations:")
+print("    - SGD column: grows linearly (doubles when ||G|| doubles).")
+print("    - Adam column: saturates near eta*sqrt(m*n) for large ||G||.")
+print("    - Muon column: FLAT LINE. Always the same value.")
+print()
+print("    At small ||G|| (e.g., 0.01):")
+print("      SGD takes a tiny step, Adam takes a moderate step,")
+print("      Muon takes a FULL-SIZE step (possibly too aggressive without warmup).")
+print()
+print("    At large ||G|| (e.g., 10000):")
+print("      SGD explodes, Adam saturates, Muon is unchanged.")
+print("      This is why Muon is robust to gradient spikes.\n")
+
+
+# ===================================================================
+#  FINAL VERDICT
+# ===================================================================
+
+sep("FINAL VERDICT")
+
+print(f"  Total checks:   {total_checks}")
+print(f"  Total failures: {total_failures}")
+print()
+
+if all_pass:
+    print("  ============================================")
+    print("  =            ALL TESTS PASSED              =")
+    print("  ============================================")
+    print()
+    print("  Axiom 0.5b VERIFIED:")
+    print()
+    print("  1. ||ortho(M)||_F = sqrt(min(m,n)) for ALL tested shapes and scales.")
+    print("     This is exact to machine precision (~1e-14) and completely independent")
+    print("     of ||M||_F (tested from 1e-6 to 1e+6 scale).")
+    print()
+    print("  2. The shrinkage factor ||M||_F / ||ortho(M)||_F shows that ortho()")
+    print("     acts as IMPLICIT GRADIENT CLIPPING + NORMALIZATION in one operation.")
+    print("     Large gradients are shrunk, small gradients are expanded.")
+    print()
+    print("  3. Three-way step size comparison confirmed:")
+    print("     - SGD:  ||Delta||_F = eta * ||G||_F           (proportional to gradient)")
+    print("     - Adam: ||Delta||_F ~ eta * sqrt(m*n)         (saturates)")
+    print("     - Muon: ||Delta||_F = eta * sqrt(min(m,n))    (CONSTANT)")
+    print()
+    print("  4. Muon needs a DIFFERENT learning rate because:")
+    print("     - The update norm depends on sqrt(min(m,n)), not ||G||_F or sqrt(m*n).")
+    print("     - For a 768x768 layer: SGD step ~ 0.1, Adam step ~ 0.768,")
+    print("       Muon step ~ 0.554 (with their typical LRs).")
+    print("     - The LR must compensate for the fundamentally different normalization.")
+    print()
+    print("  5. Per-singular-value analysis:")
+    print("     - SGD preserves the gradient's singular value ratios (faithful scaling).")
+    print("     - Adam collapses the condition number (coordinate-wise normalization).")
+    print("     - Muon EQUALIZES all singular values (strongest democratic normalization).")
+    print()
+    print("  6. Statistical sweep: 3000 matrices across 6 shapes confirm the property")
+    print("     holds to machine precision for all shapes and scales.")
+    print()
+    print("  BOTTOM LINE: Muon's ortho() is a one-shot operation that simultaneously")
+    print("  clips gradients, normalizes their Frobenius norm, and equalizes all")
+    print("  singular values. This explains why Muon uses different LR schedules and")
+    print("  why it is inherently robust to gradient magnitude variations.")
+else:
+    print("  ============================================")
+    print("  =          SOME TESTS FAILED               =")
+    print("  ============================================")
+    print()
+    print(f"  Axiom 0.5b: {total_failures}/{total_checks} checks failed.")
+    print("  See details above.")
+
+print()
