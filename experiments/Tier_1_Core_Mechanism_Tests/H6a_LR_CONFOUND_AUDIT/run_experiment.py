@@ -1,45 +1,36 @@
 #!/usr/bin/env python3
 """
-H6a: LR CONFOUND AUDIT OF D-TEST — THE PAPER'S CREDIBILITY DEPENDS ON THIS
-=============================================================================
+H6a: LR confound audit of the D-TEST depth-scaling claim
+=========================================================
 
-CONTEXT:
-  D-TEST claimed O(T * kappa^L) vs O(T) complexity separation with R^2=0.91.
-  It used:
-    - SGD LR tuned per depth as lr = 2/(lambda_max * L)
-    - Muon LR fixed at 0.005
+This module runs a discrete learning-rate audit in the original 32x32 deep-linear
+regression setting and compares two protocols:
 
-  H6 showed the 130x curvature rescaling was entirely an LR artifact.
-  This experiment applies the same audit to D-TEST.
+1. A convergence-aware per-depth LR sweep for both SGD and Muon.
+2. A D-TEST-style replica with formula SGD LR and fixed Muon LR.
 
-CONCERN:
-  - SGD's optimal LR may change MORE with depth than the formula gives
-  - Muon's optimal LR may also change with depth but was fixed
-  - The depth exponent (1.10x per layer) could be a LR mismatch growing with depth
+Measured outputs are limited to this setting and include:
+- per-LR final losses across seeds
+- convergence counts and fractions
+- selected best LRs under the discrete sweep
+- log(advantage) vs depth linear fits
+- temporal advantage at selected training steps
 
-PROTOCOL:
-  For each depth L in {2, 4, 8, 16}:
-    For each optimizer (SGD, Muon):
-      Sweep 7 LR candidates, 3 seeds each.
-      Find best LR by median final loss.
-    Compute advantage = best_SGD_loss / best_Muon_loss
-
-  Fit log(advantage) vs L.
-  Compare R^2 with D-TEST's R^2=0.91.
-
-VERDICT:
-  If R^2 drops below 0.5 or exponent flattens => D-TEST was an LR confound
-  If R^2 stays >0.8 and exponent is similar => D-TEST survives the audit
+This experiment does not, by itself, measure asymptotic complexity classes or
+establish RG / gauge-fixing mechanisms. It is a deep-linear LR-confound audit
+under the specific sweep grids defined below.
 """
 
-import numpy as np
-import os
+from pathlib import Path
 import time
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+import numpy as np
+
+SCRIPT_PATH = Path(__file__).resolve()
+SCRIPT_DIR = SCRIPT_PATH.parent
 
 # =============================================================================
-# CONFIGURATION — matches D-TEST setup
+# CONFIGURATION — preserve the original deep-linear audit setup
 # =============================================================================
 
 DIM = 32
@@ -50,17 +41,24 @@ NS_ITERS = 5
 BATCH_SIZE = 64
 NUM_SEEDS = 3
 
-# LR sweep ranges — extended to avoid hitting sweep boundaries
 SGD_LRS = [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2]
 MUON_LRS = [0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02]
+
+MEASUREMENT_STEPS = [50, 100, 150, 200, 250, 300]
+DTEST_MUON_LR = 0.005
+SEED_BASE = 42
+SEED_STRIDE = 137
+INIT_SEED_OFFSET = 5000
+DIVERGENCE_THRESHOLD = 1e10
 
 
 # =============================================================================
 # NETWORK AND TRAINING UTILITIES
 # =============================================================================
 
+
 def newton_schulz(M, n_iters=NS_ITERS):
-    """Newton-Schulz iteration for orthogonal polar factor."""
+    """Newton-Schulz iteration for an orthogonal polar factor."""
     norm = np.linalg.norm(M, ord='fro')
     if norm < 1e-15:
         return M
@@ -71,19 +69,22 @@ def newton_schulz(M, n_iters=NS_ITERS):
     return X
 
 
+
 def init_weights(dim, depth, seed):
     """Initialize near identity for stability (same as D-TEST)."""
     rng = np.random.RandomState(seed)
     return [np.eye(dim) + rng.randn(dim, dim) * 0.1 for _ in range(depth)]
 
 
-def make_data(dim, seed):
+
+def make_data(dim, seed, batch_size=BATCH_SIZE):
     """Generate target matrix and data (same as D-TEST: single random target)."""
     rng = np.random.RandomState(seed)
     W_target = rng.randn(dim, dim) * 0.5
-    X = rng.randn(dim, BATCH_SIZE) * 0.3
+    X = rng.randn(dim, batch_size) * 0.3
     Y = W_target @ X
     return X, Y
+
 
 
 def forward(weights, X):
@@ -93,10 +94,12 @@ def forward(weights, X):
     return out
 
 
+
 def compute_loss(weights, X, Y):
     pred = forward(weights, X)
     diff = pred - Y
     return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
+
 
 
 def compute_gradients(weights, X, Y):
@@ -114,6 +117,7 @@ def compute_gradients(weights, X, Y):
     return grads
 
 
+
 def train(weights_init, X, Y, lr, optimizer, n_steps=NUM_STEPS):
     """Train and return (final_loss, loss_history)."""
     weights = [W.copy() for W in weights_init]
@@ -123,18 +127,17 @@ def train(weights_init, X, Y, lr, optimizer, n_steps=NUM_STEPS):
     for step in range(n_steps):
         loss = compute_loss(weights, X, Y)
         losses.append(loss)
-        if not np.isfinite(loss) or loss > 1e10:
-            # Fill rest with inf
+        if not np.isfinite(loss) or loss > DIVERGENCE_THRESHOLD:
             losses.extend([float('inf')] * (n_steps - step))
             return float('inf'), losses
 
         grads = compute_gradients(weights, X, Y)
         for i in range(len(weights)):
             if optimizer == 'muon':
-                ortho_g = newton_schulz(grads[i])
-                mom[i] = MOMENTUM * mom[i] + ortho_g
+                grad_update = newton_schulz(grads[i])
             else:
-                mom[i] = MOMENTUM * mom[i] + grads[i]
+                grad_update = grads[i]
+            mom[i] = MOMENTUM * mom[i] + grad_update
             weights[i] = weights[i] - lr * mom[i]
 
     final_loss = compute_loss(weights, X, Y)
@@ -143,8 +146,9 @@ def train(weights_init, X, Y, lr, optimizer, n_steps=NUM_STEPS):
 
 
 # =============================================================================
-# D-TEST's original LR selection for SGD (for comparison)
+# D-TEST comparison utility
 # =============================================================================
+
 
 def dtest_sgd_lr(depth, X, Y):
     """Replicate D-TEST's lr = 2/(lambda_max * L) formula."""
@@ -165,462 +169,737 @@ def dtest_sgd_lr(depth, X, Y):
 
 
 # =============================================================================
+# RESULT HELPERS
+# =============================================================================
+
+
+def make_seeds(num_seeds=NUM_SEEDS, base=SEED_BASE, stride=SEED_STRIDE):
+    return [base + i * stride for i in range(num_seeds)]
+
+
+
+def expected_training_call_counts(config):
+    num_depths = len(config['depths'])
+    num_seeds = config['num_seeds']
+    sweep_runs = num_depths * (len(config['sgd_lrs']) + len(config['muon_lrs'])) * num_seeds
+    dtest_replica_runs = num_depths * num_seeds * 2
+    temporal_runs = num_depths * num_seeds * 2
+    return {
+        'sweep_runs': sweep_runs,
+        'dtest_replica_runs': dtest_replica_runs,
+        'temporal_runs': temporal_runs,
+        'total_training_calls': sweep_runs + dtest_replica_runs + temporal_runs,
+    }
+
+
+
+def get_default_config():
+    config = {
+        'dim': DIM,
+        'depths': list(DEPTHS),
+        'num_steps': NUM_STEPS,
+        'momentum': MOMENTUM,
+        'ns_iters': NS_ITERS,
+        'batch_size': BATCH_SIZE,
+        'num_seeds': NUM_SEEDS,
+        'sgd_lrs': list(SGD_LRS),
+        'muon_lrs': list(MUON_LRS),
+        'measurement_steps': list(MEASUREMENT_STEPS),
+        'dtest_muon_lr': DTEST_MUON_LR,
+        'seed_base': SEED_BASE,
+        'seed_stride': SEED_STRIDE,
+        'init_seed_offset': INIT_SEED_OFFSET,
+        'divergence_threshold': DIVERGENCE_THRESHOLD,
+        'selection_rule': (
+            'Prefer higher convergence count, then lower median finite final loss, '
+            'then lower LR as a deterministic tie-break.'
+        ),
+        'scope_note': (
+            'Deep-linear LR-confound audit under discrete sweep grids; not a direct '
+            'test of asymptotic complexity classes or RG / gauge observables.'
+        ),
+        'script_path': str(SCRIPT_PATH),
+        'experiment_dir': str(SCRIPT_DIR),
+    }
+    config['expected_training_calls'] = expected_training_call_counts(config)
+    return config
+
+
+
+def summarize_final_losses(final_losses, num_seeds):
+    finite_losses = [float(loss) for loss in final_losses if np.isfinite(loss)]
+    converged_count = len(finite_losses)
+    if finite_losses:
+        median_loss = float(np.median(finite_losses))
+        mean_loss = float(np.mean(finite_losses))
+        std_loss = float(np.std(finite_losses))
+        sem_loss = float(np.std(finite_losses, ddof=1) / np.sqrt(len(finite_losses))) if len(finite_losses) > 1 else 0.0
+    else:
+        median_loss = float('inf')
+        mean_loss = float('inf')
+        std_loss = float('inf')
+        sem_loss = float('inf')
+
+    return {
+        'final_losses': [float(loss) if np.isfinite(loss) else float('inf') for loss in final_losses],
+        'finite_final_losses': finite_losses,
+        'converged_count': converged_count,
+        'convergence_fraction': converged_count / num_seeds,
+        'median_finite_loss': median_loss,
+        'mean_finite_loss': mean_loss,
+        'std_finite_loss': std_loss,
+        'sem_finite_loss': sem_loss,
+        'all_converged': converged_count == num_seeds,
+        'any_converged': bool(finite_losses),
+    }
+
+
+
+def select_best_lr(lr_results, lr_grid):
+    """
+    Select the best LR using a convergence-aware rule.
+
+    Preferred policy:
+      1. maximize converged seeds
+      2. minimize median finite loss
+      3. minimize LR as a deterministic tie-break
+
+    Also return the legacy median-over-finite-only selection for transparency.
+    """
+    if not lr_results:
+        raise ValueError('select_best_lr received an empty lr_results list')
+
+    max_converged = max(result['converged_count'] for result in lr_results)
+    convergence_candidates = [result for result in lr_results if result['converged_count'] == max_converged]
+    selected = min(convergence_candidates, key=lambda result: (result['median_finite_loss'], result['lr']))
+    legacy_selected = min(lr_results, key=lambda result: (result['median_finite_loss'], result['lr']))
+
+    def annotate(result, policy_name):
+        annotated = dict(result)
+        annotated['selection_policy'] = policy_name
+        annotated['boundary_hit'] = annotated['lr'] in (lr_grid[0], lr_grid[-1])
+        annotated['grid_min_lr'] = lr_grid[0]
+        annotated['grid_max_lr'] = lr_grid[-1]
+        annotated['grid_size'] = len(lr_grid)
+        return annotated
+
+    selected_annotated = annotate(selected, 'convergence_first_then_median_finite')
+    legacy_annotated = annotate(legacy_selected, 'median_finite_only')
+
+    return {
+        'selected': selected_annotated,
+        'legacy_selected': legacy_annotated,
+        'selection_changed_vs_legacy': (
+            selected_annotated['lr'] != legacy_annotated['lr']
+            or selected_annotated['converged_count'] != legacy_annotated['converged_count']
+        ),
+    }
+
+
+
+def compute_advantage_summary(depth, sgd_summary, muon_summary, label):
+    sgd_loss = sgd_summary['median_finite_loss']
+    muon_loss = muon_summary['median_finite_loss']
+    if np.isfinite(sgd_loss) and np.isfinite(muon_loss) and muon_loss > 1e-30:
+        advantage = float(sgd_loss / muon_loss)
+        log_advantage = float(np.log(advantage))
+    else:
+        advantage = float('inf')
+        log_advantage = float('inf')
+
+    return {
+        'protocol': label,
+        'depth': depth,
+        'sgd_lr': float(sgd_summary['lr']),
+        'muon_lr': float(muon_summary['lr']),
+        'sgd_summary': dict(sgd_summary),
+        'muon_summary': dict(muon_summary),
+        'advantage': advantage,
+        'log_advantage': log_advantage,
+        'valid_for_fit': np.isfinite(log_advantage),
+    }
+
+
+
+def linear_fit(depths, log_advantages, label):
+    if len(depths) < 2:
+        return {
+            'label': label,
+            'n_points': len(depths),
+            'depths': [int(depth) for depth in depths],
+            'log_advantages': [float(value) for value in log_advantages],
+            'slope': 0.0,
+            'intercept': 0.0,
+            'r2': 0.0,
+            'per_layer_factor': 1.0,
+            'predicted_log_advantages': [],
+            'residuals': [],
+            'valid': False,
+        }
+
+    d = np.array(depths, dtype=float)
+    y = np.array(log_advantages, dtype=float)
+    A = np.vstack([d, np.ones(len(d))]).T
+    slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+    predicted = slope * d + intercept
+    ss_res = np.sum((y - predicted) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1.0 - ss_res / (ss_tot + 1e-15) if ss_tot > 1e-15 else 0.0
+
+    return {
+        'label': label,
+        'n_points': len(depths),
+        'depths': [int(depth) for depth in d.tolist()],
+        'log_advantages': [float(value) for value in y.tolist()],
+        'slope': float(slope),
+        'intercept': float(intercept),
+        'r2': float(r2),
+        'per_layer_factor': float(np.exp(slope)),
+        'predicted_log_advantages': [float(value) for value in predicted.tolist()],
+        'residuals': [float(value) for value in (y - predicted).tolist()],
+        'valid': True,
+    }
+
+
+# =============================================================================
 # MAIN EXPERIMENT
 # =============================================================================
 
-def main():
+
+def run_experiment(verbose=True):
+    config = get_default_config()
+    seeds = make_seeds(config['num_seeds'], config['seed_base'], config['seed_stride'])
+    expected_calls = config['expected_training_calls']
+
     t_start = time.time()
-    seeds = [42 + i * 137 for i in range(NUM_SEEDS)]
-    total_runs = len(DEPTHS) * (len(SGD_LRS) + len(MUON_LRS)) * NUM_SEEDS
-    run_count = 0
+    training_calls = 0
 
-    print()
-    print("=" * 110)
-    print("  H6a: LR CONFOUND AUDIT OF D-TEST DEPTH SCALING")
-    print("  THE PAPER'S CREDIBILITY DEPENDS ON THIS RESULT")
-    print("=" * 110)
-    print()
-    print(f"  Setup: {DIM}x{DIM} deep linear, {NUM_STEPS} steps, {NUM_SEEDS} seeds")
-    print(f"  Depths: {DEPTHS}")
-    print(f"  SGD LR sweep:  {SGD_LRS}")
-    print(f"  Muon LR sweep: {MUON_LRS}")
-    print(f"  Total training runs: {total_runs}")
-    print()
+    if verbose:
+        print()
+        print('=' * 110)
+        print('  H6a: LR CONFOUND AUDIT OF THE D-TEST DEPTH-SCALING CLAIM')
+        print('=' * 110)
+        print()
+        print('  Scope: deep-linear LR-confound audit under discrete LR sweeps.')
+        print(f"  Not directly measured: complexity classes or RG / gauge observables.")
+        print()
+        print(f"  Setup: {config['dim']}x{config['dim']} deep linear, {config['num_steps']} steps, {config['num_seeds']} seeds")
+        print(f"  Depths: {config['depths']}")
+        print(f"  SGD LR sweep:  {config['sgd_lrs']}")
+        print(f"  Muon LR sweep: {config['muon_lrs']}")
+        print(f"  Measurement steps: {config['measurement_steps']}")
+        print(f"  Selection rule: {config['selection_rule']}")
+        print(f"  Expected training calls: {expected_calls['total_training_calls']}")
+        print()
+        print('  Phase 1: sweeping LRs ...')
+        print()
 
-    # =========================================================================
-    # PHASE 1: Full LR sweep for both optimizers at every depth
-    # =========================================================================
+    sweep = {}
+    best_by_depth = []
+    legacy_selection_differences = []
 
-    # results[depth][optimizer][lr] = list of final losses across seeds
-    results = {}
+    for depth in config['depths']:
+        sweep[depth] = {}
+        if verbose:
+            print(f"  --- Depth L={depth} ---")
 
-    for depth in DEPTHS:
-        print(f"  --- Depth L={depth} ---")
-        results[depth] = {'sgd': {}, 'muon': {}}
+        for optimizer, lr_grid in [('sgd', config['sgd_lrs']), ('muon', config['muon_lrs'])]:
+            lr_results = []
+            for lr in lr_grid:
+                final_losses = []
+                for seed in seeds:
+                    X, Y = make_data(config['dim'], seed, batch_size=config['batch_size'])
+                    weights_init = init_weights(config['dim'], depth, seed + config['init_seed_offset'])
+                    final_loss, _ = train(weights_init, X, Y, lr, optimizer, n_steps=config['num_steps'])
+                    final_losses.append(final_loss)
+                    training_calls += 1
 
-        # Generate data (fixed per seed, independent of depth for fair comparison)
-        # But depth affects the problem structure, so we use a common data seed
-        for opt_name, lr_list in [('sgd', SGD_LRS), ('muon', MUON_LRS)]:
-            for lr in lr_list:
-                seed_losses = []
-                for s in seeds:
-                    X, Y = make_data(DIM, s)
-                    w_init = init_weights(DIM, depth, s + 5000)
-                    final_loss, _ = train(w_init, X, Y, lr, opt_name)
-                    seed_losses.append(final_loss)
-                    run_count += 1
+                loss_summary = summarize_final_losses(final_losses, config['num_seeds'])
+                lr_results.append({
+                    'lr': float(lr),
+                    **loss_summary,
+                })
 
-                results[depth][opt_name][lr] = seed_losses
-                finite = [l for l in seed_losses if np.isfinite(l)]
-                median_l = np.median(finite) if finite else float('inf')
+            selection = select_best_lr(lr_results, lr_grid)
+            best_summary = selection['selected']
+            legacy_best_summary = selection['legacy_selected']
 
-            # Print progress
-            best_lr_for_opt = None
-            best_median = float('inf')
-            for lr in lr_list:
-                finite = [l for l in results[depth][opt_name][lr] if np.isfinite(l)]
-                med = np.median(finite) if finite else float('inf')
-                if med < best_median:
-                    best_median = med
-                    best_lr_for_opt = lr
-            print(f"    {opt_name.upper():>5}: best_lr={best_lr_for_opt:.4f}  "
-                  f"median_loss={best_median:.6e}  "
-                  f"({run_count}/{total_runs} runs done)")
-
-    elapsed = time.time() - t_start
-    print(f"\n  All sweeps complete in {elapsed:.1f}s ({total_runs} runs)")
-
-    # =========================================================================
-    # PHASE 2: Extract best LR and loss for each (depth, optimizer)
-    # =========================================================================
-
-    print()
-    print("=" * 110)
-    print("  PHASE 2: BEST LR PER DEPTH AND OPTIMIZER")
-    print("=" * 110)
-    print()
-
-    best = {}  # best[depth][optimizer] = {'lr': ..., 'median_loss': ..., 'mean_loss': ..., 'losses': [...]}
-
-    for depth in DEPTHS:
-        best[depth] = {}
-        for opt_name, lr_list in [('sgd', SGD_LRS), ('muon', MUON_LRS)]:
-            best_lr = None
-            best_median = float('inf')
-            for lr in lr_list:
-                finite = [l for l in results[depth][opt_name][lr] if np.isfinite(l)]
-                if finite:
-                    med = np.median(finite)
-                    if med < best_median:
-                        best_median = med
-                        best_lr = lr
-            finite_best = [l for l in results[depth][opt_name][best_lr] if np.isfinite(l)]
-            best[depth][opt_name] = {
-                'lr': best_lr,
-                'median_loss': best_median,
-                'mean_loss': np.mean(finite_best) if finite_best else float('inf'),
-                'losses': results[depth][opt_name][best_lr],
+            sweep[depth][optimizer] = {
+                'lr_results': lr_results,
+                'best': best_summary,
+                'legacy_best': legacy_best_summary,
             }
 
-    # Print the table
-    print(f"  {'Depth':>5} | {'Best SGD LR':>12} {'SGD loss':>14} | "
-          f"{'Best Muon LR':>12} {'Muon loss':>14} | "
-          f"{'Advantage':>12} {'log(adv)':>10}")
-    print(f"  {'':->5}-+-{'':->12}-{'':->14}-+-{'':->12}-{'':->14}-+-{'':->12}-{'':->10}")
+            if selection['selection_changed_vs_legacy']:
+                legacy_selection_differences.append({
+                    'depth': depth,
+                    'optimizer': optimizer,
+                    'selected_lr': best_summary['lr'],
+                    'selected_converged_count': best_summary['converged_count'],
+                    'selected_median_finite_loss': best_summary['median_finite_loss'],
+                    'legacy_lr': legacy_best_summary['lr'],
+                    'legacy_converged_count': legacy_best_summary['converged_count'],
+                    'legacy_median_finite_loss': legacy_best_summary['median_finite_loss'],
+                })
 
-    depth_arr = []
-    log_advantage_arr = []
-    advantage_arr = []
+            if verbose:
+                print(
+                    f"    {optimizer.upper():>5}: selected_lr={best_summary['lr']:.4f}  "
+                    f"converged={best_summary['converged_count']}/{config['num_seeds']}  "
+                    f"median_finite_loss={best_summary['median_finite_loss']:.6e}"
+                )
+                if selection['selection_changed_vs_legacy']:
+                    print(
+                        f"           legacy median-only would pick lr={legacy_best_summary['lr']:.4f} "
+                        f"with {legacy_best_summary['converged_count']}/{config['num_seeds']} converged"
+                    )
 
-    for depth in DEPTHS:
-        sgd_l = best[depth]['sgd']['median_loss']
-        muon_l = best[depth]['muon']['median_loss']
-        sgd_lr = best[depth]['sgd']['lr']
-        muon_lr = best[depth]['muon']['lr']
+        sgd_best = sweep[depth]['sgd']['best']
+        muon_best = sweep[depth]['muon']['best']
+        sgd_legacy = sweep[depth]['sgd']['legacy_best']
+        muon_legacy = sweep[depth]['muon']['legacy_best']
+        advantage_summary = compute_advantage_summary(depth, sgd_best, muon_best, 'swept')
+        best_by_depth.append({
+            'depth': depth,
+            'sgd_best_lr': sgd_best['lr'],
+            'sgd_converged_count': sgd_best['converged_count'],
+            'sgd_convergence_fraction': sgd_best['convergence_fraction'],
+            'sgd_median_finite_loss': sgd_best['median_finite_loss'],
+            'sgd_mean_finite_loss': sgd_best['mean_finite_loss'],
+            'sgd_sem_finite_loss': sgd_best['sem_finite_loss'],
+            'sgd_boundary_hit': sgd_best['boundary_hit'],
+            'sgd_legacy_lr': sgd_legacy['lr'],
+            'sgd_legacy_converged_count': sgd_legacy['converged_count'],
+            'sgd_legacy_median_finite_loss': sgd_legacy['median_finite_loss'],
+            'sgd_selection_changed_vs_legacy': sgd_best['lr'] != sgd_legacy['lr'],
+            'muon_best_lr': muon_best['lr'],
+            'muon_converged_count': muon_best['converged_count'],
+            'muon_convergence_fraction': muon_best['convergence_fraction'],
+            'muon_median_finite_loss': muon_best['median_finite_loss'],
+            'muon_mean_finite_loss': muon_best['mean_finite_loss'],
+            'muon_sem_finite_loss': muon_best['sem_finite_loss'],
+            'muon_boundary_hit': muon_best['boundary_hit'],
+            'muon_legacy_lr': muon_legacy['lr'],
+            'muon_legacy_converged_count': muon_legacy['converged_count'],
+            'muon_legacy_median_finite_loss': muon_legacy['median_finite_loss'],
+            'muon_selection_changed_vs_legacy': muon_best['lr'] != muon_legacy['lr'],
+            'advantage': advantage_summary['advantage'],
+            'log_advantage': advantage_summary['log_advantage'],
+            'valid_for_fit': advantage_summary['valid_for_fit'],
+        })
 
-        if muon_l > 1e-30 and np.isfinite(sgd_l) and np.isfinite(muon_l):
-            advantage = sgd_l / muon_l
-            log_adv = np.log(advantage)
-            depth_arr.append(depth)
-            log_advantage_arr.append(log_adv)
-            advantage_arr.append(advantage)
-        else:
-            advantage = float('inf')
-            log_adv = float('inf')
+    sweep_elapsed = time.time() - t_start
 
-        print(f"  {depth:>5} | {sgd_lr:>12.4f} {sgd_l:>14.6e} | "
-              f"{muon_lr:>12.4f} {muon_l:>14.6e} | "
-              f"{advantage:>12.2f}x {log_adv:>10.4f}")
+    swept_advantage = []
+    swept_depths = []
+    swept_log_advantages = []
+    for row in best_by_depth:
+        summary = {
+            'protocol': 'swept',
+            'depth': row['depth'],
+            'sgd_lr': row['sgd_best_lr'],
+            'muon_lr': row['muon_best_lr'],
+            'advantage': row['advantage'],
+            'log_advantage': row['log_advantage'],
+            'valid_for_fit': row['valid_for_fit'],
+        }
+        swept_advantage.append(summary)
+        if row['valid_for_fit']:
+            swept_depths.append(row['depth'])
+            swept_log_advantages.append(row['log_advantage'])
 
-    # =========================================================================
-    # PHASE 3: D-TEST COMPARISON — original fixed-LR results
-    # =========================================================================
+    dtest_replica = []
+    dtest_depths = []
+    dtest_log_advantages = []
 
-    print()
-    print("=" * 110)
-    print("  PHASE 3: D-TEST COMPARISON (ORIGINAL FIXED-LR PROTOCOL)")
-    print("=" * 110)
-    print()
+    for depth in config['depths']:
+        sgd_losses = []
+        muon_losses = []
+        sgd_formula_lrs = []
 
-    # Replicate D-TEST: fixed Muon LR=0.005, SGD LR from formula
-    dtest_depth_arr = []
-    dtest_log_adv_arr = []
-    dtest_advantage_arr = []
+        for seed in seeds:
+            X, Y = make_data(config['dim'], seed, batch_size=config['batch_size'])
+            weights_init = init_weights(config['dim'], depth, seed + config['init_seed_offset'])
+            sgd_lr_formula = float(dtest_sgd_lr(depth, X, Y))
+            sgd_formula_lrs.append(sgd_lr_formula)
 
-    print(f"  {'Depth':>5} | {'D-TEST SGD LR':>14} {'SGD loss':>14} | "
-          f"{'D-TEST Muon LR':>14} {'Muon loss':>14} | "
-          f"{'Advantage':>12} {'log(adv)':>10}")
-    print(f"  {'':->5}-+-{'':->14}-{'':->14}-+-{'':->14}-{'':->14}-+-{'':->12}-{'':->10}")
+            final_loss_sgd, _ = train(weights_init, X, Y, sgd_lr_formula, 'sgd', n_steps=config['num_steps'])
+            sgd_losses.append(final_loss_sgd)
+            training_calls += 1
 
-    DTEST_MUON_LR = 0.005
+            final_loss_muon, _ = train(weights_init, X, Y, config['dtest_muon_lr'], 'muon', n_steps=config['num_steps'])
+            muon_losses.append(final_loss_muon)
+            training_calls += 1
 
-    for depth in DEPTHS:
-        sgd_losses_dtest = []
-        muon_losses_dtest = []
-        for s in seeds:
-            X, Y = make_data(DIM, s)
-            w_init = init_weights(DIM, depth, s + 5000)
-            sgd_lr_dtest = dtest_sgd_lr(depth, X, Y)
+        sgd_summary = {
+            'lr': float(np.median(sgd_formula_lrs)),
+            **summarize_final_losses(sgd_losses, config['num_seeds']),
+            'formula_lrs_by_seed': [float(lr) for lr in sgd_formula_lrs],
+            'formula_lr_mean': float(np.mean(sgd_formula_lrs)),
+            'formula_lr_median': float(np.median(sgd_formula_lrs)),
+            'formula_lr_min': float(np.min(sgd_formula_lrs)),
+            'formula_lr_max': float(np.max(sgd_formula_lrs)),
+        }
+        muon_summary = {
+            'lr': float(config['dtest_muon_lr']),
+            **summarize_final_losses(muon_losses, config['num_seeds']),
+        }
 
-            # SGD run
-            w_sgd = [W.copy() for W in w_init]
-            fl_sgd, _ = train(w_sgd, X, Y, sgd_lr_dtest, 'sgd')
-            sgd_losses_dtest.append(fl_sgd)
+        advantage_summary = compute_advantage_summary(depth, sgd_summary, muon_summary, 'dtest_replica')
+        replica_row = {
+            'depth': depth,
+            'sgd_formula_lrs_by_seed': [float(lr) for lr in sgd_formula_lrs],
+            'sgd_formula_lr_mean': float(np.mean(sgd_formula_lrs)),
+            'sgd_formula_lr_median': float(np.median(sgd_formula_lrs)),
+            'sgd_formula_lr_min': float(np.min(sgd_formula_lrs)),
+            'sgd_formula_lr_max': float(np.max(sgd_formula_lrs)),
+            'sgd_summary': sgd_summary,
+            'muon_summary': muon_summary,
+            'advantage': advantage_summary['advantage'],
+            'log_advantage': advantage_summary['log_advantage'],
+            'valid_for_fit': advantage_summary['valid_for_fit'],
+        }
+        dtest_replica.append(replica_row)
+        if replica_row['valid_for_fit']:
+            dtest_depths.append(depth)
+            dtest_log_advantages.append(replica_row['log_advantage'])
 
-            # Muon run
-            w_muon = [W.copy() for W in w_init]
-            fl_muon, _ = train(w_muon, X, Y, DTEST_MUON_LR, 'muon')
-            muon_losses_dtest.append(fl_muon)
+    fits = {
+        'swept': linear_fit(
+            swept_depths,
+            swept_log_advantages,
+            'Convergence-aware swept LR: log(advantage) vs depth',
+        ),
+        'dtest_replica': linear_fit(
+            dtest_depths,
+            dtest_log_advantages,
+            'D-TEST replica: log(advantage) vs depth',
+        ),
+    }
 
-        sgd_med = np.median([l for l in sgd_losses_dtest if np.isfinite(l)]) if any(np.isfinite(l) for l in sgd_losses_dtest) else float('inf')
-        muon_med = np.median([l for l in muon_losses_dtest if np.isfinite(l)]) if any(np.isfinite(l) for l in muon_losses_dtest) else float('inf')
+    lr_scaling_by_depth = []
+    for best_row, dtest_row in zip(best_by_depth, dtest_replica):
+        dtest_median_lr = dtest_row['sgd_formula_lr_median']
+        lr_scaling_by_depth.append({
+            'depth': best_row['depth'],
+            'sgd_best_lr': best_row['sgd_best_lr'],
+            'muon_best_lr': best_row['muon_best_lr'],
+            'dtest_formula_sgd_lr_median': dtest_median_lr,
+            'dtest_formula_sgd_lr_min': dtest_row['sgd_formula_lr_min'],
+            'dtest_formula_sgd_lr_max': dtest_row['sgd_formula_lr_max'],
+            'sgd_swept_over_dtest_formula': (
+                float(best_row['sgd_best_lr'] / dtest_median_lr) if dtest_median_lr > 0 else float('nan')
+            ),
+        })
 
-        if muon_med > 1e-30 and np.isfinite(sgd_med) and np.isfinite(muon_med):
-            adv = sgd_med / muon_med
-            log_adv = np.log(adv)
-            dtest_depth_arr.append(depth)
-            dtest_log_adv_arr.append(log_adv)
-            dtest_advantage_arr.append(adv)
-        else:
-            adv = float('inf')
-            log_adv = float('inf')
-
-        sgd_lr_show = dtest_sgd_lr(depth, *make_data(DIM, seeds[0]))
-        print(f"  {depth:>5} | {sgd_lr_show:>14.6f} {sgd_med:>14.6e} | "
-              f"{DTEST_MUON_LR:>14.4f} {muon_med:>14.6e} | "
-              f"{adv:>12.2f}x {log_adv:>10.4f}")
-
-    # =========================================================================
-    # PHASE 4: LINEAR FIT AND R^2
-    # =========================================================================
-
-    print()
-    print("=" * 110)
-    print("  PHASE 4: LINEAR FIT — log(advantage) vs L")
-    print("=" * 110)
-    print()
-
-    def linear_fit(depths, log_advs, label):
-        """Fit log(advantage) = a*L + b, return (slope, intercept, R^2)."""
-        if len(depths) < 2:
-            print(f"  {label}: INSUFFICIENT DATA (only {len(depths)} points)")
-            return 0.0, 0.0, 0.0
-
-        d = np.array(depths, dtype=float)
-        y = np.array(log_advs, dtype=float)
-        A = np.vstack([d, np.ones(len(d))]).T
-        result = np.linalg.lstsq(A, y, rcond=None)
-        slope, intercept = result[0]
-
-        ss_res = np.sum((y - (slope * d + intercept)) ** 2)
-        ss_tot = np.sum((y - np.mean(y)) ** 2)
-        r2 = 1.0 - ss_res / (ss_tot + 1e-15) if ss_tot > 1e-15 else 0.0
-
-        print(f"  {label}:")
-        print(f"    Fit: log(advantage) = {slope:.4f} * L + ({intercept:.4f})")
-        print(f"    Per-layer factor: e^slope = {np.exp(slope):.4f}x")
-        print(f"    R^2 = {r2:.4f}")
-        print()
-        return slope, intercept, r2
-
-    # Swept-LR fit (THIS IS THE AUDIT)
-    slope_swept, intercept_swept, r2_swept = linear_fit(
-        depth_arr, log_advantage_arr, "SWEPT-LR (per-depth best for BOTH optimizers)")
-
-    # D-TEST-replica fit (for comparison)
-    slope_dtest, intercept_dtest, r2_dtest = linear_fit(
-        dtest_depth_arr, dtest_log_adv_arr, "D-TEST REPLICA (fixed Muon LR, formula SGD LR)")
-
-    # =========================================================================
-    # PHASE 5: LR SCALING WITH DEPTH
-    # =========================================================================
-
-    print()
-    print("=" * 110)
-    print("  PHASE 5: HOW DOES OPTIMAL LR SCALE WITH DEPTH?")
-    print("=" * 110)
-    print()
-
-    print(f"  {'Depth':>5} | {'Best SGD LR':>12} | {'Best Muon LR':>12} | "
-          f"{'D-TEST SGD LR':>14} | {'SGD swept/dtest':>16}")
-    print(f"  {'':->5}-+-{'':->12}-+-{'':->12}-+-{'':->14}-+-{'':->16}")
-
-    sgd_swept_lrs = []
-    muon_swept_lrs = []
-    dtest_sgd_lrs = []
-
-    for depth in DEPTHS:
-        sgd_lr_swept = best[depth]['sgd']['lr']
-        muon_lr_swept = best[depth]['muon']['lr']
-        sgd_lr_dt = dtest_sgd_lr(depth, *make_data(DIM, seeds[0]))
-
-        sgd_swept_lrs.append(sgd_lr_swept)
-        muon_swept_lrs.append(muon_lr_swept)
-        dtest_sgd_lrs.append(sgd_lr_dt)
-
-        ratio = sgd_lr_swept / sgd_lr_dt if sgd_lr_dt > 0 else float('nan')
-        print(f"  {depth:>5} | {sgd_lr_swept:>12.4f} | {muon_lr_swept:>12.4f} | "
-              f"{sgd_lr_dt:>14.6f} | {ratio:>16.2f}x")
-
-    # Check if SGD LR decreases faster with depth than Muon LR
-    print()
-    if len(DEPTHS) >= 2:
-        sgd_lr_ratio = sgd_swept_lrs[-1] / sgd_swept_lrs[0] if sgd_swept_lrs[0] > 0 else float('nan')
-        muon_lr_ratio = muon_swept_lrs[-1] / muon_swept_lrs[0] if muon_swept_lrs[0] > 0 else float('nan')
-        print(f"  SGD LR ratio (depth {DEPTHS[-1]} / depth {DEPTHS[0]}):  {sgd_lr_ratio:.4f}")
-        print(f"  Muon LR ratio (depth {DEPTHS[-1]} / depth {DEPTHS[0]}): {muon_lr_ratio:.4f}")
-        print()
-        if np.isfinite(sgd_lr_ratio) and np.isfinite(muon_lr_ratio):
-            if sgd_lr_ratio < muon_lr_ratio * 0.5:
-                print("  WARNING: SGD's optimal LR decreases MUCH faster with depth than Muon's.")
-                print("  This asymmetric scaling could EXPLAIN the depth-exponent as an LR confound.")
-            elif sgd_lr_ratio < muon_lr_ratio:
-                print("  NOTE: SGD's optimal LR decreases somewhat faster with depth than Muon's.")
-                print("  This may partially confound the depth-exponent measurement.")
-            else:
-                print("  GOOD: SGD and Muon optimal LRs scale similarly with depth.")
-                print("  The depth-exponent is NOT primarily an LR scaling artifact.")
-
-    # =========================================================================
-    # PHASE 6: DETAILED LR LANDSCAPE PER DEPTH
-    # =========================================================================
-
-    print()
-    print("=" * 110)
-    print("  PHASE 6: FULL LR LANDSCAPE (median final loss)")
-    print("=" * 110)
-
-    for depth in DEPTHS:
-        print(f"\n  Depth L={depth}:")
-        print(f"    SGD LRs:")
-        for lr in SGD_LRS:
-            finite = [l for l in results[depth]['sgd'][lr] if np.isfinite(l)]
-            med = np.median(finite) if finite else float('inf')
-            mean = np.mean(finite) if finite else float('inf')
-            marker = " <-- BEST" if lr == best[depth]['sgd']['lr'] else ""
-            frac = len(finite) / NUM_SEEDS * 100
-            print(f"      lr={lr:.4f}  median={med:12.6e}  mean={mean:12.6e}  "
-                  f"converged={frac:.0f}%{marker}")
-
-        print(f"    Muon LRs:")
-        for lr in MUON_LRS:
-            finite = [l for l in results[depth]['muon'][lr] if np.isfinite(l)]
-            med = np.median(finite) if finite else float('inf')
-            mean = np.mean(finite) if finite else float('inf')
-            marker = " <-- BEST" if lr == best[depth]['muon']['lr'] else ""
-            frac = len(finite) / NUM_SEEDS * 100
-            print(f"      lr={lr:.4f}  median={med:12.6e}  mean={mean:12.6e}  "
-                  f"converged={frac:.0f}%{marker}")
-
-    # =========================================================================
-    # PHASE 7: RESIDUAL TABLE — advantage at EACH measurement point
-    # =========================================================================
-
-    print()
-    print("=" * 110)
-    print("  PHASE 7: ADVANTAGE AT MULTIPLE TRAINING STEPS (using best LRs)")
-    print("=" * 110)
-    print()
-
-    MEASUREMENT_STEPS = [50, 100, 150, 200, 250, 300]
-
-    print(f"  {'Depth':>5} |", end="")
-    for ms in MEASUREMENT_STEPS:
-        print(f"  Step {ms:>3}", end="")
-    print()
-    print(f"  {'':->5}-+", end="")
-    for _ in MEASUREMENT_STEPS:
-        print(f"{'':->10}", end="")
-    print()
-
-    for depth in DEPTHS:
-        # Run SGD and Muon at best LRs, store full loss curves
+    temporal_advantage = []
+    for depth in config['depths']:
+        sgd_lr = sweep[depth]['sgd']['best']['lr']
+        muon_lr = sweep[depth]['muon']['best']['lr']
         sgd_curves = []
         muon_curves = []
-        for s in seeds:
-            X, Y = make_data(DIM, s)
-            w_init = init_weights(DIM, depth, s + 5000)
+        step_summaries = []
 
-            w_sgd = [W.copy() for W in w_init]
-            _, losses_sgd = train(w_sgd, X, Y, best[depth]['sgd']['lr'], 'sgd')
-            sgd_curves.append(losses_sgd)
+        for seed in seeds:
+            X, Y = make_data(config['dim'], seed, batch_size=config['batch_size'])
+            weights_init = init_weights(config['dim'], depth, seed + config['init_seed_offset'])
 
-            w_muon = [W.copy() for W in w_init]
-            _, losses_muon = train(w_muon, X, Y, best[depth]['muon']['lr'], 'muon')
-            muon_curves.append(losses_muon)
+            _, sgd_losses_curve = train(weights_init, X, Y, sgd_lr, 'sgd', n_steps=config['num_steps'])
+            sgd_curves.append([float(loss) if np.isfinite(loss) else float('inf') for loss in sgd_losses_curve])
+            training_calls += 1
 
-        print(f"  {depth:>5} |", end="")
-        for ms in MEASUREMENT_STEPS:
-            sgd_at_step = [c[ms] if ms < len(c) else c[-1] for c in sgd_curves]
-            muon_at_step = [c[ms] if ms < len(c) else c[-1] for c in muon_curves]
-            sgd_med = np.median([l for l in sgd_at_step if np.isfinite(l)]) if any(np.isfinite(l) for l in sgd_at_step) else float('inf')
-            muon_med = np.median([l for l in muon_at_step if np.isfinite(l)]) if any(np.isfinite(l) for l in muon_at_step) else float('inf')
-            if muon_med > 1e-30 and np.isfinite(sgd_med):
-                adv = sgd_med / muon_med
-                print(f"  {adv:>7.2f}x", end="")
+            _, muon_losses_curve = train(weights_init, X, Y, muon_lr, 'muon', n_steps=config['num_steps'])
+            muon_curves.append([float(loss) if np.isfinite(loss) else float('inf') for loss in muon_losses_curve])
+            training_calls += 1
+
+        for step in config['measurement_steps']:
+            sgd_losses_at_step = [curve[step] if step < len(curve) else curve[-1] for curve in sgd_curves]
+            muon_losses_at_step = [curve[step] if step < len(curve) else curve[-1] for curve in muon_curves]
+            sgd_step_summary = summarize_final_losses(sgd_losses_at_step, config['num_seeds'])
+            muon_step_summary = summarize_final_losses(muon_losses_at_step, config['num_seeds'])
+
+            if (
+                np.isfinite(sgd_step_summary['median_finite_loss'])
+                and np.isfinite(muon_step_summary['median_finite_loss'])
+                and muon_step_summary['median_finite_loss'] > 1e-30
+            ):
+                advantage = float(
+                    sgd_step_summary['median_finite_loss'] / muon_step_summary['median_finite_loss']
+                )
+                log_advantage = float(np.log(advantage))
             else:
-                print(f"  {'INF':>8}", end="")
-        print()
+                advantage = float('inf')
+                log_advantage = float('inf')
 
-    # =========================================================================
-    # FINAL VERDICT
-    # =========================================================================
+            step_summaries.append({
+                'step': step,
+                'sgd_summary': sgd_step_summary,
+                'muon_summary': muon_step_summary,
+                'advantage': advantage,
+                'log_advantage': log_advantage,
+            })
+
+        temporal_advantage.append({
+            'depth': depth,
+            'sgd_lr': float(sgd_lr),
+            'muon_lr': float(muon_lr),
+            'sgd_curves': sgd_curves,
+            'muon_curves': muon_curves,
+            'step_summaries': step_summaries,
+        })
+
+    total_elapsed = time.time() - t_start
+
+    results = {
+        'metadata': {
+            'experiment_id': 'H6a_LR_CONFOUND_AUDIT',
+            'title': 'H6a: LR confound audit of the D-TEST depth-scaling claim',
+            'script_path': str(SCRIPT_PATH),
+            'experiment_dir': str(SCRIPT_DIR),
+        },
+        'config': config,
+        'seeds': seeds,
+        'selection_policy': {
+            'name': 'convergence_first_then_median_finite',
+            'description': config['selection_rule'],
+        },
+        'sweep': sweep,
+        'best_by_depth': best_by_depth,
+        'legacy_selection_differences': legacy_selection_differences,
+        'swept_advantage': swept_advantage,
+        'dtest_replica': {
+            'fixed_muon_lr': float(config['dtest_muon_lr']),
+            'by_depth': dtest_replica,
+        },
+        'fits': fits,
+        'lr_scaling': {
+            'by_depth': lr_scaling_by_depth,
+            'sgd_endpoint_ratio': (
+                float(best_by_depth[-1]['sgd_best_lr'] / best_by_depth[0]['sgd_best_lr'])
+                if best_by_depth and best_by_depth[0]['sgd_best_lr'] > 0 else float('nan')
+            ),
+            'muon_endpoint_ratio': (
+                float(best_by_depth[-1]['muon_best_lr'] / best_by_depth[0]['muon_best_lr'])
+                if best_by_depth and best_by_depth[0]['muon_best_lr'] > 0 else float('nan')
+            ),
+        },
+        'temporal_advantage': {
+            'measurement_steps': list(config['measurement_steps']),
+            'by_depth': temporal_advantage,
+        },
+        'run_counts': {
+            **expected_calls,
+            'actual_training_calls': training_calls,
+        },
+        'timing': {
+            'sweep_wall_time_seconds': float(sweep_elapsed),
+            'total_wall_time_seconds': float(total_elapsed),
+        },
+    }
+
+    if verbose:
+        print_report(results)
+
+    return results
+
+
+# =============================================================================
+# REPORTING
+# =============================================================================
+
+
+def print_report(results):
+    config = results['config']
+    best_by_depth = results['best_by_depth']
+    dtest_rows = results['dtest_replica']['by_depth']
+    fit_swept = results['fits']['swept']
+    fit_dtest = results['fits']['dtest_replica']
 
     print()
-    print("=" * 110)
-    print("  FINAL VERDICT: DOES D-TEST SURVIVE THE LR CONFOUND AUDIT?")
-    print("=" * 110)
+    print('=' * 110)
+    print('  PHASE 2: CONVERGENCE-AWARE BEST LR SUMMARY')
+    print('=' * 110)
     print()
+    print(
+        f"  {'Depth':>5} | {'Best SGD LR':>12} {'Conv':>7} {'Median loss':>14} | "
+        f"{'Best Muon LR':>12} {'Conv':>7} {'Median loss':>14} | {'Advantage':>10}"
+    )
+    print(
+        f"  {'':->5}-+-{'':->12}-{'':->7}-{'':->14}-+-{'':->12}-{'':->7}-{'':->14}-+-{'':->10}"
+    )
+    for row in best_by_depth:
+        print(
+            f"  {row['depth']:>5} | {row['sgd_best_lr']:>12.4f} "
+            f"{row['sgd_converged_count']:>3}/{config['num_seeds']:<3} {row['sgd_median_finite_loss']:>14.6e} | "
+            f"{row['muon_best_lr']:>12.4f} "
+            f"{row['muon_converged_count']:>3}/{config['num_seeds']:<3} {row['muon_median_finite_loss']:>14.6e} | "
+            f"{row['advantage']:>9.2f}x"
+        )
 
-    print(f"  D-TEST ORIGINAL CLAIM:")
-    print(f"    log(advantage) ~ {0.0953:.4f} * L, R^2 = 0.91")
-    print(f"    Per-layer factor: 1.10x")
     print()
-
-    print(f"  D-TEST REPLICA (this experiment, same protocol, 3 seeds):")
-    print(f"    Slope = {slope_dtest:.4f}, R^2 = {r2_dtest:.4f}")
-    print(f"    Per-layer factor: {np.exp(slope_dtest):.4f}x")
-    print()
-
-    print(f"  SWEPT-LR AUDIT (per-depth best LR for BOTH optimizers):")
-    print(f"    Slope = {slope_swept:.4f}, R^2 = {r2_swept:.4f}")
-    print(f"    Per-layer factor: {np.exp(slope_swept):.4f}x")
-    print()
-
-    # Key comparisons
-    slope_change = abs(slope_swept - slope_dtest) / (abs(slope_dtest) + 1e-15)
-    r2_change = r2_dtest - r2_swept
-
-    print(f"  COMPARISONS:")
-    print(f"    Slope change: {slope_dtest:.4f} -> {slope_swept:.4f} "
-          f"({slope_change*100:.1f}% change)")
-    print(f"    R^2 change:   {r2_dtest:.4f} -> {r2_swept:.4f} "
-          f"(dropped by {r2_change:.4f})")
-    print()
-
-    # --- VERDICT ---
-    print(f"  {'='*80}")
-
-    if r2_swept > 0.8 and slope_swept > 0.03:
-        print(f"  VERDICT: D-TEST SURVIVES THE AUDIT")
-        print(f"  {'='*80}")
-        print()
-        print(f"  The exponential depth scaling PERSISTS even when both optimizers")
-        print(f"  get their per-depth optimal learning rates.")
-        print(f"    - R^2 = {r2_swept:.4f} (threshold: 0.8) -- PASS")
-        print(f"    - Slope = {slope_swept:.4f} (per-layer factor {np.exp(slope_swept):.4f}x)")
-        if slope_change < 0.5:
-            print(f"    - Slope changed by only {slope_change*100:.1f}% -- robust")
-        else:
-            print(f"    - Slope changed by {slope_change*100:.1f}% -- the MAGNITUDE is reduced")
-            print(f"      but the QUALITATIVE finding (exponential scaling) holds.")
-        print()
-        print(f"  The depth-exponent is a REAL algorithmic advantage, not an LR confound.")
-
-    elif r2_swept > 0.5 and slope_swept > 0.01:
-        print(f"  VERDICT: D-TEST PARTIALLY SURVIVES — WEAKENED BUT NOT DEAD")
-        print(f"  {'='*80}")
-        print()
-        print(f"  The exponential trend exists but is weaker after LR correction.")
-        print(f"    - R^2 = {r2_swept:.4f} (below 0.8 threshold but above 0.5)")
-        print(f"    - Slope = {slope_swept:.4f} (per-layer factor {np.exp(slope_swept):.4f}x)")
-        print()
-        if slope_change > 0.5:
-            print(f"  WARNING: The original D-TEST OVERSTATED the effect by {slope_change*100:.0f}%")
-            print(f"  due to LR confounding. The paper should report the corrected values.")
-        else:
-            print(f"  The effect size is similar but noisier with proper LR tuning.")
-
-    elif r2_swept < 0.5 or slope_swept < 0.01:
-        print(f"  VERDICT: D-TEST DOES NOT SURVIVE — RETRACT THE CLAIM")
-        print(f"  {'='*80}")
-        print()
-        print(f"  The exponential depth scaling DISAPPEARS when both optimizers")
-        print(f"  get proper per-depth LR tuning.")
-        print(f"    - R^2 dropped from {r2_dtest:.4f} to {r2_swept:.4f}")
-        if slope_swept < 0.01:
-            print(f"    - Slope dropped from {slope_dtest:.4f} to {slope_swept:.4f}")
-            print(f"      The per-layer advantage factor is essentially 1.0x (no scaling)")
-        print()
-        print(f"  The D-TEST result was an LR CONFOUND. The apparent exponential scaling")
-        print(f"  came from SGD being given increasingly suboptimal LRs at greater depths")
-        print(f"  while Muon's fixed LR happened to be near-optimal across depths.")
-
+    if results['legacy_selection_differences']:
+        print('  Legacy-selection differences (median-over-finite-only would have picked):')
+        for item in results['legacy_selection_differences']:
+            print(
+                f"    depth={item['depth']:>2}  opt={item['optimizer']:<4}  "
+                f"new_lr={item['selected_lr']:.4f} ({item['selected_converged_count']}/{config['num_seeds']} conv)  "
+                f"legacy_lr={item['legacy_lr']:.4f} ({item['legacy_converged_count']}/{config['num_seeds']} conv)"
+            )
     else:
-        print(f"  VERDICT: INCONCLUSIVE")
-        print(f"  {'='*80}")
-        print()
-        print(f"  Cannot determine if the depth scaling is real or artifactual.")
-        print(f"  R^2 = {r2_swept:.4f}, slope = {slope_swept:.4f}")
+        print('  No differences from the legacy median-over-finite-only selector on this run.')
+
+    boundary_hits = [
+        (row['depth'], 'sgd', row['sgd_best_lr'])
+        for row in best_by_depth if row['sgd_boundary_hit']
+    ] + [
+        (row['depth'], 'muon', row['muon_best_lr'])
+        for row in best_by_depth if row['muon_boundary_hit']
+    ]
+    if boundary_hits:
+        print('  Boundary-hit warning(s):')
+        for depth, optimizer, lr in boundary_hits:
+            print(f"    depth={depth:>2}  opt={optimizer:<4}  selected LR sits on sweep edge at {lr:.4f}")
 
     print()
-    elapsed_total = time.time() - t_start
-    print(f"  Total experiment time: {elapsed_total:.1f}s")
+    print('=' * 110)
+    print('  PHASE 3: D-TEST-STYLE REPLICA (formula SGD LR, fixed Muon LR = 0.005)')
+    print('=' * 110)
     print()
-    print("=" * 110)
-    print("  EXPERIMENT COMPLETE")
-    print("=" * 110)
+    print(
+        f"  {'Depth':>5} | {'Formula SGD LR':>14} {'Range':>20} | "
+        f"{'SGD conv':>8} {'SGD median':>14} | {'Muon conv':>9} {'Muon median':>14} | {'Adv':>8}"
+    )
+    print(
+        f"  {'':->5}-+-{'':->14}-{'':->20}-+-{'':->8}-{'':->14}-+-{'':->9}-{'':->14}-+-{'':->8}"
+    )
+    for row in dtest_rows:
+        sgd_summary = row['sgd_summary']
+        muon_summary = row['muon_summary']
+        print(
+            f"  {row['depth']:>5} | {row['sgd_formula_lr_median']:>14.6f} "
+            f"[{row['sgd_formula_lr_min']:.6f}, {row['sgd_formula_lr_max']:.6f}] | "
+            f"{sgd_summary['converged_count']:>3}/{config['num_seeds']:<3} {sgd_summary['median_finite_loss']:>14.6e} | "
+            f"{muon_summary['converged_count']:>3}/{config['num_seeds']:<3} {muon_summary['median_finite_loss']:>14.6e} | "
+            f"{row['advantage']:>7.2f}x"
+        )
+
     print()
+    print('=' * 110)
+    print('  PHASE 4: FIT SUMMARY — log(advantage) vs depth')
+    print('=' * 110)
+    print()
+    print(
+        f"  {'Protocol':<48} {'Slope':>10} {'e^slope':>10} {'R^2':>10} {'Points':>8}"
+    )
+    print(
+        f"  {'':-<48} {'':->10} {'':->10} {'':->10} {'':->8}"
+    )
+    for fit in [fit_swept, fit_dtest]:
+        print(
+            f"  {fit['label']:<48} {fit['slope']:>10.4f} {fit['per_layer_factor']:>10.4f} "
+            f"{fit['r2']:>10.4f} {fit['n_points']:>8}"
+        )
+
+    print()
+    print('=' * 110)
+    print('  PHASE 5: LR SCALING WITH DEPTH')
+    print('=' * 110)
+    print()
+    print(
+        f"  {'Depth':>5} | {'Swept SGD':>10} | {'Swept Muon':>10} | {'D-TEST SGD med':>14} | {'Swept / D-TEST':>14}"
+    )
+    print(
+        f"  {'':->5}-+-{'':->10}-+-{'':->10}-+-{'':->14}-+-{'':->14}"
+    )
+    for row in results['lr_scaling']['by_depth']:
+        print(
+            f"  {row['depth']:>5} | {row['sgd_best_lr']:>10.4f} | {row['muon_best_lr']:>10.4f} | "
+            f"{row['dtest_formula_sgd_lr_median']:>14.6f} | {row['sgd_swept_over_dtest_formula']:>14.2f}x"
+        )
+    print()
+    print(f"  SGD endpoint LR ratio (L={config['depths'][-1]} / L={config['depths'][0]}):  {results['lr_scaling']['sgd_endpoint_ratio']:.4f}")
+    print(f"  Muon endpoint LR ratio (L={config['depths'][-1]} / L={config['depths'][0]}): {results['lr_scaling']['muon_endpoint_ratio']:.4f}")
+
+    print()
+    print('=' * 110)
+    print('  PHASE 6: FULL LR LANDSCAPE (median finite loss, convergence shown explicitly)')
+    print('=' * 110)
+    for depth in config['depths']:
+        print(f"\n  Depth L={depth}:")
+        for optimizer in ['sgd', 'muon']:
+            print(f"    {optimizer.upper()}:")
+            for row in results['sweep'][depth][optimizer]['lr_results']:
+                marker = ' <-- SELECTED' if row['lr'] == results['sweep'][depth][optimizer]['best']['lr'] else ''
+                print(
+                    f"      lr={row['lr']:.4f}  median_finite={row['median_finite_loss']:12.6e}  "
+                    f"mean_finite={row['mean_finite_loss']:12.6e}  "
+                    f"converged={row['converged_count']}/{config['num_seeds']}{marker}"
+                )
+
+    print()
+    print('=' * 110)
+    print('  PHASE 7: TEMPORAL ADVANTAGE AT SELECTED TRAINING STEPS (using selected best LRs)')
+    print('=' * 110)
+    print()
+    print(f"  {'Depth':>5} |", end='')
+    for step in results['temporal_advantage']['measurement_steps']:
+        print(f"  Step {step:>3}", end='')
+    print()
+    print(f"  {'':->5}-+", end='')
+    for _ in results['temporal_advantage']['measurement_steps']:
+        print(f"{'':->10}", end='')
+    print()
+    for depth_row in results['temporal_advantage']['by_depth']:
+        print(f"  {depth_row['depth']:>5} |", end='')
+        for step_summary in depth_row['step_summaries']:
+            advantage = step_summary['advantage']
+            if np.isfinite(advantage):
+                print(f"  {advantage:>7.2f}x", end='')
+            else:
+                print(f"  {'INF':>8}", end='')
+        print()
+
+    print()
+    print('=' * 110)
+    print('  CALIBRATED INTERPRETATION')
+    print('=' * 110)
+    print()
+    print('  This audit measures final-loss ratios and convergence behavior under the discrete sweeps above.')
+    print('  It does not directly prove complexity-class separation or RG / gauge explanations.')
+    print()
+    print(
+        f"  D-TEST-style replica fit: slope={fit_dtest['slope']:.4f}, "
+        f"e^slope={fit_dtest['per_layer_factor']:.4f}, R^2={fit_dtest['r2']:.4f}"
+    )
+    print(
+        f"  Swept-LR audit fit:      slope={fit_swept['slope']:.4f}, "
+        f"e^slope={fit_swept['per_layer_factor']:.4f}, R^2={fit_swept['r2']:.4f}"
+    )
+    print()
+
+    slope_delta = fit_swept['slope'] - fit_dtest['slope']
+    r2_delta = fit_swept['r2'] - fit_dtest['r2']
+    if fit_swept['slope'] < fit_dtest['slope'] and fit_swept['r2'] < fit_dtest['r2']:
+        print('  Under convergence-aware per-depth retuning, the depth trend is weaker than in the D-TEST-style replica.')
+    elif fit_swept['slope'] > fit_dtest['slope'] and fit_swept['r2'] >= fit_dtest['r2']:
+        print('  Under convergence-aware per-depth retuning, the depth trend is at least as strong as in the D-TEST-style replica.')
+    else:
+        print('  The relationship between the swept-LR audit and D-TEST-style replica is mixed in this run.')
+    print(f"  Delta(slope) = {slope_delta:+.4f}, Delta(R^2) = {r2_delta:+.4f}")
+    print()
+    print('  Caveats: 4 depths, 3 seeds, discrete LR grids, no confidence intervals, and possible sweep-boundary effects.')
+    print(f"  Total training calls executed: {results['run_counts']['actual_training_calls']}")
+    print(f"  Total wall time: {results['timing']['total_wall_time_seconds']:.1f}s")
+    print()
+    print('=' * 110)
+    print('  EXPERIMENT COMPLETE')
+    print('=' * 110)
+    print()
+
+
+
+def main():
+    run_experiment(verbose=True)
 
 
 if __name__ == '__main__':

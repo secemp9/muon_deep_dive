@@ -1,259 +1,304 @@
 #!/usr/bin/env python3
 """
-1.2b-ii: Trajectory in Polar Coordinates -- (Q_t, P_t) Decomposition
-=====================================================================
+1.2b-ii: Polar-factor trajectory proxy analysis in (Q_t, P_t) coordinates
+============================================================================
 
-At each step, decompose W_t = Q_t P_t (polar decomposition).
-  Q_t lives on the Stiefel manifold (orthogonal matrices).
-  P_t lives in Sym+ (symmetric positive semi-definite matrices).
+This experiment tracks the *per-layer* polar decomposition W_t = Q_t P_t during
+training of a deep linear network. For each layer and optimization step it
+records:
 
-Track how much of each weight update changes Q vs P:
-  ||DeltaQ|| / ||DeltaW||   (orientation change fraction)
-  ||DeltaP|| / ||DeltaW||   (spectrum change fraction)
+  - ||ΔQ|| / ||ΔW|| : change in the orthogonal polar factor relative to the
+    weight-step norm
+  - ||ΔP|| / ||ΔW|| : change in the symmetric positive-semidefinite polar factor
+    relative to the weight-step norm
+  - cumulative drifts ||Q_t - Q_0||, ||P_t - P_0||, ||W_t - W_0||
 
-Also track cumulative drift from initialization:
-  ||Q_t - Q_0||_F   (total orientation drift)
-  ||P_t - P_0||_F   (total spectrum drift)
+Important scope limitations:
+  - These are per-layer polar-factor diagnostics for a toy deep linear system.
+    They are *not* direct coordinates on the full deep-linear gauge orbit.
+  - ||ΔQ|| / ||ΔW|| and ||ΔP|| / ||ΔW|| are descriptive ratios, not additive
+    shares of a decomposition of ΔW. They can exceed 1.
+  - Raw means of these ratios can become noisy when ||ΔW|| is very small, so the
+    script also reports aggregate ratios Σ||ΔQ|| / Σ||ΔW|| and
+    Σ||ΔP|| / Σ||ΔW|| as more stable summaries.
+  - This default run is a single-seed, fixed-batch study.
 
-HYPOTHESIS (to be tested, may be wrong given 1.2b-i results):
-  Under Muon: ||DeltaQ||/||DeltaW|| ~ 1, ||DeltaP||/||DeltaW|| ~ 0
-    (movement is predominantly in orientation, not spectrum)
-  Under SGD:  both ratios are O(1)
-    (movement in both orientation and spectrum)
-
-CRITICAL CONTEXT from 1.2b-i:
-  - Muon is MORE chaotic in weight space (higher Lyapunov) but more stable
-    in loss space
-  - The benefit is DIRECTIONAL, not stability
-  - Neither optimizer distinguishes gauge from physical in Lyapunov terms
-  - So this experiment may show something different from what was hypothesized
-
-Setup: 4-layer deep linear net, 32x32, quadratic loss, 300 steps.
+Default setup is preserved from the prior version:
+  4-layer deep linear net, 32x32, quadratic loss, 300 steps.
 """
 
-import numpy as np
+from __future__ import annotations
+
+import copy
 import os
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-np.random.seed(42)
+import numpy as np
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "SEED": 42,
+    "DIM": 32,
+    "NUM_LAYERS": 4,
+    "NUM_STEPS": 300,
+    "BATCH_SIZE": 64,
+    "LR_MUON": 0.005,
+    "MOMENTUM": 0.9,
+    "NS_ITERS": 5,
+    "REPORT_STEPS": [50, 100, 200, 300],
+    "WINDOW_RADIUS": 5,
+    "LR_CANDIDATES_SGD": [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001],
+    "STABILITY_STEPS": 100,
+    "STABILITY_LOSS_MULTIPLIER": 50.0,
+    "TARGET_SCALE": 0.5,
+    "INPUT_SCALE": 0.3,
+    "RATIO_DENOM_EPS": 1e-15,
+    "SMALL_DW_EPS": 1e-12,
+}
+
 
 # =============================================================================
-# CONFIGURATION
+# CONFIG / PROBLEM SETUP
 # =============================================================================
 
-DIM = 32
-NUM_LAYERS = 4
-NUM_STEPS = 300
-BATCH_SIZE = 64
-LR_MUON = 0.005
-MOMENTUM = 0.9
-NS_ITERS = 5
+def get_default_config() -> Dict[str, Any]:
+    """Return a deep copy of the default experiment configuration."""
+    return copy.deepcopy(DEFAULT_CONFIG)
 
-# Report steps
-REPORT_STEPS = [50, 100, 200, 300]
 
-# Random target matrix (fixed)
-W_target = np.random.randn(DIM, DIM) * 0.5
+def prepare_config(config_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Merge user overrides into the default config."""
+    config = get_default_config()
+    if config_overrides:
+        for key, value in config_overrides.items():
+            config[key] = copy.deepcopy(value)
+    return config
 
-# Random input data (fixed batch)
-X_data = np.random.randn(DIM, BATCH_SIZE) * 0.3
 
-# Output directory
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+def build_problem(config: Dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Construct the fixed target matrix and fixed input batch."""
+    rng = np.random.RandomState(config["SEED"])
+    dim = config["DIM"]
+    batch_size = config["BATCH_SIZE"]
+    target = rng.randn(dim, dim) * config["TARGET_SCALE"]
+    x_data = rng.randn(dim, batch_size) * config["INPUT_SCALE"]
+    return target, x_data
 
 
 # =============================================================================
 # CORE FUNCTIONS
 # =============================================================================
 
-def init_weights(num_layers, seed=42):
+def init_weights(num_layers: int, dim: int, seed: int = 42) -> List[np.ndarray]:
     """Initialize layers near identity for stability."""
     rng = np.random.RandomState(seed)
     weights = []
     for _ in range(num_layers):
-        W = np.eye(DIM) + rng.randn(DIM, DIM) * 0.1
-        weights.append(W.copy())
+        w = np.eye(dim) + rng.randn(dim, dim) * 0.1
+        weights.append(w.copy())
     return weights
 
 
-def forward(weights, X):
+def forward(weights: List[np.ndarray], x: np.ndarray) -> np.ndarray:
     """Forward pass: W_L @ ... @ W_1 @ X."""
-    out = X.copy()
-    for W in weights:
-        out = W @ out
+    out = x.copy()
+    for w in weights:
+        out = w @ out
     return out
 
 
-def compute_loss(weights, X, target):
+def compute_loss(weights: List[np.ndarray], x: np.ndarray, target: np.ndarray) -> float:
     """Loss = 0.5 * ||W_product @ X - T @ X||^2 / N."""
-    pred = forward(weights, X)
-    target_out = target @ X
+    pred = forward(weights, x)
+    target_out = target @ x
     diff = pred - target_out
-    return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
+    return float(0.5 * np.mean(np.sum(diff ** 2, axis=0)))
 
 
-def compute_gradients(weights, X, target):
-    """Backprop through deep linear net."""
+def compute_gradients(weights: List[np.ndarray], x: np.ndarray, target: np.ndarray) -> List[np.ndarray]:
+    """Backprop through a deep linear network."""
     num_layers = len(weights)
-    N = X.shape[1]
+    n = x.shape[1]
 
-    # Forward pass storing activations
-    activations = [X.copy()]
-    out = X.copy()
-    for W in weights:
-        out = W @ out
+    activations = [x.copy()]
+    out = x.copy()
+    for w in weights:
+        out = w @ out
         activations.append(out.copy())
 
-    # Backward pass
-    target_out = target @ X
-    delta = (activations[-1] - target_out) / N
+    target_out = target @ x
+    delta = (activations[-1] - target_out) / n
 
-    grads = []
+    grads: List[np.ndarray] = []
     for i in range(num_layers - 1, -1, -1):
-        G = delta @ activations[i].T
-        grads.insert(0, G)
+        grad = delta @ activations[i].T
+        grads.insert(0, grad)
         if i > 0:
             delta = weights[i].T @ delta
 
     return grads
 
 
-def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
+def newton_schulz_orthogonalize(g: np.ndarray, num_iters: int) -> np.ndarray:
     """
-    Newton-Schulz iteration to approximate the orthogonal polar factor.
-    Returns closest orthogonal matrix to G (i.e., U @ V^T from SVD).
+    Approximate the orthogonal polar factor of g via Newton-Schulz iteration.
     """
-    norm = np.linalg.norm(G, ord='fro')
+    norm = np.linalg.norm(g, ord="fro")
     if norm < 1e-12:
-        return G
-    X = G / norm
+        return g
 
+    x = g / norm
     for _ in range(num_iters):
-        A = X.T @ X
-        X = 1.5 * X - 0.5 * X @ A
-
-    return X
-
-
-def polar_decomposition(W):
-    """
-    Compute the polar decomposition W = Q P.
-    Q is orthogonal (or unitary), P is symmetric positive semi-definite.
-    Uses SVD: W = U S V^T => Q = U V^T, P = V S V^T.
-    """
-    U, S, Vt = np.linalg.svd(W, full_matrices=True)
-    Q = U @ Vt
-    P = Vt.T @ np.diag(S) @ Vt
-    return Q, P
+        a = x.T @ x
+        x = 1.5 * x - 0.5 * x @ a
+    return x
 
 
-def find_stable_lr_sgd():
-    """Find maximum stable SGD learning rate."""
-    candidates = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001]
-    for lr in candidates:
-        np.random.seed(42)
-        weights = init_weights(NUM_LAYERS)
-        velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
-        initial_loss = compute_loss(weights, X_data, W_target)
+def polar_decomposition(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute W = QP using an SVD-based polar decomposition."""
+    u, s, vt = np.linalg.svd(w, full_matrices=True)
+    q = u @ vt
+    p = vt.T @ np.diag(s) @ vt
+    return q, p
+
+
+# =============================================================================
+# OPTIMIZER HELPERS
+# =============================================================================
+
+def find_stable_lr_sgd(config: Dict[str, Any], x_data: np.ndarray, target: np.ndarray) -> float:
+    """Find the maximum stable SGD learning rate among predefined candidates."""
+    dim = config["DIM"]
+    num_layers = config["NUM_LAYERS"]
+    seed = config["SEED"]
+    momentum = config["MOMENTUM"]
+    stability_steps = config["STABILITY_STEPS"]
+    loss_multiplier = config["STABILITY_LOSS_MULTIPLIER"]
+
+    for lr in config["LR_CANDIDATES_SGD"]:
+        weights = init_weights(num_layers, dim, seed=seed)
+        velocities = [np.zeros((dim, dim)) for _ in range(num_layers)]
+        initial_loss = compute_loss(weights, x_data, target)
         stable = True
-        for step in range(100):
-            grads = compute_gradients(weights, X_data, W_target)
-            for i in range(NUM_LAYERS):
-                velocities[i] = MOMENTUM * velocities[i] + grads[i]
+        for _ in range(stability_steps):
+            grads = compute_gradients(weights, x_data, target)
+            for i in range(num_layers):
+                velocities[i] = momentum * velocities[i] + grads[i]
                 weights[i] -= lr * velocities[i]
-            loss = compute_loss(weights, X_data, W_target)
-            if np.isnan(loss) or loss > initial_loss * 50:
+            loss = compute_loss(weights, x_data, target)
+            if np.isnan(loss) or loss > initial_loss * loss_multiplier:
                 stable = False
                 break
         if stable:
-            return lr
-    return 0.001
+            return float(lr)
+
+    return float(config["LR_CANDIDATES_SGD"][-1])
 
 
-# =============================================================================
-# OPTIMIZER STEP FUNCTIONS
-# =============================================================================
-
-def sgd_step(weights, velocities, lr):
+def sgd_step(
+    weights: List[np.ndarray],
+    velocities: List[np.ndarray],
+    lr: float,
+    x_data: np.ndarray,
+    target: np.ndarray,
+    momentum: float,
+) -> tuple[List[np.ndarray], List[np.ndarray]]:
     """One step of SGD with momentum."""
-    grads = compute_gradients(weights, X_data, W_target)
+    grads = compute_gradients(weights, x_data, target)
     for i in range(len(weights)):
-        velocities[i] = MOMENTUM * velocities[i] + grads[i]
+        velocities[i] = momentum * velocities[i] + grads[i]
         weights[i] = weights[i] - lr * velocities[i]
     return weights, velocities
 
 
-def muon_step(weights, velocities, lr):
-    """One step of Muon with momentum."""
-    grads = compute_gradients(weights, X_data, W_target)
+def muon_step(
+    weights: List[np.ndarray],
+    velocities: List[np.ndarray],
+    lr: float,
+    x_data: np.ndarray,
+    target: np.ndarray,
+    momentum: float,
+    ns_iters: int,
+) -> tuple[List[np.ndarray], List[np.ndarray]]:
+    """One step of Muon with momentum using orthogonalized gradients."""
+    grads = compute_gradients(weights, x_data, target)
     for i in range(len(weights)):
-        ortho_grad = newton_schulz_orthogonalize(grads[i])
-        velocities[i] = MOMENTUM * velocities[i] + ortho_grad
+        ortho_grad = newton_schulz_orthogonalize(grads[i], num_iters=ns_iters)
+        velocities[i] = momentum * velocities[i] + ortho_grad
         weights[i] = weights[i] - lr * velocities[i]
     return weights, velocities
 
 
 # =============================================================================
-# POLAR COORDINATE TRACKING ENGINE
+# TRACKING ENGINE
 # =============================================================================
 
-def run_and_track_polar(optimizer, lr, num_steps):
+def run_and_track_polar(
+    optimizer: str,
+    lr: float,
+    num_steps: int,
+    config: Dict[str, Any],
+    x_data: np.ndarray,
+    target: np.ndarray,
+    verbose: bool = False,
+) -> Dict[str, Any]:
     """
-    Run optimizer for num_steps, at each step decompose each layer's W_t = Q_t P_t.
-    Track per-step and cumulative polar decomposition metrics.
+    Run an optimizer for num_steps and track layerwise polar-factor diagnostics.
+    """
+    dim = config["DIM"]
+    num_layers = config["NUM_LAYERS"]
+    seed = config["SEED"]
+    momentum = config["MOMENTUM"]
+    ns_iters = config["NS_ITERS"]
+    ratio_eps = config["RATIO_DENOM_EPS"]
 
-    Returns dict with per-layer and averaged metrics.
-    """
-    np.random.seed(42)
-    weights = init_weights(NUM_LAYERS)
+    weights = init_weights(num_layers, dim, seed=seed)
     velocities = [np.zeros_like(w) for w in weights]
 
-    # Initial polar decompositions
-    Q_prev = []
-    P_prev = []
-    Q_init = []
-    P_init = []
-    for i in range(NUM_LAYERS):
-        Q, P = polar_decomposition(weights[i])
-        Q_prev.append(Q.copy())
-        P_prev.append(P.copy())
-        Q_init.append(Q.copy())
-        P_init.append(P.copy())
+    q_prev: List[np.ndarray] = []
+    p_prev: List[np.ndarray] = []
+    q_init: List[np.ndarray] = []
+    p_init: List[np.ndarray] = []
+    for w in weights:
+        q, p = polar_decomposition(w)
+        q_prev.append(q.copy())
+        p_prev.append(p.copy())
+        q_init.append(q.copy())
+        p_init.append(p.copy())
 
-    # Per-layer tracking arrays
-    # Per-step ratios: ||DeltaQ||/||DeltaW|| and ||DeltaP||/||DeltaW||
-    dQ_ratio = np.zeros((NUM_LAYERS, num_steps))  # ||DeltaQ||/||DeltaW||
-    dP_ratio = np.zeros((NUM_LAYERS, num_steps))  # ||DeltaP||/||DeltaW||
+    dQ_ratio = np.zeros((num_layers, num_steps))
+    dP_ratio = np.zeros((num_layers, num_steps))
+    dQ_norm = np.zeros((num_layers, num_steps))
+    dP_norm = np.zeros((num_layers, num_steps))
+    dW_norm = np.zeros((num_layers, num_steps))
+    cum_Q_drift = np.zeros((num_layers, num_steps))
+    cum_P_drift = np.zeros((num_layers, num_steps))
+    cum_W_drift = np.zeros((num_layers, num_steps))
 
-    # Per-step absolute norms
-    dQ_norm = np.zeros((NUM_LAYERS, num_steps))
-    dP_norm = np.zeros((NUM_LAYERS, num_steps))
-    dW_norm = np.zeros((NUM_LAYERS, num_steps))
-
-    # Cumulative drift from initialization
-    cum_Q_drift = np.zeros((NUM_LAYERS, num_steps))
-    cum_P_drift = np.zeros((NUM_LAYERS, num_steps))
-    cum_W_drift = np.zeros((NUM_LAYERS, num_steps))
-
-    # Loss tracking
     losses = np.zeros(num_steps + 1)
-    losses[0] = compute_loss(weights, X_data, W_target)
+    losses[0] = compute_loss(weights, x_data, target)
 
-    W_prev = [w.copy() for w in weights]
-    W_init = [w.copy() for w in weights]
+    w_prev = [w.copy() for w in weights]
+    w_init = [w.copy() for w in weights]
+    diverged_at: Optional[int] = None
 
     for step in range(num_steps):
-        # Take optimizer step
-        if optimizer == 'sgd':
-            weights, velocities = sgd_step(weights, velocities, lr)
-        elif optimizer == 'muon':
-            weights, velocities = muon_step(weights, velocities, lr)
+        if optimizer == "sgd":
+            weights, velocities = sgd_step(weights, velocities, lr, x_data, target, momentum)
+        elif optimizer == "muon":
+            weights, velocities = muon_step(weights, velocities, lr, x_data, target, momentum, ns_iters)
+        else:
+            raise ValueError(f"Unknown optimizer: {optimizer}")
 
-        losses[step + 1] = compute_loss(weights, X_data, W_target)
+        losses[step + 1] = compute_loss(weights, x_data, target)
 
-        # Check for divergence
         if np.isnan(losses[step + 1]) or losses[step + 1] > 1e10:
-            print(f"    WARNING: {optimizer} diverged at step {step + 1}")
-            # Fill remaining with NaN
+            diverged_at = step + 1
+            if verbose:
+                print(f"    WARNING: {optimizer} diverged at step {diverged_at}")
             dQ_ratio[:, step:] = np.nan
             dP_ratio[:, step:] = np.nan
             dQ_norm[:, step:] = np.nan
@@ -262,605 +307,1082 @@ def run_and_track_polar(optimizer, lr, num_steps):
             cum_Q_drift[:, step:] = np.nan
             cum_P_drift[:, step:] = np.nan
             cum_W_drift[:, step:] = np.nan
-            losses[step + 1:] = np.nan
+            losses[step + 1 :] = np.nan
             break
 
-        for i in range(NUM_LAYERS):
-            # Polar decomposition of current weight
-            Q_curr, P_curr = polar_decomposition(weights[i])
+        for i in range(num_layers):
+            q_curr, p_curr = polar_decomposition(weights[i])
 
-            # Step differences
-            delta_W = weights[i] - W_prev[i]
-            delta_Q = Q_curr - Q_prev[i]
-            delta_P = P_curr - P_prev[i]
+            delta_w = weights[i] - w_prev[i]
+            delta_q = q_curr - q_prev[i]
+            delta_p = p_curr - p_prev[i]
 
-            norm_dW = np.linalg.norm(delta_W, 'fro')
-            norm_dQ = np.linalg.norm(delta_Q, 'fro')
-            norm_dP = np.linalg.norm(delta_P, 'fro')
+            norm_dW = np.linalg.norm(delta_w, ord="fro")
+            norm_dQ = np.linalg.norm(delta_q, ord="fro")
+            norm_dP = np.linalg.norm(delta_p, ord="fro")
 
             dW_norm[i, step] = norm_dW
             dQ_norm[i, step] = norm_dQ
             dP_norm[i, step] = norm_dP
 
-            if norm_dW > 1e-15:
+            if norm_dW > ratio_eps:
                 dQ_ratio[i, step] = norm_dQ / norm_dW
                 dP_ratio[i, step] = norm_dP / norm_dW
             else:
                 dQ_ratio[i, step] = np.nan
                 dP_ratio[i, step] = np.nan
 
-            # Cumulative drift from initialization
-            cum_Q_drift[i, step] = np.linalg.norm(Q_curr - Q_init[i], 'fro')
-            cum_P_drift[i, step] = np.linalg.norm(P_curr - P_init[i], 'fro')
-            cum_W_drift[i, step] = np.linalg.norm(weights[i] - W_init[i], 'fro')
+            cum_Q_drift[i, step] = np.linalg.norm(q_curr - q_init[i], ord="fro")
+            cum_P_drift[i, step] = np.linalg.norm(p_curr - p_init[i], ord="fro")
+            cum_W_drift[i, step] = np.linalg.norm(weights[i] - w_init[i], ord="fro")
 
-            # Update previous
-            Q_prev[i] = Q_curr.copy()
-            P_prev[i] = P_curr.copy()
+            q_prev[i] = q_curr.copy()
+            p_prev[i] = p_curr.copy()
 
-        W_prev = [w.copy() for w in weights]
+        w_prev = [w.copy() for w in weights]
 
     return {
-        'dQ_ratio': dQ_ratio,       # (NUM_LAYERS, num_steps)
-        'dP_ratio': dP_ratio,
-        'dQ_norm': dQ_norm,
-        'dP_norm': dP_norm,
-        'dW_norm': dW_norm,
-        'cum_Q_drift': cum_Q_drift,
-        'cum_P_drift': cum_P_drift,
-        'cum_W_drift': cum_W_drift,
-        'losses': losses,
+        "optimizer": optimizer,
+        "lr": float(lr),
+        "diverged_at": diverged_at,
+        "dQ_ratio": dQ_ratio,
+        "dP_ratio": dP_ratio,
+        "dQ_norm": dQ_norm,
+        "dP_norm": dP_norm,
+        "dW_norm": dW_norm,
+        "cum_Q_drift": cum_Q_drift,
+        "cum_P_drift": cum_P_drift,
+        "cum_W_drift": cum_W_drift,
+        "losses": losses,
     }
 
 
 # =============================================================================
-# MAIN EXPERIMENT
+# SUMMARY / ANALYSIS HELPERS
 # =============================================================================
 
-print("=" * 100)
-print("1.2b-ii: TRAJECTORY IN POLAR COORDINATES -- (Q_t, P_t) DECOMPOSITION")
-print("=" * 100)
-print(f"Setup: {NUM_LAYERS}-layer deep linear net (dim={DIM}), quadratic loss, {NUM_STEPS} steps")
-print(f"LR_Muon={LR_MUON}, Momentum={MOMENTUM}")
-print(f"Report at steps: {REPORT_STEPS}")
-print("=" * 100)
+def safe_ratio(numerator: Any, denominator: Any, eps: float = 1e-15) -> Any:
+    """Safe division that returns NaN when the denominator is too small."""
+    numer_arr = np.asarray(numerator, dtype=float)
+    denom_arr = np.asarray(denominator, dtype=float)
+    numer_b, denom_b = np.broadcast_arrays(numer_arr, denom_arr)
+    out = np.full(numer_b.shape, np.nan, dtype=float)
+    mask = np.abs(denom_b) > eps
+    out[mask] = numer_b[mask] / denom_b[mask]
+    if out.shape == ():
+        return float(out)
+    return out
 
-# Find stable SGD learning rate
-lr_sgd = find_stable_lr_sgd()
-print(f"\nSGD learning rate (max stable): {lr_sgd}")
-print(f"Muon learning rate (fixed):     {LR_MUON}")
 
-# Quick sanity check
-np.random.seed(42)
-w_test = init_weights(NUM_LAYERS)
-loss_init = compute_loss(w_test, X_data, W_target)
-print(f"\nInitial loss: {loss_init:.6e}")
+def nan_stats(array: np.ndarray) -> Dict[str, Any]:
+    """Basic finite-value summary stats for a NumPy array."""
+    flat = np.asarray(array, dtype=float).ravel()
+    flat = flat[~np.isnan(flat)]
+    if flat.size == 0:
+        return {
+            "count": 0,
+            "min": np.nan,
+            "median": np.nan,
+            "mean": np.nan,
+            "max": np.nan,
+        }
+    return {
+        "count": int(flat.size),
+        "min": float(np.min(flat)),
+        "median": float(np.median(flat)),
+        "mean": float(np.mean(flat)),
+        "max": float(np.max(flat)),
+    }
 
-# Verify polar decomposition works
-print("\nVerifying polar decomposition on initial weights...")
-for i, W in enumerate(w_test):
-    Q, P = polar_decomposition(W)
-    recon_err = np.linalg.norm(W - Q @ P, 'fro') / np.linalg.norm(W, 'fro')
-    Q_orth_err = np.linalg.norm(Q.T @ Q - np.eye(DIM), 'fro')
-    P_sym_err = np.linalg.norm(P - P.T, 'fro')
-    P_eigmin = np.min(np.linalg.eigvalsh(P))
-    print(f"  Layer {i}: recon_err={recon_err:.2e}, Q_orth_err={Q_orth_err:.2e}, "
-          f"P_sym_err={P_sym_err:.2e}, P_min_eig={P_eigmin:.4f}")
+
+def report_window_bounds(step: int, num_steps: int, radius: int) -> tuple[int, int]:
+    """10-step style window centered on a 1-indexed report step, matching prior logic."""
+    lo = max(0, step - radius)
+    hi = min(num_steps, step + radius)
+    return lo, hi
+
+
+def summarize_single_optimizer(results: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    """Build stable summaries and diagnostics for one optimizer run."""
+    ratio_eps = config["RATIO_DENOM_EPS"]
+    small_dw_eps = config["SMALL_DW_EPS"]
+
+    dQ_ratio = results["dQ_ratio"]
+    dP_ratio = results["dP_ratio"]
+    dQ_norm = results["dQ_norm"]
+    dP_norm = results["dP_norm"]
+    dW_norm = results["dW_norm"]
+    cum_Q_drift = results["cum_Q_drift"]
+    cum_P_drift = results["cum_P_drift"]
+    cum_W_drift = results["cum_W_drift"]
+    losses = results["losses"]
+
+    total_dQ = float(np.nansum(dQ_norm))
+    total_dP = float(np.nansum(dP_norm))
+    total_dW = float(np.nansum(dW_norm))
+
+    step_dQ = np.nansum(dQ_norm, axis=0)
+    step_dP = np.nansum(dP_norm, axis=0)
+    step_dW = np.nansum(dW_norm, axis=0)
+
+    summary = {
+        "aggregate_dQ_over_dW": safe_ratio(total_dQ, total_dW, eps=ratio_eps),
+        "aggregate_dP_over_dW": safe_ratio(total_dP, total_dW, eps=ratio_eps),
+        "raw_mean_dQ_ratio": float(np.nanmean(dQ_ratio)),
+        "raw_mean_dP_ratio": float(np.nanmean(dP_ratio)),
+        "stepwise_aggregate_dQ_over_dW": safe_ratio(step_dQ, step_dW, eps=ratio_eps),
+        "stepwise_aggregate_dP_over_dW": safe_ratio(step_dP, step_dW, eps=ratio_eps),
+        "stepwise_raw_mean_dQ_ratio": np.nanmean(dQ_ratio, axis=0),
+        "stepwise_raw_mean_dP_ratio": np.nanmean(dP_ratio, axis=0),
+        "mean_cum_Q_final": float(np.nanmean(cum_Q_drift[:, -1])),
+        "mean_cum_P_final": float(np.nanmean(cum_P_drift[:, -1])),
+        "mean_cum_W_final": float(np.nanmean(cum_W_drift[:, -1])),
+        "mean_cum_Q_fraction_final": safe_ratio(
+            np.nanmean(cum_Q_drift[:, -1]),
+            np.nanmean(cum_Q_drift[:, -1]) + np.nanmean(cum_P_drift[:, -1]),
+            eps=ratio_eps,
+        ),
+        "mean_cum_Q_over_P_final": safe_ratio(
+            np.nanmean(cum_Q_drift[:, -1]),
+            np.nanmean(cum_P_drift[:, -1]),
+            eps=ratio_eps,
+        ),
+        "final_loss": float(losses[-1]),
+        "dW_stats": nan_stats(dW_norm),
+        "dQ_ratio_stats": nan_stats(dQ_ratio),
+        "dP_ratio_stats": nan_stats(dP_ratio),
+        "small_dW_count": int(np.sum((dW_norm < small_dw_eps) & ~np.isnan(dW_norm))),
+        "small_dW_fraction": float(
+            np.sum((dW_norm < small_dw_eps) & ~np.isnan(dW_norm))
+            / max(1, np.sum(~np.isnan(dW_norm)))
+        ),
+        "valid_ratio_count": int(np.sum(~np.isnan(dQ_ratio))),
+        "total_dQ_norm": total_dQ,
+        "total_dP_norm": total_dP,
+        "total_dW_norm": total_dW,
+    }
+    return summary
+
+
+def build_windowed_ratio_rows(
+    results_sgd: Dict[str, Any],
+    results_muon: Dict[str, Any],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Per-report-step summaries for robust aggregate ratios and legacy raw means."""
+    rows: List[Dict[str, Any]] = []
+    num_steps = config["NUM_STEPS"]
+    radius = config["WINDOW_RADIUS"]
+    eps = config["RATIO_DENOM_EPS"]
+
+    for step in config["REPORT_STEPS"]:
+        lo, hi = report_window_bounds(step, num_steps=num_steps, radius=radius)
+        rows.append(
+            {
+                "step": int(step),
+                "window": [int(lo + 1), int(hi)],
+                "sgd_aggregate_dQ_over_dW": safe_ratio(
+                    np.nansum(results_sgd["dQ_norm"][:, lo:hi]),
+                    np.nansum(results_sgd["dW_norm"][:, lo:hi]),
+                    eps=eps,
+                ),
+                "sgd_aggregate_dP_over_dW": safe_ratio(
+                    np.nansum(results_sgd["dP_norm"][:, lo:hi]),
+                    np.nansum(results_sgd["dW_norm"][:, lo:hi]),
+                    eps=eps,
+                ),
+                "muon_aggregate_dQ_over_dW": safe_ratio(
+                    np.nansum(results_muon["dQ_norm"][:, lo:hi]),
+                    np.nansum(results_muon["dW_norm"][:, lo:hi]),
+                    eps=eps,
+                ),
+                "muon_aggregate_dP_over_dW": safe_ratio(
+                    np.nansum(results_muon["dP_norm"][:, lo:hi]),
+                    np.nansum(results_muon["dW_norm"][:, lo:hi]),
+                    eps=eps,
+                ),
+                "sgd_raw_mean_dQ_ratio": float(np.nanmean(results_sgd["dQ_ratio"][:, lo:hi])),
+                "sgd_raw_mean_dP_ratio": float(np.nanmean(results_sgd["dP_ratio"][:, lo:hi])),
+                "muon_raw_mean_dQ_ratio": float(np.nanmean(results_muon["dQ_ratio"][:, lo:hi])),
+                "muon_raw_mean_dP_ratio": float(np.nanmean(results_muon["dP_ratio"][:, lo:hi])),
+            }
+        )
+    return rows
+
+
+def build_cumulative_drift_rows(
+    results_sgd: Dict[str, Any],
+    results_muon: Dict[str, Any],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Per-report-step cumulative drift summaries."""
+    rows: List[Dict[str, Any]] = []
+    eps = config["RATIO_DENOM_EPS"]
+
+    for step in config["REPORT_STEPS"]:
+        idx = step - 1
+        sgd_q = float(np.nanmean(results_sgd["cum_Q_drift"][:, idx]))
+        sgd_p = float(np.nanmean(results_sgd["cum_P_drift"][:, idx]))
+        sgd_w = float(np.nanmean(results_sgd["cum_W_drift"][:, idx]))
+        muon_q = float(np.nanmean(results_muon["cum_Q_drift"][:, idx]))
+        muon_p = float(np.nanmean(results_muon["cum_P_drift"][:, idx]))
+        muon_w = float(np.nanmean(results_muon["cum_W_drift"][:, idx]))
+        rows.append(
+            {
+                "step": int(step),
+                "sgd_cum_Q": sgd_q,
+                "sgd_cum_P": sgd_p,
+                "sgd_cum_W": sgd_w,
+                "muon_cum_Q": muon_q,
+                "muon_cum_P": muon_p,
+                "muon_cum_W": muon_w,
+                "sgd_Q_over_P": safe_ratio(sgd_q, sgd_p, eps=eps),
+                "muon_Q_over_P": safe_ratio(muon_q, muon_p, eps=eps),
+                "sgd_Q_fraction": safe_ratio(sgd_q, sgd_q + sgd_p, eps=eps),
+                "muon_Q_fraction": safe_ratio(muon_q, muon_q + muon_p, eps=eps),
+            }
+        )
+    return rows
+
+
+def build_per_layer_rows(results: Dict[str, Any], config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Per-layer final summaries for one optimizer."""
+    rows: List[Dict[str, Any]] = []
+    eps = config["RATIO_DENOM_EPS"]
+    num_layers = config["NUM_LAYERS"]
+
+    for layer in range(num_layers):
+        total_dW = float(np.nansum(results["dW_norm"][layer, :]))
+        total_dQ = float(np.nansum(results["dQ_norm"][layer, :]))
+        total_dP = float(np.nansum(results["dP_norm"][layer, :]))
+        q_final = float(results["cum_Q_drift"][layer, -1])
+        p_final = float(results["cum_P_drift"][layer, -1])
+        rows.append(
+            {
+                "layer": int(layer),
+                "aggregate_dQ_over_dW": safe_ratio(total_dQ, total_dW, eps=eps),
+                "aggregate_dP_over_dW": safe_ratio(total_dP, total_dW, eps=eps),
+                "raw_mean_dQ_ratio": float(np.nanmean(results["dQ_ratio"][layer, :])),
+                "raw_mean_dP_ratio": float(np.nanmean(results["dP_ratio"][layer, :])),
+                "cum_Q_final": q_final,
+                "cum_P_final": p_final,
+                "Q_fraction_final": safe_ratio(q_final, q_final + p_final, eps=eps),
+            }
+        )
+    return rows
+
+
+def build_phase_rows(
+    results_sgd: Dict[str, Any],
+    results_muon: Dict[str, Any],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Early vs late comparisons for robust and raw summaries."""
+    eps = config["RATIO_DENOM_EPS"]
+    phase_specs = {
+        "early": slice(0, 50),
+        "late": slice(max(0, config["NUM_STEPS"] - 50), config["NUM_STEPS"]),
+    }
+    rows: List[Dict[str, Any]] = []
+    for name, sl in phase_specs.items():
+        rows.append(
+            {
+                "phase": name,
+                "sgd_aggregate_dQ_over_dW": safe_ratio(
+                    np.nansum(results_sgd["dQ_norm"][:, sl]),
+                    np.nansum(results_sgd["dW_norm"][:, sl]),
+                    eps=eps,
+                ),
+                "sgd_aggregate_dP_over_dW": safe_ratio(
+                    np.nansum(results_sgd["dP_norm"][:, sl]),
+                    np.nansum(results_sgd["dW_norm"][:, sl]),
+                    eps=eps,
+                ),
+                "muon_aggregate_dQ_over_dW": safe_ratio(
+                    np.nansum(results_muon["dQ_norm"][:, sl]),
+                    np.nansum(results_muon["dW_norm"][:, sl]),
+                    eps=eps,
+                ),
+                "muon_aggregate_dP_over_dW": safe_ratio(
+                    np.nansum(results_muon["dP_norm"][:, sl]),
+                    np.nansum(results_muon["dW_norm"][:, sl]),
+                    eps=eps,
+                ),
+                "sgd_raw_mean_dQ_ratio": float(np.nanmean(results_sgd["dQ_ratio"][:, sl])),
+                "sgd_raw_mean_dP_ratio": float(np.nanmean(results_sgd["dP_ratio"][:, sl])),
+                "muon_raw_mean_dQ_ratio": float(np.nanmean(results_muon["dQ_ratio"][:, sl])),
+                "muon_raw_mean_dP_ratio": float(np.nanmean(results_muon["dP_ratio"][:, sl])),
+            }
+        )
+    return rows
+
+
+def evaluate_assessment(
+    summary_sgd: Dict[str, Any],
+    summary_muon: Dict[str, Any],
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return continuity tests plus a more calibrated single-run conclusion."""
+    num_steps = config["NUM_STEPS"]
+
+    legacy_tests = {
+        "T1": {
+            "description": "Muon raw mean ||dQ||/||dW|| > SGD raw mean ||dQ||/||dW||",
+            "muon": summary_muon["raw_mean_dQ_ratio"],
+            "sgd": summary_sgd["raw_mean_dQ_ratio"],
+            "passed": bool(summary_muon["raw_mean_dQ_ratio"] > summary_sgd["raw_mean_dQ_ratio"]),
+        },
+        "T2": {
+            "description": "Muon raw mean ||dP||/||dW|| < SGD raw mean ||dP||/||dW||",
+            "muon": summary_muon["raw_mean_dP_ratio"],
+            "sgd": summary_sgd["raw_mean_dP_ratio"],
+            "passed": bool(summary_muon["raw_mean_dP_ratio"] < summary_sgd["raw_mean_dP_ratio"]),
+        },
+        "T3": {
+            "description": f"Muon cumulative Q/(Q+P) > SGD cumulative Q/(Q+P) at step {num_steps}",
+            "muon": summary_muon["mean_cum_Q_fraction_final"],
+            "sgd": summary_sgd["mean_cum_Q_fraction_final"],
+            "passed": bool(summary_muon["mean_cum_Q_fraction_final"] > summary_sgd["mean_cum_Q_fraction_final"]),
+        },
+        "T4": {
+            "description": "Muon cumulative Q/P ratio > SGD cumulative Q/P ratio",
+            "muon": summary_muon["mean_cum_Q_over_P_final"],
+            "sgd": summary_sgd["mean_cum_Q_over_P_final"],
+            "passed": bool(summary_muon["mean_cum_Q_over_P_final"] > summary_sgd["mean_cum_Q_over_P_final"]),
+        },
+        "T5": {
+            "description": f"Muon ||P-P0|| < SGD ||P-P0|| at step {num_steps}",
+            "muon": summary_muon["mean_cum_P_final"],
+            "sgd": summary_sgd["mean_cum_P_final"],
+            "passed": bool(summary_muon["mean_cum_P_final"] < summary_sgd["mean_cum_P_final"]),
+        },
+    }
+
+    robust_tests = {
+        "R1": {
+            "description": "Muon aggregate Σ||dQ|| / Σ||dW|| > SGD aggregate Σ||dQ|| / Σ||dW||",
+            "muon": summary_muon["aggregate_dQ_over_dW"],
+            "sgd": summary_sgd["aggregate_dQ_over_dW"],
+            "passed": bool(summary_muon["aggregate_dQ_over_dW"] > summary_sgd["aggregate_dQ_over_dW"]),
+        },
+        "R2": {
+            "description": "Muon aggregate Σ||dP|| / Σ||dW|| < SGD aggregate Σ||dP|| / Σ||dW||",
+            "muon": summary_muon["aggregate_dP_over_dW"],
+            "sgd": summary_sgd["aggregate_dP_over_dW"],
+            "passed": bool(summary_muon["aggregate_dP_over_dW"] < summary_sgd["aggregate_dP_over_dW"]),
+        },
+    }
+
+    legacy_score = int(sum(test["passed"] for test in legacy_tests.values()))
+    similar_profiles = abs(
+        summary_muon["mean_cum_Q_fraction_final"] - summary_sgd["mean_cum_Q_fraction_final"]
+    ) < 0.05
+
+    if legacy_score >= 4:
+        legacy_label = "STRONG SUPPORT"
+    elif legacy_score >= 3:
+        legacy_label = "MODERATE SUPPORT"
+    elif legacy_score >= 2:
+        legacy_label = "WEAK SIGNAL"
+    else:
+        legacy_label = "NO SUPPORT / SURPRISING"
+    if similar_profiles:
+        legacy_label += " (SIMILAR PROFILES)"
+
+    supported: List[str] = []
+    not_supported: List[str] = []
+
+    if robust_tests["R1"]["passed"]:
+        supported.append("Muon has a larger aggregate per-step ||ΔQ||/||ΔW|| ratio than SGD.")
+    else:
+        not_supported.append(
+            "Muon does not have a larger aggregate per-step ||ΔQ||/||ΔW|| ratio than SGD."
+        )
+
+    if legacy_tests["T1"]["passed"]:
+        supported.append("Muon also exceeds SGD under the legacy raw-mean ||ΔQ||/||ΔW|| metric.")
+    else:
+        not_supported.append(
+            "Muon does not exceed SGD under the legacy raw-mean ||ΔQ||/||ΔW|| metric."
+        )
+
+    if robust_tests["R2"]["passed"] and legacy_tests["T2"]["passed"]:
+        supported.append("Muon has lower per-step P-factor motion than SGD under both aggregate and raw summaries.")
+    elif robust_tests["R2"]["passed"]:
+        supported.append("Muon has lower aggregate per-step P-factor motion than SGD.")
+    else:
+        not_supported.append("Muon does not show lower per-step P-factor motion than SGD.")
+
+    if legacy_tests["T3"]["passed"]:
+        supported.append("Muon ends with a higher cumulative orientation fraction Q/(Q+P) than SGD.")
+    else:
+        not_supported.append("Muon does not end with a higher cumulative orientation fraction than SGD.")
+
+    if legacy_tests["T5"]["passed"]:
+        supported.append("Muon ends with lower cumulative P drift than SGD.")
+    else:
+        not_supported.append("Muon does not end with lower cumulative P drift than SGD.")
+
+    if summary_muon["final_loss"] < summary_sgd["final_loss"]:
+        supported.append("Muon reaches a lower final loss in this single fixed-batch run.")
+    else:
+        not_supported.append("Muon does not reach a lower final loss in this single fixed-batch run.")
+
+    q_support = robust_tests["R1"]["passed"] and legacy_tests["T1"]["passed"]
+    p_support = robust_tests["R2"]["passed"]
+    cumulative_support = legacy_tests["T3"]["passed"] and legacy_tests["T5"]["passed"]
+
+    if q_support and p_support and cumulative_support:
+        calibrated_label = "CONSISTENT SINGLE-RUN SUPPORT"
+        calibrated_detail = (
+            "Within this toy per-layer polar-factor proxy, Muon shows more Q-directed motion, "
+            "less P-directed motion, and a higher cumulative orientation fraction than SGD. "
+            "This remains single-seed, fixed-batch evidence rather than a direct measurement "
+            "of deep-linear gauge coordinates."
+        )
+    elif p_support and cumulative_support:
+        calibrated_label = "MIXED SINGLE-RUN EVIDENCE"
+        calibrated_detail = (
+            "Muon shows less P-directed motion and a somewhat higher cumulative orientation "
+            "fraction than SGD, but the stronger claim of larger per-step Q motion is not "
+            "supported across the available summaries."
+        )
+    elif cumulative_support:
+        calibrated_label = "CUMULATIVE-ONLY SIGNAL"
+        calibrated_detail = (
+            "Differences appear mainly in cumulative drifts, while the per-step evidence is weak "
+            "or inconsistent. Interpret this as suggestive rather than strong support."
+        )
+    else:
+        calibrated_label = "NO CLEAR SUPPORT"
+        calibrated_detail = (
+            "This run does not provide clear support for the expectation that Muon is more "
+            "orientation-dominated than SGD in these polar-factor diagnostics."
+        )
+
+    return {
+        "legacy_tests": legacy_tests,
+        "robust_tests": robust_tests,
+        "legacy_score": legacy_score,
+        "legacy_label": legacy_label,
+        "calibrated_conclusion": {
+            "label": calibrated_label,
+            "detail": calibrated_detail,
+            "supported_expectations": supported,
+            "unsupported_expectations": not_supported,
+            "limitations": [
+                "Single seed only.",
+                "Fixed input batch only.",
+                "Per-layer polar factors are proxy diagnostics, not direct deep-linear gauge coordinates.",
+                "Raw mean ratio tests are sensitive to tiny ||ΔW|| denominators.",
+            ],
+        },
+    }
+
+
+def compute_problem_diagnostics(
+    config: Dict[str, Any],
+    x_data: np.ndarray,
+    target: np.ndarray,
+) -> Dict[str, Any]:
+    """Diagnostics for the fixed problem instance and initial weights."""
+    dim = config["DIM"]
+    num_layers = config["NUM_LAYERS"]
+    seed = config["SEED"]
+
+    w_test = init_weights(num_layers, dim, seed=seed)
+    initial_loss = compute_loss(w_test, x_data, target)
+    target_singular_values = np.linalg.svd(target, compute_uv=False)
+    target_condition_number = float(target_singular_values[0] / target_singular_values[-1])
+
+    polar_checks = []
+    for layer, w in enumerate(w_test):
+        q, p = polar_decomposition(w)
+        polar_checks.append(
+            {
+                "layer": int(layer),
+                "recon_err": float(np.linalg.norm(w - q @ p, ord="fro") / np.linalg.norm(w, ord="fro")),
+                "Q_orth_err": float(np.linalg.norm(q.T @ q - np.eye(dim), ord="fro")),
+                "P_sym_err": float(np.linalg.norm(p - p.T, ord="fro")),
+                "P_min_eig": float(np.min(np.linalg.eigvalsh(p))),
+            }
+        )
+
+    return {
+        "initial_loss": float(initial_loss),
+        "target_singular_values": target_singular_values,
+        "target_condition_number": target_condition_number,
+        "polar_checks": polar_checks,
+    }
 
 
 # =============================================================================
-# RUN BOTH OPTIMIZERS
+# PLOTTING
 # =============================================================================
 
-print(f"\n{'=' * 100}")
-print("RUNNING OPTIMIZERS AND TRACKING POLAR DECOMPOSITION")
-print("=" * 100)
+def make_overview_plot(
+    results_sgd: Dict[str, Any],
+    results_muon: Dict[str, Any],
+    summary_sgd: Dict[str, Any],
+    summary_muon: Dict[str, Any],
+    config: Dict[str, Any],
+    lr_sgd: float,
+    out_dir: Path,
+) -> Optional[str]:
+    """Save the main six-panel overview plot and return its path."""
+    try:
+        import matplotlib
 
-print("\n  Running SGD...", flush=True)
-results_sgd = run_and_track_polar('sgd', lr_sgd, NUM_STEPS)
-print(f"    Final loss: {results_sgd['losses'][-1]:.6e}")
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
 
-print("\n  Running Muon...", flush=True)
-results_muon = run_and_track_polar('muon', LR_MUON, NUM_STEPS)
-print(f"    Final loss: {results_muon['losses'][-1]:.6e}")
-
-
-# =============================================================================
-# TABLE 1: PER-STEP RATIOS AT REPORT STEPS (averaged across layers)
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("TABLE 1: PER-STEP ORIENTATION vs SPECTRUM CHANGE RATIOS")
-print("        (averaged across layers, averaged over 10-step window around report step)")
-print("=" * 100)
-
-print(f"\n{'Step':>6} | {'SGD ||dQ||/||dW||':>18} | {'SGD ||dP||/||dW||':>18} | "
-      f"{'Muon ||dQ||/||dW||':>19} | {'Muon ||dP||/||dW||':>19}")
-print("-" * 90)
-
-for step in REPORT_STEPS:
-    # Average over a window of 10 steps centered on the report step
-    lo = max(0, step - 5)
-    hi = min(NUM_STEPS, step + 5)
-
-    sgd_dQ_r = np.nanmean(results_sgd['dQ_ratio'][:, lo:hi])
-    sgd_dP_r = np.nanmean(results_sgd['dP_ratio'][:, lo:hi])
-    muon_dQ_r = np.nanmean(results_muon['dQ_ratio'][:, lo:hi])
-    muon_dP_r = np.nanmean(results_muon['dP_ratio'][:, lo:hi])
-
-    print(f"{step:6d} | {sgd_dQ_r:18.6f} | {sgd_dP_r:18.6f} | "
-          f"{muon_dQ_r:19.6f} | {muon_dP_r:19.6f}")
-
-# Overall averages
-sgd_dQ_overall = np.nanmean(results_sgd['dQ_ratio'])
-sgd_dP_overall = np.nanmean(results_sgd['dP_ratio'])
-muon_dQ_overall = np.nanmean(results_muon['dQ_ratio'])
-muon_dP_overall = np.nanmean(results_muon['dP_ratio'])
-
-print("-" * 90)
-print(f"{'ALL':>6} | {sgd_dQ_overall:18.6f} | {sgd_dP_overall:18.6f} | "
-      f"{muon_dQ_overall:19.6f} | {muon_dP_overall:19.6f}")
-
-
-# =============================================================================
-# TABLE 2: CUMULATIVE DRIFT AT REPORT STEPS (averaged across layers)
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("TABLE 2: CUMULATIVE DRIFT FROM INITIALIZATION (averaged across layers)")
-print("=" * 100)
-
-print(f"\n{'Step':>6} | {'SGD ||Q-Q0||':>14} | {'SGD ||P-P0||':>14} | {'SGD ||W-W0||':>14} | "
-      f"{'Muon ||Q-Q0||':>14} | {'Muon ||P-P0||':>14} | {'Muon ||W-W0||':>14}")
-print("-" * 105)
-
-for step in REPORT_STEPS:
-    idx = step - 1  # 0-indexed
-    sgd_Qd = np.nanmean(results_sgd['cum_Q_drift'][:, idx])
-    sgd_Pd = np.nanmean(results_sgd['cum_P_drift'][:, idx])
-    sgd_Wd = np.nanmean(results_sgd['cum_W_drift'][:, idx])
-    muon_Qd = np.nanmean(results_muon['cum_Q_drift'][:, idx])
-    muon_Pd = np.nanmean(results_muon['cum_P_drift'][:, idx])
-    muon_Wd = np.nanmean(results_muon['cum_W_drift'][:, idx])
-
-    print(f"{step:6d} | {sgd_Qd:14.6f} | {sgd_Pd:14.6f} | {sgd_Wd:14.6f} | "
-          f"{muon_Qd:14.6f} | {muon_Pd:14.6f} | {muon_Wd:14.6f}")
-
-
-# =============================================================================
-# TABLE 3: RATIO OF CUMULATIVE Q DRIFT TO P DRIFT
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("TABLE 3: RATIO OF CUMULATIVE Q-DRIFT TO P-DRIFT (averaged across layers)")
-print("         Q-drift / P-drift > 1 means more orientation change than spectrum change")
-print("=" * 100)
-
-print(f"\n{'Step':>6} | {'SGD Q/P ratio':>14} | {'Muon Q/P ratio':>15} | {'SGD Q/(Q+P)':>12} | {'Muon Q/(Q+P)':>13}")
-print("-" * 72)
-
-for step in REPORT_STEPS:
-    idx = step - 1
-    sgd_Qd = np.nanmean(results_sgd['cum_Q_drift'][:, idx])
-    sgd_Pd = np.nanmean(results_sgd['cum_P_drift'][:, idx])
-    muon_Qd = np.nanmean(results_muon['cum_Q_drift'][:, idx])
-    muon_Pd = np.nanmean(results_muon['cum_P_drift'][:, idx])
-
-    sgd_qp = sgd_Qd / sgd_Pd if sgd_Pd > 1e-15 else np.inf
-    muon_qp = muon_Qd / muon_Pd if muon_Pd > 1e-15 else np.inf
-    sgd_frac = sgd_Qd / (sgd_Qd + sgd_Pd) if (sgd_Qd + sgd_Pd) > 1e-15 else np.nan
-    muon_frac = muon_Qd / (muon_Qd + muon_Pd) if (muon_Qd + muon_Pd) > 1e-15 else np.nan
-
-    print(f"{step:6d} | {sgd_qp:14.4f} | {muon_qp:15.4f} | {sgd_frac:12.4f} | {muon_frac:13.4f}")
-
-
-# =============================================================================
-# TABLE 4: PER-LAYER BREAKDOWN AT STEP 300
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("TABLE 4: PER-LAYER BREAKDOWN AT STEP 300")
-print("=" * 100)
-
-print(f"\n  SGD (lr={lr_sgd}):")
-print(f"  {'Layer':>6} | {'||dQ||/||dW||':>14} | {'||dP||/||dW||':>14} | "
-      f"{'cum ||Q-Q0||':>14} | {'cum ||P-P0||':>14} | {'Q/(Q+P)':>10}")
-print("  " + "-" * 85)
-
-for layer in range(NUM_LAYERS):
-    dQr = np.nanmean(results_sgd['dQ_ratio'][layer, :])
-    dPr = np.nanmean(results_sgd['dP_ratio'][layer, :])
-    Qd = results_sgd['cum_Q_drift'][layer, -1]
-    Pd = results_sgd['cum_P_drift'][layer, -1]
-    frac = Qd / (Qd + Pd) if (Qd + Pd) > 1e-15 else np.nan
-    print(f"  {layer:6d} | {dQr:14.6f} | {dPr:14.6f} | {Qd:14.6f} | {Pd:14.6f} | {frac:10.4f}")
-
-print(f"\n  Muon (lr={LR_MUON}):")
-print(f"  {'Layer':>6} | {'||dQ||/||dW||':>14} | {'||dP||/||dW||':>14} | "
-      f"{'cum ||Q-Q0||':>14} | {'cum ||P-P0||':>14} | {'Q/(Q+P)':>10}")
-print("  " + "-" * 85)
-
-for layer in range(NUM_LAYERS):
-    dQr = np.nanmean(results_muon['dQ_ratio'][layer, :])
-    dPr = np.nanmean(results_muon['dP_ratio'][layer, :])
-    Qd = results_muon['cum_Q_drift'][layer, -1]
-    Pd = results_muon['cum_P_drift'][layer, -1]
-    frac = Qd / (Qd + Pd) if (Qd + Pd) > 1e-15 else np.nan
-    print(f"  {layer:6d} | {dQr:14.6f} | {dPr:14.6f} | {Qd:14.6f} | {Pd:14.6f} | {frac:10.4f}")
-
-
-# =============================================================================
-# TABLE 5: EARLY vs LATE TRAINING COMPARISON
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("TABLE 5: EARLY (steps 1-50) vs LATE (steps 250-300) TRAINING DYNAMICS")
-print("=" * 100)
-
-early_slice = slice(0, 50)
-late_slice = slice(250, 300)
-
-print(f"\n{'Phase':>10} | {'SGD dQ/dW':>12} | {'SGD dP/dW':>12} | "
-      f"{'Muon dQ/dW':>12} | {'Muon dP/dW':>12}")
-print("-" * 68)
-
-for phase_name, sl in [('Early', early_slice), ('Late', late_slice)]:
-    sgd_dQr = np.nanmean(results_sgd['dQ_ratio'][:, sl])
-    sgd_dPr = np.nanmean(results_sgd['dP_ratio'][:, sl])
-    muon_dQr = np.nanmean(results_muon['dQ_ratio'][:, sl])
-    muon_dPr = np.nanmean(results_muon['dP_ratio'][:, sl])
-    print(f"{phase_name:>10} | {sgd_dQr:12.6f} | {sgd_dPr:12.6f} | "
-          f"{muon_dQr:12.6f} | {muon_dPr:12.6f}")
-
-
-# =============================================================================
-# PLOT: CUMULATIVE Q AND P DRIFT OVER TIME
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("GENERATING PLOTS")
-print("=" * 100)
-
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    num_layers = config["NUM_LAYERS"]
+    num_steps = config["NUM_STEPS"]
+    dim = config["DIM"]
 
     fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-    fig.suptitle('1.2b-ii: Trajectory in Polar Coordinates -- (Q, P) Decomposition\n'
-                 f'{NUM_LAYERS}-layer linear net, dim={DIM}, {NUM_STEPS} steps',
-                 fontsize=14, fontweight='bold')
+    fig.suptitle(
+        "1.2b-ii: Polar-factor trajectory proxy analysis\n"
+        f"{num_layers}-layer linear net, dim={dim}, {num_steps} steps",
+        fontsize=14,
+        fontweight="bold",
+    )
 
-    t_axis = np.arange(NUM_STEPS)
+    t_axis = np.arange(1, num_steps + 1)
 
-    # --- Panel (a): Cumulative Q drift ---
     ax = axes[0, 0]
-    ax.set_title('(a) Cumulative Orientation Drift ||Q_t - Q_0||')
-    for layer in range(NUM_LAYERS):
-        ax.plot(t_axis, results_sgd['cum_Q_drift'][layer, :],
-                'b-', alpha=0.3, linewidth=0.8)
-        ax.plot(t_axis, results_muon['cum_Q_drift'][layer, :],
-                'r-', alpha=0.3, linewidth=0.8)
-    # Layer-averaged
-    ax.plot(t_axis, np.mean(results_sgd['cum_Q_drift'], axis=0),
-            'b-', linewidth=2.5, label='SGD (avg)')
-    ax.plot(t_axis, np.mean(results_muon['cum_Q_drift'], axis=0),
-            'r-', linewidth=2.5, label='Muon (avg)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('||Q_t - Q_0||_F')
+    ax.set_title("(a) Cumulative orientation drift ||Q_t - Q_0||")
+    for layer in range(num_layers):
+        ax.plot(t_axis, results_sgd["cum_Q_drift"][layer, :], "b-", alpha=0.3, linewidth=0.8)
+        ax.plot(t_axis, results_muon["cum_Q_drift"][layer, :], "r-", alpha=0.3, linewidth=0.8)
+    ax.plot(t_axis, np.nanmean(results_sgd["cum_Q_drift"], axis=0), "b-", linewidth=2.5, label="SGD (avg)")
+    ax.plot(t_axis, np.nanmean(results_muon["cum_Q_drift"], axis=0), "r-", linewidth=2.5, label="Muon (avg)")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("||Q_t - Q_0||_F")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (b): Cumulative P drift ---
     ax = axes[0, 1]
-    ax.set_title('(b) Cumulative Spectrum Drift ||P_t - P_0||')
-    for layer in range(NUM_LAYERS):
-        ax.plot(t_axis, results_sgd['cum_P_drift'][layer, :],
-                'b-', alpha=0.3, linewidth=0.8)
-        ax.plot(t_axis, results_muon['cum_P_drift'][layer, :],
-                'r-', alpha=0.3, linewidth=0.8)
-    ax.plot(t_axis, np.mean(results_sgd['cum_P_drift'], axis=0),
-            'b-', linewidth=2.5, label='SGD (avg)')
-    ax.plot(t_axis, np.mean(results_muon['cum_P_drift'], axis=0),
-            'r-', linewidth=2.5, label='Muon (avg)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('||P_t - P_0||_F')
+    ax.set_title("(b) Cumulative spectrum drift ||P_t - P_0||")
+    for layer in range(num_layers):
+        ax.plot(t_axis, results_sgd["cum_P_drift"][layer, :], "b-", alpha=0.3, linewidth=0.8)
+        ax.plot(t_axis, results_muon["cum_P_drift"][layer, :], "r-", alpha=0.3, linewidth=0.8)
+    ax.plot(t_axis, np.nanmean(results_sgd["cum_P_drift"], axis=0), "b-", linewidth=2.5, label="SGD (avg)")
+    ax.plot(t_axis, np.nanmean(results_muon["cum_P_drift"], axis=0), "r-", linewidth=2.5, label="Muon (avg)")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("||P_t - P_0||_F")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (c): Q drift / (Q drift + P drift) over time ---
     ax = axes[0, 2]
-    ax.set_title('(c) Orientation Fraction: ||Q-Q0|| / (||Q-Q0|| + ||P-P0||)')
-    sgd_Q_avg = np.mean(results_sgd['cum_Q_drift'], axis=0)
-    sgd_P_avg = np.mean(results_sgd['cum_P_drift'], axis=0)
-    muon_Q_avg = np.mean(results_muon['cum_Q_drift'], axis=0)
-    muon_P_avg = np.mean(results_muon['cum_P_drift'], axis=0)
-
-    sgd_frac = sgd_Q_avg / (sgd_Q_avg + sgd_P_avg + 1e-15)
-    muon_frac = muon_Q_avg / (muon_Q_avg + muon_P_avg + 1e-15)
-
-    ax.plot(t_axis, sgd_frac, 'b-', linewidth=2.5, label='SGD')
-    ax.plot(t_axis, muon_frac, 'r-', linewidth=2.5, label='Muon')
-    ax.axhline(y=0.5, color='gray', linestyle='--', linewidth=1, alpha=0.7,
-               label='Equal Q/P')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('Q fraction')
+    ax.set_title("(c) Cumulative orientation fraction Q/(Q+P)")
+    sgd_q_avg = np.nanmean(results_sgd["cum_Q_drift"], axis=0)
+    sgd_p_avg = np.nanmean(results_sgd["cum_P_drift"], axis=0)
+    muon_q_avg = np.nanmean(results_muon["cum_Q_drift"], axis=0)
+    muon_p_avg = np.nanmean(results_muon["cum_P_drift"], axis=0)
+    ax.plot(t_axis, safe_ratio(sgd_q_avg, sgd_q_avg + sgd_p_avg), "b-", linewidth=2.5, label="SGD")
+    ax.plot(t_axis, safe_ratio(muon_q_avg, muon_q_avg + muon_p_avg), "r-", linewidth=2.5, label="Muon")
+    ax.axhline(y=0.5, color="gray", linestyle="--", linewidth=1, alpha=0.7, label="Q=P")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Q/(Q+P)")
     ax.set_ylim(0, 1)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (d): Per-step ||dQ||/||dW|| ---
     ax = axes[1, 0]
-    ax.set_title('(d) Per-Step ||dQ|| / ||dW|| (layer-averaged)')
-
-    # Smooth with rolling window
-    window = 10
-    sgd_dQr_avg = np.nanmean(results_sgd['dQ_ratio'], axis=0)
-    muon_dQr_avg = np.nanmean(results_muon['dQ_ratio'], axis=0)
-
-    # Rolling mean
-    sgd_dQr_smooth = np.convolve(sgd_dQr_avg, np.ones(window)/window, mode='valid')
-    muon_dQr_smooth = np.convolve(muon_dQr_avg, np.ones(window)/window, mode='valid')
-
-    ax.plot(np.arange(len(sgd_dQr_smooth)), sgd_dQr_smooth,
-            'b-', linewidth=2, label='SGD')
-    ax.plot(np.arange(len(muon_dQr_smooth)), muon_dQr_smooth,
-            'r-', linewidth=2, label='Muon')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('||dQ|| / ||dW||')
+    ax.set_title("(d) Aggregate per-step Σ||ΔQ|| / Σ||ΔW|| across layers")
+    ax.plot(t_axis, summary_sgd["stepwise_aggregate_dQ_over_dW"], "b-", linewidth=2, label="SGD")
+    ax.plot(t_axis, summary_muon["stepwise_aggregate_dQ_over_dW"], "r-", linewidth=2, label="Muon")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Aggregate ||ΔQ|| / ||ΔW||")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (e): Per-step ||dP||/||dW|| ---
     ax = axes[1, 1]
-    ax.set_title('(e) Per-Step ||dP|| / ||dW|| (layer-averaged)')
-
-    sgd_dPr_avg = np.nanmean(results_sgd['dP_ratio'], axis=0)
-    muon_dPr_avg = np.nanmean(results_muon['dP_ratio'], axis=0)
-
-    sgd_dPr_smooth = np.convolve(sgd_dPr_avg, np.ones(window)/window, mode='valid')
-    muon_dPr_smooth = np.convolve(muon_dPr_avg, np.ones(window)/window, mode='valid')
-
-    ax.plot(np.arange(len(sgd_dPr_smooth)), sgd_dPr_smooth,
-            'b-', linewidth=2, label='SGD')
-    ax.plot(np.arange(len(muon_dPr_smooth)), muon_dPr_smooth,
-            'r-', linewidth=2, label='Muon')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('||dP|| / ||dW||')
+    ax.set_title("(e) Aggregate per-step Σ||ΔP|| / Σ||ΔW|| across layers")
+    ax.plot(t_axis, summary_sgd["stepwise_aggregate_dP_over_dW"], "b-", linewidth=2, label="SGD")
+    ax.plot(t_axis, summary_muon["stepwise_aggregate_dP_over_dW"], "r-", linewidth=2, label="Muon")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Aggregate ||ΔP|| / ||ΔW||")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (f): Loss curves ---
     ax = axes[1, 2]
-    ax.set_title('(f) Training Loss')
-    ax.semilogy(np.arange(NUM_STEPS + 1), results_sgd['losses'], 'b-',
-                linewidth=2, label=f'SGD (lr={lr_sgd})')
-    ax.semilogy(np.arange(NUM_STEPS + 1), results_muon['losses'], 'r-',
-                linewidth=2, label=f'Muon (lr={LR_MUON})')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('Loss')
+    ax.set_title("(f) Training loss")
+    ax.semilogy(np.arange(num_steps + 1), results_sgd["losses"], "b-", linewidth=2, label=f"SGD (lr={lr_sgd})")
+    ax.semilogy(
+        np.arange(num_steps + 1),
+        results_muon["losses"],
+        "r-",
+        linewidth=2,
+        label=f"Muon (lr={config['LR_MUON']})",
+    )
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plot_path = os.path.join(SCRIPT_DIR, 'polar_trajectory_decomposition.png')
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\n  Plot saved to: {plot_path}")
-
-except ImportError:
-    print("\n  WARNING: matplotlib not available, skipping plots.")
-    plot_path = None
+    plot_path = out_dir / "polar_trajectory_decomposition.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return str(plot_path)
 
 
-# =============================================================================
-# ADDITIONAL PLOT: PHASE PORTRAIT (Q drift vs P drift)
-# =============================================================================
+def make_phase_portrait(
+    results_sgd: Dict[str, Any],
+    results_muon: Dict[str, Any],
+    config: Dict[str, Any],
+    out_dir: Path,
+) -> Optional[str]:
+    """Save the phase portrait plot and return its path."""
+    try:
+        import matplotlib
 
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    num_layers = config["NUM_LAYERS"]
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle('1.2b-ii: Phase Portrait -- Cumulative Q Drift vs P Drift',
-                 fontsize=13, fontweight='bold')
-
-    # Panel (a): All layers
-    ax = axes[0]
-    ax.set_title('(a) Per-Layer Phase Portrait')
-    for layer in range(NUM_LAYERS):
-        ax.plot(results_sgd['cum_P_drift'][layer, :],
-                results_sgd['cum_Q_drift'][layer, :],
-                'b-', alpha=0.5, linewidth=1, label=f'SGD L{layer}' if layer == 0 else None)
-        ax.plot(results_muon['cum_P_drift'][layer, :],
-                results_muon['cum_Q_drift'][layer, :],
-                'r-', alpha=0.5, linewidth=1, label=f'Muon L{layer}' if layer == 0 else None)
-        # Mark endpoints
-        ax.plot(results_sgd['cum_P_drift'][layer, -1],
-                results_sgd['cum_Q_drift'][layer, -1],
-                'bx', markersize=8)
-        ax.plot(results_muon['cum_P_drift'][layer, -1],
-                results_muon['cum_Q_drift'][layer, -1],
-                'rx', markersize=8)
-
-    # Diagonal reference line
-    max_val = max(
-        np.nanmax(results_sgd['cum_Q_drift']),
-        np.nanmax(results_sgd['cum_P_drift']),
-        np.nanmax(results_muon['cum_Q_drift']),
-        np.nanmax(results_muon['cum_P_drift']),
+    fig.suptitle(
+        "1.2b-ii: Phase portrait of cumulative polar-factor drifts",
+        fontsize=13,
+        fontweight="bold",
     )
-    ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.4, label='Q=P (equal)')
-    ax.set_xlabel('Cumulative ||P_t - P_0||_F (spectrum drift)')
-    ax.set_ylabel('Cumulative ||Q_t - Q_0||_F (orientation drift)')
+
+    ax = axes[0]
+    ax.set_title("(a) Per-layer trajectories")
+    for layer in range(num_layers):
+        ax.plot(
+            results_sgd["cum_P_drift"][layer, :],
+            results_sgd["cum_Q_drift"][layer, :],
+            "b-",
+            alpha=0.5,
+            linewidth=1,
+            label="SGD" if layer == 0 else None,
+        )
+        ax.plot(
+            results_muon["cum_P_drift"][layer, :],
+            results_muon["cum_Q_drift"][layer, :],
+            "r-",
+            alpha=0.5,
+            linewidth=1,
+            label="Muon" if layer == 0 else None,
+        )
+        ax.plot(results_sgd["cum_P_drift"][layer, -1], results_sgd["cum_Q_drift"][layer, -1], "bx", markersize=8)
+        ax.plot(results_muon["cum_P_drift"][layer, -1], results_muon["cum_Q_drift"][layer, -1], "rx", markersize=8)
+
+    max_val = max(
+        float(np.nanmax(results_sgd["cum_Q_drift"])),
+        float(np.nanmax(results_sgd["cum_P_drift"])),
+        float(np.nanmax(results_muon["cum_Q_drift"])),
+        float(np.nanmax(results_muon["cum_P_drift"])),
+    )
+    ax.plot([0, max_val], [0, max_val], "k--", alpha=0.4, label="Q=P")
+    ax.set_xlabel("Cumulative ||P_t - P_0||_F")
+    ax.set_ylabel("Cumulative ||Q_t - Q_0||_F")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # Panel (b): Averaged
     ax = axes[1]
-    ax.set_title('(b) Layer-Averaged Phase Portrait')
-    sgd_Q_avg = np.mean(results_sgd['cum_Q_drift'], axis=0)
-    sgd_P_avg = np.mean(results_sgd['cum_P_drift'], axis=0)
-    muon_Q_avg = np.mean(results_muon['cum_Q_drift'], axis=0)
-    muon_P_avg = np.mean(results_muon['cum_P_drift'], axis=0)
-
-    ax.plot(sgd_P_avg, sgd_Q_avg, 'b-', linewidth=2.5, label='SGD')
-    ax.plot(muon_P_avg, muon_Q_avg, 'r-', linewidth=2.5, label='Muon')
-    ax.plot(sgd_P_avg[-1], sgd_Q_avg[-1], 'bx', markersize=12, markeredgewidth=3)
-    ax.plot(muon_P_avg[-1], muon_Q_avg[-1], 'rx', markersize=12, markeredgewidth=3)
-    ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.4, label='Q=P (equal)')
-    ax.set_xlabel('Cumulative ||P_t - P_0||_F (spectrum drift)')
-    ax.set_ylabel('Cumulative ||Q_t - Q_0||_F (orientation drift)')
+    ax.set_title("(b) Layer-averaged trajectory")
+    sgd_q_avg = np.nanmean(results_sgd["cum_Q_drift"], axis=0)
+    sgd_p_avg = np.nanmean(results_sgd["cum_P_drift"], axis=0)
+    muon_q_avg = np.nanmean(results_muon["cum_Q_drift"], axis=0)
+    muon_p_avg = np.nanmean(results_muon["cum_P_drift"], axis=0)
+    ax.plot(sgd_p_avg, sgd_q_avg, "b-", linewidth=2.5, label="SGD")
+    ax.plot(muon_p_avg, muon_q_avg, "r-", linewidth=2.5, label="Muon")
+    ax.plot(sgd_p_avg[-1], sgd_q_avg[-1], "bx", markersize=12, markeredgewidth=3)
+    ax.plot(muon_p_avg[-1], muon_q_avg[-1], "rx", markersize=12, markeredgewidth=3)
+    ax.plot([0, max_val], [0, max_val], "k--", alpha=0.4, label="Q=P")
+    ax.set_xlabel("Cumulative ||P_t - P_0||_F")
+    ax.set_ylabel("Cumulative ||Q_t - Q_0||_F")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plot_path2 = os.path.join(SCRIPT_DIR, 'polar_phase_portrait.png')
-    plt.savefig(plot_path2, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Plot saved to: {plot_path2}")
-
-except ImportError:
-    pass
+    plot_path = out_dir / "polar_phase_portrait.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return str(plot_path)
 
 
 # =============================================================================
-# VERDICT
+# REPORTING
 # =============================================================================
 
-print(f"\n\n{'=' * 100}")
-print("FINAL ANALYSIS: POLAR COORDINATE TRAJECTORY DECOMPOSITION")
-print("=" * 100)
+def print_header(config: Dict[str, Any]) -> None:
+    print("=" * 100)
+    print("1.2b-ii: POLAR-FACTOR TRAJECTORY PROXY ANALYSIS -- (Q_t, P_t) DECOMPOSITION")
+    print("=" * 100)
+    print(
+        f"Setup: {config['NUM_LAYERS']}-layer deep linear net (dim={config['DIM']}), "
+        f"quadratic loss, {config['NUM_STEPS']} steps"
+    )
+    print(f"LR_Muon={config['LR_MUON']}, Momentum={config['MOMENTUM']}, NS iters={config['NS_ITERS']}")
+    print(f"Report at steps: {config['REPORT_STEPS']}")
+    print("Scope note: per-layer polar-factor proxy only; not a direct deep-linear gauge-coordinate measurement.")
+    print("Ratio note: raw ||ΔQ||/||ΔW|| and ||ΔP||/||ΔW|| can be noisy when ||ΔW|| is tiny.")
+    print("=" * 100)
 
-# Compute key summary statistics
-sgd_dQr_all = np.nanmean(results_sgd['dQ_ratio'])
-sgd_dPr_all = np.nanmean(results_sgd['dP_ratio'])
-muon_dQr_all = np.nanmean(results_muon['dQ_ratio'])
-muon_dPr_all = np.nanmean(results_muon['dP_ratio'])
 
-sgd_cumQ_final = np.nanmean(results_sgd['cum_Q_drift'][:, -1])
-sgd_cumP_final = np.nanmean(results_sgd['cum_P_drift'][:, -1])
-muon_cumQ_final = np.nanmean(results_muon['cum_Q_drift'][:, -1])
-muon_cumP_final = np.nanmean(results_muon['cum_P_drift'][:, -1])
+def print_problem_diagnostics(problem: Dict[str, Any], lr_sgd: float, config: Dict[str, Any]) -> None:
+    print(f"\nSGD learning rate (max stable candidate): {lr_sgd}")
+    print(f"Muon learning rate (fixed default):       {config['LR_MUON']}")
+    print(f"\nInitial loss: {problem['initial_loss']:.6e}")
+    print(f"Target condition number: {problem['target_condition_number']:.4f}")
+    print("\nPolar decomposition checks on initial weights:")
+    for row in problem["polar_checks"]:
+        print(
+            f"  Layer {row['layer']}: recon_err={row['recon_err']:.2e}, "
+            f"Q_orth_err={row['Q_orth_err']:.2e}, P_sym_err={row['P_sym_err']:.2e}, "
+            f"P_min_eig={row['P_min_eig']:.4f}"
+        )
 
-sgd_Q_frac_final = sgd_cumQ_final / (sgd_cumQ_final + sgd_cumP_final + 1e-15)
-muon_Q_frac_final = muon_cumQ_final / (muon_cumQ_final + muon_cumP_final + 1e-15)
 
-print(f"""
-  SUMMARY STATISTICS (averaged across layers, over all {NUM_STEPS} steps):
-  ---------------------------------------------------------------
-  PER-STEP RATIOS:
-    SGD:   ||dQ||/||dW|| = {sgd_dQr_all:.6f},  ||dP||/||dW|| = {sgd_dPr_all:.6f}
-    Muon:  ||dQ||/||dW|| = {muon_dQr_all:.6f},  ||dP||/||dW|| = {muon_dPr_all:.6f}
+def print_windowed_ratio_table(rows: List[Dict[str, Any]]) -> None:
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 1A: WINDOWED AGGREGATE PER-STEP RATIOS")
+    print("          Ratios are Σ||ΔQ||/Σ||ΔW|| and Σ||ΔP||/Σ||ΔW|| over a 10-step window across all layers")
+    print("=" * 100)
+    print(
+        f"\n{'Step':>6} | {'Window':>11} | {'SGD agg dQ/dW':>14} | {'SGD agg dP/dW':>14} | "
+        f"{'Muon agg dQ/dW':>15} | {'Muon agg dP/dW':>15}"
+    )
+    print("-" * 94)
+    for row in rows:
+        print(
+            f"{row['step']:6d} | {str(tuple(row['window'])):>11} | "
+            f"{row['sgd_aggregate_dQ_over_dW']:14.6f} | {row['sgd_aggregate_dP_over_dW']:14.6f} | "
+            f"{row['muon_aggregate_dQ_over_dW']:15.6f} | {row['muon_aggregate_dP_over_dW']:15.6f}"
+        )
 
-  CUMULATIVE DRIFT AT STEP {NUM_STEPS}:
-    SGD:   ||Q-Q0|| = {sgd_cumQ_final:.6f},  ||P-P0|| = {sgd_cumP_final:.6f},  Q/(Q+P) = {sgd_Q_frac_final:.4f}
-    Muon:  ||Q-Q0|| = {muon_cumQ_final:.6f},  ||P-P0|| = {muon_cumP_final:.6f},  Q/(Q+P) = {muon_Q_frac_final:.4f}
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 1B: SUPPLEMENTAL RAW-MEAN PER-STEP RATIOS")
+    print("          Legacy continuity metric; can spike when ||ΔW|| is very small")
+    print("=" * 100)
+    print(
+        f"\n{'Step':>6} | {'SGD raw dQ/dW':>14} | {'SGD raw dP/dW':>14} | "
+        f"{'Muon raw dQ/dW':>15} | {'Muon raw dP/dW':>15}"
+    )
+    print("-" * 80)
+    for row in rows:
+        print(
+            f"{row['step']:6d} | {row['sgd_raw_mean_dQ_ratio']:14.6f} | {row['sgd_raw_mean_dP_ratio']:14.6f} | "
+            f"{row['muon_raw_mean_dQ_ratio']:15.6f} | {row['muon_raw_mean_dP_ratio']:15.6f}"
+        )
 
-  FINAL LOSSES:
-    SGD:   {results_sgd['losses'][-1]:.6e}
-    Muon:  {results_muon['losses'][-1]:.6e}
-  ---------------------------------------------------------------
-""")
+
+def print_cumulative_table(rows: List[Dict[str, Any]]) -> None:
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 2: CUMULATIVE DRIFT FROM INITIALIZATION (layer-averaged)")
+    print("=" * 100)
+    print(
+        f"\n{'Step':>6} | {'SGD ||Q-Q0||':>14} | {'SGD ||P-P0||':>14} | {'SGD ||W-W0||':>14} | "
+        f"{'Muon ||Q-Q0||':>14} | {'Muon ||P-P0||':>14} | {'Muon ||W-W0||':>14}"
+    )
+    print("-" * 105)
+    for row in rows:
+        print(
+            f"{row['step']:6d} | {row['sgd_cum_Q']:14.6f} | {row['sgd_cum_P']:14.6f} | {row['sgd_cum_W']:14.6f} | "
+            f"{row['muon_cum_Q']:14.6f} | {row['muon_cum_P']:14.6f} | {row['muon_cum_W']:14.6f}"
+        )
+
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 3: CUMULATIVE ORIENTATION-vs-SPECTRUM BALANCE (layer-averaged)")
+    print("=" * 100)
+    print(
+        f"\n{'Step':>6} | {'SGD Q/P':>10} | {'Muon Q/P':>10} | {'SGD Q/(Q+P)':>12} | {'Muon Q/(Q+P)':>13}"
+    )
+    print("-" * 64)
+    for row in rows:
+        print(
+            f"{row['step']:6d} | {row['sgd_Q_over_P']:10.4f} | {row['muon_Q_over_P']:10.4f} | "
+            f"{row['sgd_Q_fraction']:12.4f} | {row['muon_Q_fraction']:13.4f}"
+        )
+
+
+def print_per_layer_table(per_layer: Dict[str, List[Dict[str, Any]]], lr_sgd: float, config: Dict[str, Any]) -> None:
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 4: PER-LAYER BREAKDOWN AT FINAL STEP")
+    print("=" * 100)
+
+    for optimizer_name, lr_label in [("sgd", lr_sgd), ("muon", config["LR_MUON"] )]:
+        label = "SGD" if optimizer_name == "sgd" else "Muon"
+        print(f"\n  {label} (lr={lr_label}):")
+        print(
+            f"  {'Layer':>6} | {'agg dQ/dW':>10} | {'agg dP/dW':>10} | {'raw dQ/dW':>10} | {'raw dP/dW':>10} | "
+            f"{'cum ||Q-Q0||':>12} | {'cum ||P-P0||':>12} | {'Q/(Q+P)':>8}"
+        )
+        print("  " + "-" * 102)
+        for row in per_layer[optimizer_name]:
+            print(
+                f"  {row['layer']:6d} | {row['aggregate_dQ_over_dW']:10.6f} | {row['aggregate_dP_over_dW']:10.6f} | "
+                f"{row['raw_mean_dQ_ratio']:10.6f} | {row['raw_mean_dP_ratio']:10.6f} | "
+                f"{row['cum_Q_final']:12.6f} | {row['cum_P_final']:12.6f} | {row['Q_fraction_final']:8.4f}"
+            )
+
+
+def print_phase_table(rows: List[Dict[str, Any]]) -> None:
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 5: EARLY vs LATE TRAINING DYNAMICS")
+    print("=" * 100)
+    print(
+        f"\n{'Phase':>10} | {'SGD agg dQ/dW':>14} | {'SGD agg dP/dW':>14} | "
+        f"{'Muon agg dQ/dW':>15} | {'Muon agg dP/dW':>15}"
+    )
+    print("-" * 84)
+    for row in rows:
+        print(
+            f"{row['phase']:>10} | {row['sgd_aggregate_dQ_over_dW']:14.6f} | {row['sgd_aggregate_dP_over_dW']:14.6f} | "
+            f"{row['muon_aggregate_dQ_over_dW']:15.6f} | {row['muon_aggregate_dP_over_dW']:15.6f}"
+        )
+
+    print(f"\n{'Phase':>10} | {'SGD raw dQ/dW':>14} | {'SGD raw dP/dW':>14} | {'Muon raw dQ/dW':>15} | {'Muon raw dP/dW':>15}")
+    print("-" * 84)
+    for row in rows:
+        print(
+            f"{row['phase']:>10} | {row['sgd_raw_mean_dQ_ratio']:14.6f} | {row['sgd_raw_mean_dP_ratio']:14.6f} | "
+            f"{row['muon_raw_mean_dQ_ratio']:15.6f} | {row['muon_raw_mean_dP_ratio']:15.6f}"
+        )
+
+
+def print_diagnostics(summary_sgd: Dict[str, Any], summary_muon: Dict[str, Any]) -> None:
+    print(f"\n\n{'=' * 100}")
+    print("RATIO DIAGNOSTICS")
+    print("=" * 100)
+    for label, summary in [("SGD", summary_sgd), ("Muon", summary_muon)]:
+        print(f"\n{label}:")
+        print(
+            f"  Aggregate Σ||ΔQ||/Σ||ΔW|| = {summary['aggregate_dQ_over_dW']:.6f}, "
+            f"Aggregate Σ||ΔP||/Σ||ΔW|| = {summary['aggregate_dP_over_dW']:.6f}"
+        )
+        print(
+            f"  Raw mean ||ΔQ||/||ΔW|| = {summary['raw_mean_dQ_ratio']:.6f}, "
+            f"Raw mean ||ΔP||/||ΔW|| = {summary['raw_mean_dP_ratio']:.6f}"
+        )
+        print(
+            f"  ||ΔW|| stats: min={summary['dW_stats']['min']:.3e}, median={summary['dW_stats']['median']:.3e}, "
+            f"mean={summary['dW_stats']['mean']:.3e}, max={summary['dW_stats']['max']:.3e}"
+        )
+        print(
+            f"  Raw ||ΔQ||/||ΔW|| stats: min={summary['dQ_ratio_stats']['min']:.3e}, "
+            f"median={summary['dQ_ratio_stats']['median']:.3e}, max={summary['dQ_ratio_stats']['max']:.3e}"
+        )
+        print(
+            f"  Raw ||ΔP||/||ΔW|| stats: min={summary['dP_ratio_stats']['min']:.3e}, "
+            f"median={summary['dP_ratio_stats']['median']:.3e}, max={summary['dP_ratio_stats']['max']:.3e}"
+        )
+        print(
+            f"  Small ||ΔW|| count (<1e-12): {summary['small_dW_count']} / {summary['valid_ratio_count']} "
+            f"({summary['small_dW_fraction']:.2%})"
+        )
+
+
+def print_assessment(assessment: Dict[str, Any], summary_sgd: Dict[str, Any], summary_muon: Dict[str, Any], config: Dict[str, Any]) -> None:
+    print(f"\n\n{'=' * 100}")
+    print("FINAL ANALYSIS")
+    print("=" * 100)
+    print(
+        f"\nFinal losses: SGD={summary_sgd['final_loss']:.6e}, Muon={summary_muon['final_loss']:.6e}"
+    )
+    print(
+        f"Final cumulative Q/(Q+P): SGD={summary_sgd['mean_cum_Q_fraction_final']:.4f}, "
+        f"Muon={summary_muon['mean_cum_Q_fraction_final']:.4f}"
+    )
+
+    print("\nLegacy continuity tests (raw-metric-heavy; kept for comparability):")
+    for test_id, test in assessment["legacy_tests"].items():
+        outcome = "YES" if test["passed"] else "NO"
+        print(
+            f"  {test_id}: {test['description']}\n"
+            f"      Muon={test['muon']:.6f} vs SGD={test['sgd']:.6f} -> {outcome}"
+        )
+
+    print("\nRobust supplemental tests (aggregate norm ratios):")
+    for test_id, test in assessment["robust_tests"].items():
+        outcome = "YES" if test["passed"] else "NO"
+        print(
+            f"  {test_id}: {test['description']}\n"
+            f"      Muon={test['muon']:.6f} vs SGD={test['sgd']:.6f} -> {outcome}"
+        )
+
+    print(f"\nLegacy heuristic score: {assessment['legacy_score']}/5 -> {assessment['legacy_label']}")
+    print("Caution: the legacy label should not be treated as a strong inferential claim.")
+
+    conclusion = assessment["calibrated_conclusion"]
+    print(f"\nCalibrated conclusion: {conclusion['label']}")
+    print(f"  {conclusion['detail']}")
+
+    print("\nSupported in this run:")
+    for item in conclusion["supported_expectations"]:
+        print(f"  - {item}")
+
+    print("\nNot supported in this run:")
+    for item in conclusion["unsupported_expectations"]:
+        print(f"  - {item}")
+
+    print("\nLimitations:")
+    for item in conclusion["limitations"]:
+        print(f"  - {item}")
+
+    print("=" * 100)
+    print(f"Overall calibrated conclusion: {conclusion['label']}")
+    print("=" * 100)
+
 
 # =============================================================================
-# HYPOTHESIS TESTING
+# MAIN ORCHESTRATION
 # =============================================================================
 
-print("  HYPOTHESIS TESTS:")
-print("  ---------------------------------------------------------------")
+def run_experiment(
+    config_overrides: Optional[Dict[str, Any]] = None,
+    make_plots: bool = True,
+    out_dir: Optional[os.PathLike[str] | str] = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Run the full experiment and return structured raw results plus summaries.
 
-# Test 1: Muon's per-step dQ/dW > SGD's per-step dQ/dW
-# (Muon changes orientation more per step)
-test1 = muon_dQr_all > sgd_dQr_all
-print(f"  T1: Muon ||dQ||/||dW|| > SGD ||dQ||/||dW||")
-print(f"      Muon={muon_dQr_all:.6f} vs SGD={sgd_dQr_all:.6f}")
-print(f"      -> {'YES' if test1 else 'NO'}")
+    Returns a dictionary with:
+      - config
+      - metadata
+      - problem diagnostics
+      - raw optimizer results for SGD and Muon
+      - summary tables and diagnostics
+      - legacy continuity tests and a calibrated conclusion
+      - plot paths (if plotting succeeded)
+    """
+    start_time = time.time()
+    config = prepare_config(config_overrides)
+    output_dir = Path(out_dir) if out_dir is not None else SCRIPT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-# Test 2: Muon's per-step dP/dW < SGD's per-step dP/dW
-# (Muon changes spectrum less per step)
-test2 = muon_dPr_all < sgd_dPr_all
-print(f"\n  T2: Muon ||dP||/||dW|| < SGD ||dP||/||dW||")
-print(f"      Muon={muon_dPr_all:.6f} vs SGD={sgd_dPr_all:.6f}")
-print(f"      -> {'YES' if test2 else 'NO'}")
+    if verbose:
+        print_header(config)
 
-# Test 3: Muon's cumulative Q fraction > SGD's cumulative Q fraction
-# (Muon's total movement is more orientation-dominated)
-test3 = muon_Q_frac_final > sgd_Q_frac_final
-print(f"\n  T3: Muon Q/(Q+P) > SGD Q/(Q+P) at step {NUM_STEPS}")
-print(f"      Muon={muon_Q_frac_final:.4f} vs SGD={sgd_Q_frac_final:.4f}")
-print(f"      -> {'YES' if test3 else 'NO'}")
+    target, x_data = build_problem(config)
+    problem = compute_problem_diagnostics(config, x_data, target)
+    lr_sgd = find_stable_lr_sgd(config, x_data, target)
 
-# Test 4: Muon has higher Q/P ratio overall
-muon_QP_ratio = muon_cumQ_final / (muon_cumP_final + 1e-15)
-sgd_QP_ratio = sgd_cumQ_final / (sgd_cumP_final + 1e-15)
-test4 = muon_QP_ratio > sgd_QP_ratio
-print(f"\n  T4: Muon cumulative Q/P ratio > SGD cumulative Q/P ratio")
-print(f"      Muon={muon_QP_ratio:.4f} vs SGD={sgd_QP_ratio:.4f}")
-print(f"      -> {'YES' if test4 else 'NO'}")
+    if verbose:
+        print_problem_diagnostics(problem, lr_sgd, config)
+        print(f"\n{'=' * 100}")
+        print("RUNNING OPTIMIZERS AND TRACKING POLAR FACTORS")
+        print("=" * 100)
+        print("\n  Running SGD...", flush=True)
 
-# Test 5: Muon's cumulative P drift is smaller than SGD's
-# (Muon moves less in spectrum space)
-test5 = muon_cumP_final < sgd_cumP_final
-print(f"\n  T5: Muon ||P-P0|| < SGD ||P-P0|| at step {NUM_STEPS}")
-print(f"      Muon={muon_cumP_final:.6f} vs SGD={sgd_cumP_final:.6f}")
-print(f"      -> {'YES' if test5 else 'NO'}")
+    results_sgd = run_and_track_polar("sgd", lr_sgd, config["NUM_STEPS"], config, x_data, target, verbose=verbose)
 
-tests_passed = sum([test1, test2, test3, test4, test5])
+    if verbose:
+        print(f"    Final loss: {results_sgd['losses'][-1]:.6e}")
+        print("\n  Running Muon...", flush=True)
 
-print(f"\n  ---------------------------------------------------------------")
-print(f"  Tests passed: {tests_passed}/5")
+    results_muon = run_and_track_polar("muon", config["LR_MUON"], config["NUM_STEPS"], config, x_data, target, verbose=verbose)
 
-# Determine overall verdict
-if tests_passed >= 4:
-    overall = "STRONG SUPPORT"
-    detail = (
-        "The data strongly supports the hypothesis that Muon's updates are\n"
-        "  predominantly orientation (Q) changes while SGD changes both Q and P.\n"
-        "  Muon moves on the Stiefel manifold; SGD wanders in full weight space."
-    )
-elif tests_passed >= 3:
-    overall = "MODERATE SUPPORT"
-    detail = (
-        "The data moderately supports the polar decomposition hypothesis.\n"
-        "  There is a measurable difference in how Muon vs SGD distribute\n"
-        "  their updates between orientation (Q) and spectrum (P)."
-    )
-elif tests_passed >= 2:
-    overall = "WEAK SIGNAL"
-    detail = (
-        "The data shows a weak signal. The difference between Muon and SGD\n"
-        "  in polar coordinates is present but not dramatic.\n"
-        "  Consistent with 1.2b-i: the distinction may be subtler than expected."
-    )
-else:
-    overall = "NO SUPPORT / SURPRISING"
-    detail = (
-        "The hypothesis is not supported. Muon does NOT preferentially change\n"
-        "  orientation over spectrum, or does so LESS than SGD.\n"
-        "  This is a genuine surprise that requires reinterpretation."
-    )
+    if verbose:
+        print(f"    Final loss: {results_muon['losses'][-1]:.6e}")
 
-# Check for the SURPRISE case: if both optimizers have very similar profiles
-if abs(muon_Q_frac_final - sgd_Q_frac_final) < 0.05:
-    overall += " (SIMILAR PROFILES)"
-    detail += (
-        "\n\n  NOTE: Both optimizers have very similar Q/(Q+P) fractions.\n"
-        "  The polar decomposition may not be the right lens to distinguish them.\n"
-        "  This is consistent with 1.2b-i's finding that the Lyapunov exponents\n"
-        "  were similar for gauge and physical directions."
-    )
+    summary_sgd = summarize_single_optimizer(results_sgd, config)
+    summary_muon = summarize_single_optimizer(results_muon, config)
 
-print(f"""
-  ======================================================================
-  VERDICT: {overall}
-  ======================================================================
-  {detail}
-  ======================================================================
-""")
+    tables = {
+        "windowed_ratios": build_windowed_ratio_rows(results_sgd, results_muon, config),
+        "cumulative_drift": build_cumulative_drift_rows(results_sgd, results_muon, config),
+        "per_layer_final": {
+            "sgd": build_per_layer_rows(results_sgd, config),
+            "muon": build_per_layer_rows(results_muon, config),
+        },
+        "phase_comparison": build_phase_rows(results_sgd, results_muon, config),
+    }
 
-print("=" * 100)
-print(f"  Tests passed: {tests_passed}/5")
-print(f"  Overall: {overall}")
-print("=" * 100)
+    assessment = evaluate_assessment(summary_sgd, summary_muon, config)
+
+    plot_paths = {"overview": None, "phase_portrait": None}
+    if make_plots:
+        plot_paths["overview"] = make_overview_plot(
+            results_sgd,
+            results_muon,
+            summary_sgd,
+            summary_muon,
+            config,
+            lr_sgd,
+            output_dir,
+        )
+        plot_paths["phase_portrait"] = make_phase_portrait(results_sgd, results_muon, config, output_dir)
+
+    runtime_sec = time.time() - start_time
+
+    report = {
+        "config": config,
+        "metadata": {
+            "script_path": str(Path(__file__).resolve()),
+            "out_dir": str(output_dir.resolve()),
+            "runtime_sec": float(runtime_sec),
+            "scope": "Single-seed fixed-batch toy study using per-layer polar-factor proxy diagnostics.",
+            "limitations": [
+                "Per-layer Q/P diagnostics are not direct deep-linear gauge coordinates.",
+                "Raw ratio metrics can spike when ||ΔW|| is tiny.",
+                "Single-seed fixed-batch evidence only.",
+            ],
+        },
+        "problem": problem,
+        "learning_rates": {
+            "sgd": float(lr_sgd),
+            "muon": float(config["LR_MUON"]),
+        },
+        "optimizers": {
+            "sgd": {
+                "name": "SGD+momentum",
+                "lr": float(lr_sgd),
+                "results": results_sgd,
+                "summary": summary_sgd,
+            },
+            "muon": {
+                "name": "Muon+momentum",
+                "lr": float(config["LR_MUON"]),
+                "results": results_muon,
+                "summary": summary_muon,
+            },
+        },
+        "tables": tables,
+        "assessment": assessment,
+        "plots": plot_paths,
+    }
+
+    if verbose:
+        print_windowed_ratio_table(tables["windowed_ratios"])
+        print_cumulative_table(tables["cumulative_drift"])
+        print_per_layer_table(tables["per_layer_final"], lr_sgd, config)
+        print_phase_table(tables["phase_comparison"])
+        print_diagnostics(summary_sgd, summary_muon)
+        if make_plots:
+            print(f"\n\n{'=' * 100}")
+            print("PLOTS")
+            print("=" * 100)
+            if plot_paths["overview"] is not None:
+                print(f"Overview plot saved to:      {plot_paths['overview']}")
+            else:
+                print("Overview plot skipped (matplotlib unavailable).")
+            if plot_paths["phase_portrait"] is not None:
+                print(f"Phase-portrait plot saved to: {plot_paths['phase_portrait']}")
+            else:
+                print("Phase-portrait plot skipped (matplotlib unavailable).")
+        print_assessment(assessment, summary_sgd, summary_muon, config)
+        print(f"Runtime: {runtime_sec:.2f}s")
+
+    return report
+
+
+def main() -> None:
+    """CLI entrypoint preserving normal script behavior."""
+    run_experiment(make_plots=True, out_dir=SCRIPT_DIR, verbose=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,762 +1,1088 @@
 #!/usr/bin/env python3
 """
-1.3c-i: Isolate lambda_max from alpha -- Track Both Independently
-=================================================================
+1.3c-i: Isolate lambda_max from alpha -- single-seed per-layer spectrum proxy study
+===================================================================================
 
-WeightWatcher alpha is the power-law exponent of the W^TW eigenvalue
-distribution.  This experiment tracks lambda_max/lambda_median AND alpha
-separately to determine whether Muon controls the bulk spectrum (slow
-alpha drift) or just suppresses lambda_max.
+This experiment compares SGD-with-momentum and Muon on a fixed deep linear toy problem.
+It tracks two quantities separately for each layer's W^T W spectrum:
 
-HYPOTHESIS:
-  - Muon controls the bulk spectrum: alpha stays large (flatter / more
-    uniform eigenvalue distribution) throughout training.
-  - SGD lets alpha -> 2 fast (heavy tail / concentration).
-  - lambda_max grows faster under SGD (consistent with sigma_1 growth
-    from 1.3b-i-A).
-  - Clipping lambda_max changes the story for SGD but not Muon,
-    because Muon already controls the outlier.
+  1. lambda_max and lambda_max / lambda_median
+  2. a simple rank-decay alpha proxy
 
-Power-law fit method (crude but sufficient for relative comparison):
-  Sort eigenvalues descending.  Log-log linear regression of eigenvalue
-  vs rank.  The negative slope is alpha.
+Important scope note:
+  - The alpha reported here is NOT a full WeightWatcher fit.
+  - It is a crude but deterministic proxy obtained by regressing
+    log(eigenvalue) against log(rank) on the per-layer W^T W eigenvalues.
+  - Results should therefore be read as a single-seed per-layer spectrum proxy
+    study, not as a calibrated heavy-tail or generalization analysis.
 
-Setup: 4-layer deep linear net, 32x32, quadratic loss, 500 steps.
-       SGD (with momentum) vs Muon.
+Default setup (preserved from the legacy script as closely as possible):
+  - 4-layer deep linear net
+  - 32 x 32 layers
+  - fixed synthetic target matrix and fixed input batch
+  - 500 training steps
+  - SGD with momentum vs Muon
+  - measurements every 25 steps
 """
 
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-import os
 
-np.random.seed(42)
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-DIM = 32
-NUM_LAYERS = 4
-NUM_STEPS = 500
-BATCH_SIZE = 64
-LR_MUON = 0.005
-MOMENTUM = 0.9
-NS_ITERS = 5
-MEASURE_EVERY = 25
-
-# Random target matrix (fixed)
-W_target = np.random.randn(DIM, DIM) * 0.5
-
-# Random input data (fixed batch)
-X_data = np.random.randn(DIM, BATCH_SIZE) * 0.3
-
-# Output directory
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Steps to print in tables
-TABLE_STEPS = [0, 100, 200, 300, 500]
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_SEED = 42
+DEFAULT_TABLE_STEPS = [0, 100, 200, 300, 500]
 
 
-# =============================================================================
-# CORE FUNCTIONS
-# =============================================================================
+def get_default_config() -> Dict[str, Any]:
+    """Return the preserved default configuration for the experiment."""
+    return {
+        "experiment_id": "1.3c-i_Isolate_lambda_max_from_alpha",
+        "dim": 32,
+        "num_layers": 4,
+        "num_steps": 500,
+        "batch_size": 64,
+        "lr_muon": 0.005,
+        "momentum": 0.9,
+        "ns_iters": 5,
+        "measure_every": 25,
+        "target_scale": 0.5,
+        "input_scale": 0.3,
+        "init_noise_scale": 0.1,
+        "table_steps": list(DEFAULT_TABLE_STEPS),
+        "sgd_lr_candidates": [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001],
+        "sgd_lr_search_steps": 200,
+        "sgd_divergence_factor": 50.0,
+    }
 
-def init_weights(num_layers, seed=42):
-    """Initialize layers near identity for stability."""
+
+def normalize_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Merge user config into defaults and normalize a few derived fields."""
+    merged = get_default_config()
+    if config:
+        merged.update(config)
+
+    merged["table_steps"] = sorted(
+        {
+            int(step)
+            for step in merged.get("table_steps", [])
+            if 0 <= int(step) <= int(merged["num_steps"])
+        }
+    )
+    if int(merged["num_steps"]) not in merged["table_steps"]:
+        merged["table_steps"].append(int(merged["num_steps"]))
+        merged["table_steps"] = sorted(set(merged["table_steps"]))
+
+    return merged
+
+
+def make_fixed_problem(config: Dict[str, Any], seed: int = DEFAULT_SEED) -> Tuple[np.ndarray, np.ndarray]:
+    """Create the fixed target matrix and input batch, matching legacy seeding behavior."""
     rng = np.random.RandomState(seed)
-    weights = []
+    dim = int(config["dim"])
+    batch_size = int(config["batch_size"])
+    w_target = rng.randn(dim, dim) * float(config["target_scale"])
+    x_data = rng.randn(dim, batch_size) * float(config["input_scale"])
+    return w_target, x_data
+
+
+def init_weights(
+    num_layers: int,
+    dim: int,
+    seed: int = DEFAULT_SEED,
+    init_noise_scale: float = 0.1,
+) -> List[np.ndarray]:
+    """Initialize all layers near the identity for stability."""
+    rng = np.random.RandomState(seed)
+    weights: List[np.ndarray] = []
     for _ in range(num_layers):
-        W = np.eye(DIM) + rng.randn(DIM, DIM) * 0.1
-        weights.append(W.copy())
+        w = np.eye(dim) + rng.randn(dim, dim) * init_noise_scale
+        weights.append(w.copy())
     return weights
 
 
-def forward(weights, X):
-    """Forward pass: W_L @ ... @ W_1 @ X."""
-    out = X.copy()
-    for W in weights:
-        out = W @ out
+def forward(weights: List[np.ndarray], x: np.ndarray) -> np.ndarray:
+    """Forward pass through the deep linear network."""
+    out = x.copy()
+    for w in weights:
+        out = w @ out
     return out
 
 
-def compute_loss(weights, X, target):
-    """Loss = 0.5 * ||W_product @ X - T @ X||^2 / N."""
-    pred = forward(weights, X)
-    target_out = target @ X
+def compute_loss(weights: List[np.ndarray], x: np.ndarray, target: np.ndarray) -> float:
+    """Quadratic loss = 0.5 * ||W_product @ X - T @ X||^2 / N."""
+    pred = forward(weights, x)
+    target_out = target @ x
     diff = pred - target_out
-    return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
+    return 0.5 * np.mean(np.sum(diff**2, axis=0))
 
 
-def compute_gradients(weights, X, target):
-    """Backprop through deep linear net."""
+def compute_gradients(weights: List[np.ndarray], x: np.ndarray, target: np.ndarray) -> List[np.ndarray]:
+    """Backpropagation for the deep linear network."""
     num_layers = len(weights)
-    N = X.shape[1]
+    batch_size = x.shape[1]
 
-    # Forward pass storing activations
-    activations = [X.copy()]
-    out = X.copy()
-    for W in weights:
-        out = W @ out
+    activations = [x.copy()]
+    out = x.copy()
+    for w in weights:
+        out = w @ out
         activations.append(out.copy())
 
-    # Backward pass
-    target_out = target @ X
-    delta = (activations[-1] - target_out) / N
+    target_out = target @ x
+    delta = (activations[-1] - target_out) / batch_size
 
-    grads = []
-    for i in range(num_layers - 1, -1, -1):
-        G = delta @ activations[i].T
-        grads.insert(0, G)
-        if i > 0:
-            delta = weights[i].T @ delta
+    grads: List[np.ndarray] = []
+    for idx in range(num_layers - 1, -1, -1):
+        grad = delta @ activations[idx].T
+        grads.insert(0, grad)
+        if idx > 0:
+            delta = weights[idx].T @ delta
 
     return grads
 
 
-def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
-    """
-    Newton-Schulz iteration to approximate the orthogonal polar factor.
-    Returns closest orthogonal matrix to G (i.e., U @ V^T from SVD).
-    """
-    norm = np.linalg.norm(G, ord='fro')
+def newton_schulz_orthogonalize(grad: np.ndarray, num_iters: int) -> np.ndarray:
+    """Approximate the orthogonal polar factor of grad via Newton-Schulz iteration."""
+    norm = np.linalg.norm(grad, ord="fro")
     if norm < 1e-12:
-        return G
-    X = G / norm
+        return grad
 
+    x = grad / norm
     for _ in range(num_iters):
-        A = X.T @ X
-        X = 1.5 * X - 0.5 * X @ A
-
-    return X
+        a = x.T @ x
+        x = 1.5 * x - 0.5 * x @ a
+    return x
 
 
 # =============================================================================
-# POWER-LAW ALPHA FITTING
+# Alpha proxy fitting
 # =============================================================================
 
-def fit_power_law_alpha(eigenvalues):
+
+def fit_power_law_alpha(eigenvalues: np.ndarray) -> float:
     """
-    Fit power-law exponent alpha from sorted eigenvalues of W^TW.
+    Fit a simple rank-decay alpha proxy from the eigenvalues of W^T W.
 
-    Method: Sort eigenvalues descending. Compute log-log linear regression
-    of eigenvalue vs rank.  alpha = -slope (positive for decaying spectra).
+    Method:
+      - sort eigenvalues descending
+      - regress log(eigenvalue) against log(rank)
+      - return alpha_proxy = -slope
 
-    Returns alpha (float).
+    This is intentionally described as a proxy rather than a full WeightWatcher fit.
     """
-    eigs = np.sort(eigenvalues)[::-1]  # descending
-    eigs = eigs[eigs > 1e-30]  # remove near-zero
-    n = len(eigs)
-    if n < 3:
-        return np.nan
-
-    ranks = np.arange(1, n + 1).astype(float)
-    log_rank = np.log(ranks)
-    log_eig = np.log(eigs)
-
-    # Linear regression: log_eig = slope * log_rank + intercept
-    # alpha = -slope
-    A = np.vstack([log_rank, np.ones(n)]).T
-    result = np.linalg.lstsq(A, log_eig, rcond=None)
-    slope = result[0][0]
-
-    return -slope
-
-
-def fit_power_law_alpha_clipped(eigenvalues):
-    """
-    Same as fit_power_law_alpha but EXCLUDING the top eigenvalue.
-    This simulates WeightWatcher's clip_xmax behavior.
-    """
-    eigs = np.sort(eigenvalues)[::-1]  # descending
-    eigs = eigs[1:]  # exclude top eigenvalue
+    eigs = np.sort(np.asarray(eigenvalues))[::-1]
     eigs = eigs[eigs > 1e-30]
     n = len(eigs)
     if n < 3:
-        return np.nan
+        return float("nan")
 
-    ranks = np.arange(1, n + 1).astype(float)
+    ranks = np.arange(1, n + 1, dtype=float)
     log_rank = np.log(ranks)
     log_eig = np.log(eigs)
 
-    A = np.vstack([log_rank, np.ones(n)]).T
-    result = np.linalg.lstsq(A, log_eig, rcond=None)
-    slope = result[0][0]
+    design = np.vstack([log_rank, np.ones(n)]).T
+    slope = np.linalg.lstsq(design, log_eig, rcond=None)[0][0]
+    return float(-slope)
 
-    return -slope
+
+def fit_power_law_alpha_clipped(eigenvalues: np.ndarray) -> float:
+    """
+    Same proxy as fit_power_law_alpha, but excluding the top eigenvalue.
+
+    This is only a clip-xmax-inspired diagnostic, not a full WeightWatcher clip_xmax analysis.
+    """
+    eigs = np.sort(np.asarray(eigenvalues))[::-1]
+    eigs = eigs[1:]
+    eigs = eigs[eigs > 1e-30]
+    n = len(eigs)
+    if n < 3:
+        return float("nan")
+
+    ranks = np.arange(1, n + 1, dtype=float)
+    log_rank = np.log(ranks)
+    log_eig = np.log(eigs)
+
+    design = np.vstack([log_rank, np.ones(n)]).T
+    slope = np.linalg.lstsq(design, log_eig, rcond=None)[0][0]
+    return float(-slope)
 
 
 # =============================================================================
-# OPTIMIZER STEP FUNCTIONS
+# Optimizer helpers
 # =============================================================================
 
-def find_stable_lr_sgd():
-    """Find maximum stable SGD learning rate."""
-    candidates = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001]
-    for lr in candidates:
-        np.random.seed(42)
-        weights = init_weights(NUM_LAYERS)
-        velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
-        initial_loss = compute_loss(weights, X_data, W_target)
+
+def sgd_step(
+    weights: List[np.ndarray],
+    velocities: List[np.ndarray],
+    lr: float,
+    x_data: np.ndarray,
+    w_target: np.ndarray,
+    momentum: float,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """One step of SGD with standard momentum (not Nesterov)."""
+    grads = compute_gradients(weights, x_data, w_target)
+    for idx in range(len(weights)):
+        velocities[idx] = momentum * velocities[idx] + grads[idx]
+        weights[idx] = weights[idx] - lr * velocities[idx]
+    return weights, velocities
+
+
+def muon_step(
+    weights: List[np.ndarray],
+    velocities: List[np.ndarray],
+    lr: float,
+    x_data: np.ndarray,
+    w_target: np.ndarray,
+    momentum: float,
+    ns_iters: int,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """One step of Muon with standard momentum plus orthogonalized gradients."""
+    grads = compute_gradients(weights, x_data, w_target)
+    for idx in range(len(weights)):
+        ortho_grad = newton_schulz_orthogonalize(grads[idx], num_iters=ns_iters)
+        velocities[idx] = momentum * velocities[idx] + ortho_grad
+        weights[idx] = weights[idx] - lr * velocities[idx]
+    return weights, velocities
+
+
+def find_stable_lr_sgd(
+    config: Dict[str, Any],
+    x_data: np.ndarray,
+    w_target: np.ndarray,
+    seed: int = DEFAULT_SEED,
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """
+    Heuristic learning-rate scan for SGD.
+
+    This preserves the legacy behavior: choose the first candidate that does not diverge
+    within a short fixed-length run. It is useful for a toy comparison, but it should not be
+    over-interpreted as a definitive fairness guarantee.
+    """
+    dim = int(config["dim"])
+    num_layers = int(config["num_layers"])
+    momentum = float(config["momentum"])
+    search_steps = int(config["sgd_lr_search_steps"])
+    divergence_factor = float(config["sgd_divergence_factor"])
+    init_noise_scale = float(config["init_noise_scale"])
+
+    scan: List[Dict[str, Any]] = []
+
+    for lr in config["sgd_lr_candidates"]:
+        weights = init_weights(num_layers, dim, seed=seed, init_noise_scale=init_noise_scale)
+        velocities = [np.zeros((dim, dim)) for _ in range(num_layers)]
+        initial_loss = compute_loss(weights, x_data, w_target)
         stable = True
-        for step in range(200):
-            grads = compute_gradients(weights, X_data, W_target)
-            for i in range(NUM_LAYERS):
-                velocities[i] = MOMENTUM * velocities[i] + grads[i]
-                weights[i] -= lr * velocities[i]
-            loss = compute_loss(weights, X_data, W_target)
-            if np.isnan(loss) or loss > initial_loss * 50:
+        steps_completed = 0
+        max_loss_seen = initial_loss
+
+        for step in range(1, search_steps + 1):
+            weights, velocities = sgd_step(weights, velocities, lr, x_data, w_target, momentum)
+            loss = compute_loss(weights, x_data, w_target)
+            max_loss_seen = max(max_loss_seen, loss)
+            steps_completed = step
+            if np.isnan(loss) or loss > initial_loss * divergence_factor:
                 stable = False
                 break
+
+        scan.append(
+            {
+                "lr": float(lr),
+                "stable": bool(stable),
+                "steps_completed": int(steps_completed),
+                "initial_loss": float(initial_loss),
+                "max_loss_seen": float(max_loss_seen),
+            }
+        )
+
         if stable:
-            return lr
-    return 0.001
+            return float(lr), scan
 
-
-def sgd_step(weights, velocities, lr):
-    """One step of SGD with momentum."""
-    grads = compute_gradients(weights, X_data, W_target)
-    for i in range(len(weights)):
-        velocities[i] = MOMENTUM * velocities[i] + grads[i]
-        weights[i] = weights[i] - lr * velocities[i]
-    return weights, velocities
-
-
-def muon_step(weights, velocities, lr):
-    """One step of Muon with momentum."""
-    grads = compute_gradients(weights, X_data, W_target)
-    for i in range(len(weights)):
-        ortho_grad = newton_schulz_orthogonalize(grads[i])
-        velocities[i] = MOMENTUM * velocities[i] + ortho_grad
-        weights[i] = weights[i] - lr * velocities[i]
-    return weights, velocities
+    return float(config["sgd_lr_candidates"][-1]), scan
 
 
 # =============================================================================
-# MEASUREMENT ENGINE
+# Measurement engine
 # =============================================================================
 
-def compute_layer_spectrum_stats(W):
-    """
-    Given weight matrix W, compute eigenvalues of W^TW and return stats.
 
-    Returns dict with:
-      - eigenvalues: full sorted (descending) eigenvalues of W^TW
-      - lambda_max, lambda_median, lambda_min
-      - alpha: power-law exponent (full)
-      - alpha_clipped: power-law exponent (excluding top eigenvalue)
-      - outlier_ratio: lambda_max / lambda_median
-    """
-    WtW = W.T @ W
-    eigs = np.linalg.eigvalsh(WtW)  # returns sorted ascending
-    eigs = eigs[::-1]  # descending
-    eigs = np.maximum(eigs, 0.0)  # ensure non-negative (numerical)
+def compute_layer_spectrum_stats(weight_matrix: np.ndarray) -> Dict[str, Any]:
+    """Compute per-layer W^T W eigenvalue statistics."""
+    wtw = weight_matrix.T @ weight_matrix
+    eigs = np.linalg.eigvalsh(wtw)[::-1]
+    eigs = np.maximum(eigs, 0.0)
 
-    lmax = eigs[0]
-    lmin = eigs[-1]
-    lmedian = np.median(eigs)
+    lambda_max = float(eigs[0])
+    lambda_min = float(eigs[-1])
+    lambda_median = float(np.median(eigs))
     alpha = fit_power_law_alpha(eigs)
     alpha_clipped = fit_power_law_alpha_clipped(eigs)
-    outlier_ratio = lmax / lmedian if lmedian > 1e-30 else np.inf
+    outlier_ratio = float(lambda_max / lambda_median) if lambda_median > 1e-30 else float("inf")
 
     return {
-        'eigenvalues': eigs,
-        'lambda_max': lmax,
-        'lambda_median': lmedian,
-        'lambda_min': lmin,
-        'alpha': alpha,
-        'alpha_clipped': alpha_clipped,
-        'outlier_ratio': outlier_ratio,
+        "eigenvalues": eigs,
+        "lambda_max": lambda_max,
+        "lambda_median": lambda_median,
+        "lambda_min": lambda_min,
+        "alpha": alpha,
+        "alpha_clipped": alpha_clipped,
+        "outlier_ratio": outlier_ratio,
     }
 
 
-def run_and_measure(optimizer_name, optimizer_fn, lr, num_steps):
-    """
-    Run optimizer for num_steps.  At every MEASURE_EVERY steps, record:
-      - alpha (per layer and mean)
-      - alpha_clipped (per layer and mean)
-      - lambda_max, lambda_median, lambda_min (per layer)
-      - outlier_ratio = lambda_max / lambda_median (per layer and mean)
-      - loss
-    """
-    np.random.seed(42)
-    weights = init_weights(NUM_LAYERS)
-    velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
+def collect_layer_snapshot(weights: List[np.ndarray]) -> Dict[str, Any]:
+    """Collect per-layer spectrum stats into stacked numeric arrays."""
+    layer_stats = [compute_layer_spectrum_stats(weight_matrix) for weight_matrix in weights]
+    return {
+        "layer_stats": layer_stats,
+        "eigenvalues": np.stack([stat["eigenvalues"] for stat in layer_stats], axis=0),
+        "alpha": np.array([stat["alpha"] for stat in layer_stats], dtype=float),
+        "alpha_clipped": np.array([stat["alpha_clipped"] for stat in layer_stats], dtype=float),
+        "lambda_max": np.array([stat["lambda_max"] for stat in layer_stats], dtype=float),
+        "lambda_median": np.array([stat["lambda_median"] for stat in layer_stats], dtype=float),
+        "lambda_min": np.array([stat["lambda_min"] for stat in layer_stats], dtype=float),
+        "outlier_ratio": np.array([stat["outlier_ratio"] for stat in layer_stats], dtype=float),
+    }
 
-    # Determine measurement steps
-    measure_steps = list(range(0, num_steps + 1, MEASURE_EVERY))
+
+def summarize_optimizer_run(run_result: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    """Compute layer-mean trajectories for the recorded metrics."""
+    return {
+        "alpha_mean": np.nanmean(run_result["alpha"], axis=1),
+        "alpha_clipped_mean": np.nanmean(run_result["alpha_clipped"], axis=1),
+        "lambda_max_mean": np.nanmean(run_result["lambda_max"], axis=1),
+        "lambda_median_mean": np.nanmean(run_result["lambda_median"], axis=1),
+        "lambda_min_mean": np.nanmean(run_result["lambda_min"], axis=1),
+        "outlier_ratio_mean": np.nanmean(run_result["outlier_ratio"], axis=1),
+        "clip_effect_mean": np.nanmean(np.abs(run_result["alpha"] - run_result["alpha_clipped"]), axis=1),
+        "losses": run_result["losses"],
+    }
+
+
+def run_and_measure(
+    optimizer_name: str,
+    optimizer_kind: str,
+    lr: float,
+    config: Dict[str, Any],
+    x_data: np.ndarray,
+    w_target: np.ndarray,
+    seed: int = DEFAULT_SEED,
+) -> Dict[str, Any]:
+    """Run one optimizer and record per-step per-layer spectrum proxy statistics."""
+    dim = int(config["dim"])
+    num_layers = int(config["num_layers"])
+    num_steps = int(config["num_steps"])
+    measure_every = int(config["measure_every"])
+    momentum = float(config["momentum"])
+    ns_iters = int(config["ns_iters"])
+    init_noise_scale = float(config["init_noise_scale"])
+
+    weights = init_weights(num_layers, dim, seed=seed, init_noise_scale=init_noise_scale)
+    initial_weights = np.stack([weight.copy() for weight in weights], axis=0)
+    velocities = [np.zeros((dim, dim)) for _ in range(num_layers)]
+
+    measure_steps = list(range(0, num_steps + 1, measure_every))
     if num_steps not in measure_steps:
         measure_steps.append(num_steps)
-    measure_steps = sorted(set(measure_steps))
-
+    measure_steps = np.array(sorted(set(measure_steps)), dtype=int)
     n_measures = len(measure_steps)
 
-    # Storage
-    alpha_all = np.zeros((n_measures, NUM_LAYERS))
-    alpha_clipped_all = np.zeros((n_measures, NUM_LAYERS))
-    lmax_all = np.zeros((n_measures, NUM_LAYERS))
-    lmedian_all = np.zeros((n_measures, NUM_LAYERS))
-    lmin_all = np.zeros((n_measures, NUM_LAYERS))
-    outlier_ratio_all = np.zeros((n_measures, NUM_LAYERS))
-    losses = np.zeros(n_measures)
+    shape = (n_measures, num_layers)
+    alpha_all = np.full(shape, np.nan)
+    alpha_clipped_all = np.full(shape, np.nan)
+    lambda_max_all = np.full(shape, np.nan)
+    lambda_median_all = np.full(shape, np.nan)
+    lambda_min_all = np.full(shape, np.nan)
+    outlier_ratio_all = np.full(shape, np.nan)
+    losses = np.full(n_measures, np.nan)
 
-    measure_idx = 0
+    def store_snapshot(measure_index: int, snapshot: Dict[str, Any], loss_value: float) -> None:
+        alpha_all[measure_index] = snapshot["alpha"]
+        alpha_clipped_all[measure_index] = snapshot["alpha_clipped"]
+        lambda_max_all[measure_index] = snapshot["lambda_max"]
+        lambda_median_all[measure_index] = snapshot["lambda_median"]
+        lambda_min_all[measure_index] = snapshot["lambda_min"]
+        outlier_ratio_all[measure_index] = snapshot["outlier_ratio"]
+        losses[measure_index] = loss_value
+
+    run_start = time.perf_counter()
+    initial_snapshot = collect_layer_snapshot(weights)
+    initial_loss = compute_loss(weights, x_data, w_target)
+    store_snapshot(0, initial_snapshot, initial_loss)
+
+    measure_index = 1
     diverged = False
-
-    # Measure at step 0
-    if measure_steps[0] == 0:
-        for i in range(NUM_LAYERS):
-            stats = compute_layer_spectrum_stats(weights[i])
-            alpha_all[0, i] = stats['alpha']
-            alpha_clipped_all[0, i] = stats['alpha_clipped']
-            lmax_all[0, i] = stats['lambda_max']
-            lmedian_all[0, i] = stats['lambda_median']
-            lmin_all[0, i] = stats['lambda_min']
-            outlier_ratio_all[0, i] = stats['outlier_ratio']
-        losses[0] = compute_loss(weights, X_data, W_target)
-        measure_idx = 1
+    divergence_step: Optional[int] = None
+    latest_loss = initial_loss
 
     for step in range(1, num_steps + 1):
-        weights, velocities = optimizer_fn(weights, velocities, lr)
+        if optimizer_kind.lower() == "sgd":
+            weights, velocities = sgd_step(weights, velocities, lr, x_data, w_target, momentum)
+        elif optimizer_kind.lower() == "muon":
+            weights, velocities = muon_step(weights, velocities, lr, x_data, w_target, momentum, ns_iters)
+        else:
+            raise ValueError(f"Unknown optimizer_kind={optimizer_kind!r}")
 
-        loss = compute_loss(weights, X_data, W_target)
-        if np.isnan(loss) or loss > 1e10:
-            print(f"    WARNING: {optimizer_name} diverged at step {step}!")
-            # Fill remaining with NaN
-            for mi in range(measure_idx, n_measures):
-                alpha_all[mi] = np.nan
-                alpha_clipped_all[mi] = np.nan
-                lmax_all[mi] = np.nan
-                lmedian_all[mi] = np.nan
-                lmin_all[mi] = np.nan
-                outlier_ratio_all[mi] = np.nan
-                losses[mi] = np.nan
+        latest_loss = compute_loss(weights, x_data, w_target)
+        if np.isnan(latest_loss) or latest_loss > 1e10:
             diverged = True
+            divergence_step = step
             break
 
-        if measure_idx < n_measures and step == measure_steps[measure_idx]:
-            for i in range(NUM_LAYERS):
-                stats = compute_layer_spectrum_stats(weights[i])
-                alpha_all[measure_idx, i] = stats['alpha']
-                alpha_clipped_all[measure_idx, i] = stats['alpha_clipped']
-                lmax_all[measure_idx, i] = stats['lambda_max']
-                lmedian_all[measure_idx, i] = stats['lambda_median']
-                lmin_all[measure_idx, i] = stats['lambda_min']
-                outlier_ratio_all[measure_idx, i] = stats['outlier_ratio']
-            losses[measure_idx] = loss
-            measure_idx += 1
+        if measure_index < n_measures and step == int(measure_steps[measure_index]):
+            snapshot = collect_layer_snapshot(weights)
+            store_snapshot(measure_index, snapshot, latest_loss)
+            measure_index += 1
+
+    runtime_seconds = time.perf_counter() - run_start
+
+    final_snapshot = collect_layer_snapshot(weights)
+    final_weights = np.stack([weight.copy() for weight in weights], axis=0)
+
+    run_result = {
+        "optimizer_name": optimizer_name,
+        "optimizer_kind": optimizer_kind,
+        "learning_rate": float(lr),
+        "measure_steps": measure_steps,
+        "alpha": alpha_all,
+        "alpha_clipped": alpha_clipped_all,
+        "lambda_max": lambda_max_all,
+        "lambda_median": lambda_median_all,
+        "lambda_min": lambda_min_all,
+        "outlier_ratio": outlier_ratio_all,
+        "losses": losses,
+        "diverged": bool(diverged),
+        "divergence_step": divergence_step,
+        "steps_completed": int(divergence_step if diverged else num_steps),
+        "runtime_seconds": float(runtime_seconds),
+        "initial_weights": initial_weights,
+        "final_weights": final_weights,
+        "initial_layer_stats": initial_snapshot["layer_stats"],
+        "final_layer_stats": final_snapshot["layer_stats"],
+        "initial_eigenvalues": initial_snapshot["eigenvalues"],
+        "final_eigenvalues": final_snapshot["eigenvalues"],
+        "initial_loss": float(initial_loss),
+        "final_loss": float(latest_loss),
+    }
+    run_result["trajectory_summary"] = summarize_optimizer_run(run_result)
+    return run_result
+
+
+def step_idx(measure_steps: np.ndarray, step_value: int) -> Optional[int]:
+    """Return the index of step_value inside measure_steps, or None if absent."""
+    idx = np.where(np.asarray(measure_steps) == step_value)[0]
+    return int(idx[0]) if len(idx) > 0 else None
+
+
+# =============================================================================
+# Evaluation and reporting helpers
+# =============================================================================
+
+
+def _test_row(
+    label: str,
+    claim: str,
+    metric_name: str,
+    sgd_value: float,
+    muon_value: float,
+    passed: bool,
+    supportive_direction: str,
+    note: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    outcome_text = "SUPPORTED" if passed else "NOT SUPPORTED"
+    if supportive_direction == "sgd_gt_muon":
+        comparison_text = f"SGD > Muon is supportive; observed {sgd_value:.4f} vs {muon_value:.4f}."
+    elif supportive_direction == "muon_lt_sgd":
+        comparison_text = f"Muon < SGD is supportive; observed {muon_value:.4f} vs {sgd_value:.4f}."
+    else:
+        comparison_text = f"Observed SGD={sgd_value:.4f}, Muon={muon_value:.4f}."
+
+    row = {
+        "label": label,
+        "claim": claim,
+        "metric_name": metric_name,
+        "sgd_value": float(sgd_value),
+        "muon_value": float(muon_value),
+        "passed": bool(passed),
+        "outcome_text": outcome_text,
+        "comparison_text": comparison_text,
+        "note": note,
+    }
+    if extra:
+        row.update(extra)
+    return row
+
+
+def evaluate_checks(results_sgd: Dict[str, Any], results_muon: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate the four deterministic checks used by the legacy script."""
+    sgd_summary = results_sgd["trajectory_summary"]
+    muon_summary = results_muon["trajectory_summary"]
+
+    alpha_mean_sgd = sgd_summary["alpha_mean"]
+    alpha_mean_muon = muon_summary["alpha_mean"]
+    alpha_clipped_mean_sgd = sgd_summary["alpha_clipped_mean"]
+    alpha_clipped_mean_muon = muon_summary["alpha_clipped_mean"]
+    outlier_mean_sgd = sgd_summary["outlier_ratio_mean"]
+    outlier_mean_muon = muon_summary["outlier_ratio_mean"]
+
+    alpha_drift_sgd = float(abs(alpha_mean_sgd[-1] - alpha_mean_sgd[0]))
+    alpha_drift_muon = float(abs(alpha_mean_muon[-1] - alpha_mean_muon[0]))
+    alpha_change_sgd = float(alpha_mean_sgd[-1] - alpha_mean_sgd[0])
+    alpha_change_muon = float(alpha_mean_muon[-1] - alpha_mean_muon[0])
+
+    alpha_final_sgd = float(alpha_mean_sgd[-1])
+    alpha_final_muon = float(alpha_mean_muon[-1])
+
+    lmax_growth_sgd = float(sgd_summary["lambda_max_mean"][-1] / sgd_summary["lambda_max_mean"][0])
+    lmax_growth_muon = float(muon_summary["lambda_max_mean"][-1] / muon_summary["lambda_max_mean"][0])
+
+    clip_effect_sgd = float(sgd_summary["clip_effect_mean"][-1])
+    clip_effect_muon = float(muon_summary["clip_effect_mean"][-1])
+
+    test1 = bool(alpha_drift_sgd > alpha_drift_muon)
+    test2 = bool(alpha_final_muon < alpha_final_sgd)
+    test3 = bool(lmax_growth_sgd > lmax_growth_muon)
+    test4 = bool(clip_effect_sgd > clip_effect_muon)
+
+    tests = {
+        "T1": _test_row(
+            label="T1",
+            claim="SGD alpha proxy drifts more than Muon over training.",
+            metric_name="|alpha_proxy(final) - alpha_proxy(init)|",
+            sgd_value=alpha_drift_sgd,
+            muon_value=alpha_drift_muon,
+            passed=test1,
+            supportive_direction="sgd_gt_muon",
+            note="Single-seed drift comparison on the layer-mean rank-decay alpha proxy.",
+            extra={
+                "sgd_signed_change": alpha_change_sgd,
+                "muon_signed_change": alpha_change_muon,
+                "sgd_initial": float(alpha_mean_sgd[0]),
+                "muon_initial": float(alpha_mean_muon[0]),
+                "sgd_final": alpha_final_sgd,
+                "muon_final": alpha_final_muon,
+            },
+        ),
+        "T2": _test_row(
+            label="T2",
+            claim="Muon finishes with a flatter/lower alpha proxy than SGD.",
+            metric_name="alpha_proxy(final)",
+            sgd_value=alpha_final_sgd,
+            muon_value=alpha_final_muon,
+            passed=test2,
+            supportive_direction="muon_lt_sgd",
+            note="In this proxy, lower alpha means a flatter rank-decay fit, but it is not a calibrated WeightWatcher regime label.",
+        ),
+        "T3": _test_row(
+            label="T3",
+            claim="SGD shows faster lambda_max growth than Muon.",
+            metric_name="lambda_max(final) / lambda_max(init)",
+            sgd_value=lmax_growth_sgd,
+            muon_value=lmax_growth_muon,
+            passed=test3,
+            supportive_direction="sgd_gt_muon",
+            note="Layer-mean growth factor of the top W^T W eigenvalue.",
+        ),
+        "T4": _test_row(
+            label="T4",
+            claim="Removing the top eigenvalue changes SGD's alpha proxy more than Muon's.",
+            metric_name="|alpha_proxy - alpha_proxy_clipped| at final step",
+            sgd_value=clip_effect_sgd,
+            muon_value=clip_effect_muon,
+            passed=test4,
+            supportive_direction="sgd_gt_muon",
+            note="Clip-xmax-inspired diagnostic only; not a full WeightWatcher clipping analysis.",
+        ),
+    }
+
+    tests_passed = int(sum(test["passed"] for test in tests.values()))
+    tests_total = len(tests)
+    overall = "PASS" if tests_passed >= 3 else "PARTIAL PASS" if tests_passed >= 2 else "FAIL"
+
+    if tests["T1"]["passed"] and tests["T2"]["passed"] and tests["T3"]["passed"] and not tests["T4"]["passed"]:
+        calibrated_conclusion = (
+            "In this single-seed per-layer spectrum proxy run, the evidence supports the T1/T2/T3 story: "
+            "Muon shows less alpha-proxy drift than SGD, finishes with a lower/flatter alpha proxy, and "
+            "exhibits slightly slower lambda_max growth. However, the stronger T4 clipping-effect story is "
+            "not supported here: removing the top eigenvalue changes Muon's final alpha proxy more than SGD's."
+        )
+    else:
+        supported = [label for label, test in tests.items() if test["passed"]]
+        unsupported = [label for label, test in tests.items() if not test["passed"]]
+        supported_text = ", ".join(supported) if supported else "none"
+        unsupported_text = ", ".join(unsupported) if unsupported else "none"
+        calibrated_conclusion = (
+            "This single-seed per-layer spectrum proxy run supports checks "
+            f"{supported_text} and does not support checks {unsupported_text}. "
+            "Interpret the result as a toy deterministic comparison rather than as a full WeightWatcher or "
+            "generalization claim."
+        )
 
     return {
-        'measure_steps': np.array(measure_steps),
-        'alpha': alpha_all,              # (n_measures, NUM_LAYERS)
-        'alpha_clipped': alpha_clipped_all,
-        'lambda_max': lmax_all,
-        'lambda_median': lmedian_all,
-        'lambda_min': lmin_all,
-        'outlier_ratio': outlier_ratio_all,
-        'losses': losses,
-        'diverged': diverged,
+        "tests": tests,
+        "tests_in_order": [tests[key] for key in ["T1", "T2", "T3", "T4"]],
+        "tests_passed": tests_passed,
+        "tests_total": tests_total,
+        "overall": overall,
+        "legacy_pass_rule": "PASS if at least 3 of 4 deterministic checks pass.",
+        "alpha_mean_sgd": alpha_mean_sgd,
+        "alpha_mean_muon": alpha_mean_muon,
+        "alpha_clipped_mean_sgd": alpha_clipped_mean_sgd,
+        "alpha_clipped_mean_muon": alpha_clipped_mean_muon,
+        "outlier_mean_sgd": outlier_mean_sgd,
+        "outlier_mean_muon": outlier_mean_muon,
+        "calibrated_conclusion": calibrated_conclusion,
     }
 
 
-# =============================================================================
-# MAIN EXPERIMENT
-# =============================================================================
+def run_experiment(config: Optional[Dict[str, Any]] = None, seed: int = DEFAULT_SEED) -> Dict[str, Any]:
+    """Compute the full experiment and return structured results for scripts or notebooks."""
+    normalized = normalize_config(config)
+    overall_start = time.perf_counter()
 
-print("=" * 100)
-print("1.3c-i: ISOLATE lambda_max FROM alpha -- TRACK BOTH INDEPENDENTLY")
-print("=" * 100)
-print(f"Setup: {NUM_LAYERS}-layer deep linear net (dim={DIM}), quadratic loss, {NUM_STEPS} steps")
-print(f"Track: alpha (power-law exponent), alpha_clipped (excluding top eigenvalue),")
-print(f"       lambda_max/lambda_median (outlier ratio)")
-print(f"Measure every {MEASURE_EVERY} steps")
-print(f"LR_Muon={LR_MUON}, Momentum={MOMENTUM}")
-print("=" * 100)
+    w_target, x_data = make_fixed_problem(normalized, seed=seed)
+    initial_weights = init_weights(
+        int(normalized["num_layers"]),
+        int(normalized["dim"]),
+        seed=seed,
+        init_noise_scale=float(normalized["init_noise_scale"]),
+    )
+    initial_loss = compute_loss(initial_weights, x_data, w_target)
 
-# Find stable SGD learning rate
-lr_sgd = find_stable_lr_sgd()
-print(f"\nSGD learning rate (max stable): {lr_sgd}")
-print(f"Muon learning rate (fixed):     {LR_MUON}")
+    chosen_lr_sgd, lr_scan = find_stable_lr_sgd(normalized, x_data, w_target, seed=seed)
+    results_sgd = run_and_measure("SGD", "sgd", chosen_lr_sgd, normalized, x_data, w_target, seed=seed)
+    results_muon = run_and_measure(
+        "Muon",
+        "muon",
+        float(normalized["lr_muon"]),
+        normalized,
+        x_data,
+        w_target,
+        seed=seed,
+    )
 
-# Initial loss
-np.random.seed(42)
-w_test = init_weights(NUM_LAYERS)
-loss_init = compute_loss(w_test, X_data, W_target)
-print(f"Initial loss: {loss_init:.6e}")
+    checks = evaluate_checks(results_sgd, results_muon)
+    total_runtime = time.perf_counter() - overall_start
 
-# Run both optimizers
-print(f"\n{'=' * 100}")
-print("RUNNING OPTIMIZERS")
-print("=" * 100)
+    problem_stats = {
+        "target_fro_norm": float(np.linalg.norm(w_target, ord="fro")),
+        "target_spectral_norm": float(np.linalg.norm(w_target, ord=2)),
+        "input_fro_norm": float(np.linalg.norm(x_data, ord="fro")),
+        "input_column_norm_mean": float(np.mean(np.linalg.norm(x_data, axis=0))),
+        "input_column_norm_std": float(np.std(np.linalg.norm(x_data, axis=0))),
+    }
 
-print("\n  Running SGD...", flush=True)
-results_sgd = run_and_measure('SGD', sgd_step, lr_sgd, NUM_STEPS)
-print(f"    SGD final loss: {results_sgd['losses'][-1]:.6e}")
-
-print("\n  Running Muon...", flush=True)
-results_muon = run_and_measure('Muon', muon_step, LR_MUON, NUM_STEPS)
-print(f"    Muon final loss: {results_muon['losses'][-1]:.6e}")
-
-# Get step arrays
-steps_sgd = results_sgd['measure_steps']
-steps_muon = results_muon['measure_steps']
-
-
-# =============================================================================
-# HELPER: Find index of a step in the measure_steps array
-# =============================================================================
-
-def step_idx(measure_steps, step_val):
-    """Return the index of step_val in measure_steps, or None."""
-    idx = np.where(measure_steps == step_val)[0]
-    return idx[0] if len(idx) > 0 else None
-
-
-# =============================================================================
-# TABLE 1: alpha(t) -- power-law exponent evolution
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("TABLE 1: POWER-LAW EXPONENT alpha(t) -- MEAN ACROSS LAYERS")
-print("  alpha = negative slope of log(eigenvalue) vs log(rank)")
-print("  Higher alpha => steeper decay => MORE heavy-tailed / concentrated")
-print("  Lower alpha => flatter spectrum => more uniform eigenvalue distribution")
-print("=" * 100)
-
-print(f"\n  {'Step':>6} | {'SGD alpha':>10} | {'Muon alpha':>11} | {'SGD-Muon':>10} | {'SGD alpha_c':>12} | {'Muon alpha_c':>13} | {'SGD-Muon clip':>14}")
-print("  " + "-" * 95)
-
-for ts in TABLE_STEPS:
-    idx_s = step_idx(steps_sgd, ts)
-    idx_m = step_idx(steps_muon, ts)
-    if idx_s is not None and idx_m is not None:
-        a_sgd = np.nanmean(results_sgd['alpha'][idx_s])
-        a_muon = np.nanmean(results_muon['alpha'][idx_m])
-        ac_sgd = np.nanmean(results_sgd['alpha_clipped'][idx_s])
-        ac_muon = np.nanmean(results_muon['alpha_clipped'][idx_m])
-        print(f"  {ts:6d} | {a_sgd:10.4f} | {a_muon:11.4f} | {a_sgd - a_muon:+10.4f} | "
-              f"{ac_sgd:12.4f} | {ac_muon:13.4f} | {ac_sgd - ac_muon:+14.4f}")
+    experiment = {
+        "metadata": {
+            "experiment_id": normalized["experiment_id"],
+            "title": "1.3c-i: Isolate lambda_max from alpha",
+            "study_scope": "single-seed per-layer W^T W spectrum proxy study",
+            "alpha_scope_note": (
+                "alpha is a rank-decay proxy from log(eigenvalue)-vs-log(rank) regression, "
+                "not a full WeightWatcher fit"
+            ),
+            "script_path": str(SCRIPT_DIR / "run_experiment.py"),
+            "counterpart_notebook": str(SCRIPT_DIR / "run_experiment.ipynb"),
+            "runtime_seconds": float(total_runtime),
+        },
+        "seed": int(seed),
+        "config": normalized,
+        "problem_stats": problem_stats,
+        "learning_rate_search": {
+            "method": "candidate-grid non-divergence heuristic on SGD only",
+            "candidates": [float(val) for val in normalized["sgd_lr_candidates"]],
+            "search_steps": int(normalized["sgd_lr_search_steps"]),
+            "divergence_factor": float(normalized["sgd_divergence_factor"]),
+            "chosen_sgd_lr": float(chosen_lr_sgd),
+            "scan": lr_scan,
+        },
+        "initial_loss": float(initial_loss),
+        "optimizers": {
+            "SGD": results_sgd,
+            "Muon": results_muon,
+        },
+        "checks": checks,
+        "summary": {
+            "overall": checks["overall"],
+            "tests_passed": checks["tests_passed"],
+            "tests_total": checks["tests_total"],
+            "calibrated_conclusion": checks["calibrated_conclusion"],
+        },
+    }
+    return experiment
 
 
-# =============================================================================
-# TABLE 2: lambda_max / lambda_median (outlier ratio)
-# =============================================================================
+def create_summary_figure(
+    experiment: Dict[str, Any],
+    save_path: Optional[Path] = None,
+    show: bool = False,
+    close: bool = False,
+    use_agg: bool = False,
+):
+    """Create the legacy-style multi-panel summary figure from structured results."""
+    if use_agg:
+        import matplotlib
 
-print(f"\n\n{'=' * 100}")
-print("TABLE 2: OUTLIER RATIO lambda_max / lambda_median -- MEAN ACROSS LAYERS")
-print("  Higher ratio => top eigenvalue is more of an outlier vs bulk")
-print("=" * 100)
-
-print(f"\n  {'Step':>6} | {'SGD ratio':>10} | {'Muon ratio':>11} | {'SGD/Muon':>10}")
-print("  " + "-" * 52)
-
-for ts in TABLE_STEPS:
-    idx_s = step_idx(steps_sgd, ts)
-    idx_m = step_idx(steps_muon, ts)
-    if idx_s is not None and idx_m is not None:
-        r_sgd = np.nanmean(results_sgd['outlier_ratio'][idx_s])
-        r_muon = np.nanmean(results_muon['outlier_ratio'][idx_m])
-        ratio_str = f"{r_sgd / r_muon:.4f}" if r_muon > 1e-10 else "N/A"
-        print(f"  {ts:6d} | {r_sgd:10.4f} | {r_muon:11.4f} | {ratio_str:>10}")
-
-
-# =============================================================================
-# TABLE 3: Per-layer alpha at key steps
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("TABLE 3: PER-LAYER alpha AT KEY STEPS")
-print("=" * 100)
-
-print(f"\n  {'Step':>6} | ", end="")
-for layer in range(NUM_LAYERS):
-    print(f"{'SGD L' + str(layer):>8} {'Muon L' + str(layer):>8} | ", end="")
-print()
-print("  " + "-" * (8 + (18 + 3) * NUM_LAYERS))
-
-for ts in TABLE_STEPS:
-    idx_s = step_idx(steps_sgd, ts)
-    idx_m = step_idx(steps_muon, ts)
-    if idx_s is not None and idx_m is not None:
-        print(f"  {ts:6d} | ", end="")
-        for layer in range(NUM_LAYERS):
-            a_sgd = results_sgd['alpha'][idx_s, layer]
-            a_muon = results_muon['alpha'][idx_m, layer]
-            print(f"{a_sgd:8.4f} {a_muon:8.4f} | ", end="")
-        print()
-
-
-# =============================================================================
-# TABLE 4: Per-layer lambda_max, lambda_median, lambda_min at key steps
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("TABLE 4: EIGENVALUE SUMMARY (LAYER MEANS) AT KEY STEPS")
-print("=" * 100)
-
-print(f"\n  {'Step':>6} | {'SGD lmax':>10} {'SGD lmed':>10} {'SGD lmin':>10} | "
-      f"{'Muon lmax':>10} {'Muon lmed':>10} {'Muon lmin':>10}")
-print("  " + "-" * 85)
-
-for ts in TABLE_STEPS:
-    idx_s = step_idx(steps_sgd, ts)
-    idx_m = step_idx(steps_muon, ts)
-    if idx_s is not None and idx_m is not None:
-        lmax_s = np.nanmean(results_sgd['lambda_max'][idx_s])
-        lmed_s = np.nanmean(results_sgd['lambda_median'][idx_s])
-        lmin_s = np.nanmean(results_sgd['lambda_min'][idx_s])
-        lmax_m = np.nanmean(results_muon['lambda_max'][idx_m])
-        lmed_m = np.nanmean(results_muon['lambda_median'][idx_m])
-        lmin_m = np.nanmean(results_muon['lambda_min'][idx_m])
-        print(f"  {ts:6d} | {lmax_s:10.4f} {lmed_s:10.4f} {lmin_s:10.4f} | "
-              f"{lmax_m:10.4f} {lmed_m:10.4f} {lmin_m:10.4f}")
-
-
-# =============================================================================
-# TABLE 5: Effect of clipping -- does removing lambda_max change alpha?
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("TABLE 5: CLIPPING EFFECT -- |alpha - alpha_clipped| (MEAN ACROSS LAYERS)")
-print("  Large difference => lambda_max is an outlier distorting the fit")
-print("  Small difference => lambda_max is consistent with bulk spectrum")
-print("=" * 100)
-
-print(f"\n  {'Step':>6} | {'SGD |da|':>10} | {'Muon |da|':>11} | {'SGD-Muon':>10}")
-print("  " + "-" * 52)
-
-for ts in TABLE_STEPS:
-    idx_s = step_idx(steps_sgd, ts)
-    idx_m = step_idx(steps_muon, ts)
-    if idx_s is not None and idx_m is not None:
-        da_sgd = np.nanmean(np.abs(results_sgd['alpha'][idx_s] - results_sgd['alpha_clipped'][idx_s]))
-        da_muon = np.nanmean(np.abs(results_muon['alpha'][idx_m] - results_muon['alpha_clipped'][idx_m]))
-        print(f"  {ts:6d} | {da_sgd:10.4f} | {da_muon:11.4f} | {da_sgd - da_muon:+10.4f}")
-
-
-# =============================================================================
-# ANALYSIS: Key Tests
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("KEY TESTS")
-print("=" * 100)
-
-# Compute mean alpha trajectories
-alpha_mean_sgd = np.nanmean(results_sgd['alpha'], axis=1)    # (n_measures,)
-alpha_mean_muon = np.nanmean(results_muon['alpha'], axis=1)
-
-alpha_c_mean_sgd = np.nanmean(results_sgd['alpha_clipped'], axis=1)
-alpha_c_mean_muon = np.nanmean(results_muon['alpha_clipped'], axis=1)
-
-outlier_mean_sgd = np.nanmean(results_sgd['outlier_ratio'], axis=1)
-outlier_mean_muon = np.nanmean(results_muon['outlier_ratio'], axis=1)
-
-# Use final step for tests
-final_idx_s = -1
-final_idx_m = -1
-
-# T1: Does alpha evolve differently for Muon vs SGD?
-# Compute alpha drift: |alpha(final) - alpha(0)|
-alpha_drift_sgd = abs(alpha_mean_sgd[final_idx_s] - alpha_mean_sgd[0])
-alpha_drift_muon = abs(alpha_mean_muon[final_idx_m] - alpha_mean_muon[0])
-
-# Also: compute total alpha change (signed)
-alpha_change_sgd = alpha_mean_sgd[final_idx_s] - alpha_mean_sgd[0]
-alpha_change_muon = alpha_mean_muon[final_idx_m] - alpha_mean_muon[0]
-
-# T2: Does Muon keep a flatter spectrum (lower alpha = less heavy-tailed)?
-# NOTE: higher alpha = steeper log-log slope = MORE concentrated
-# Flatter spectrum = smaller alpha (eigenvalues more uniform)
-alpha_final_sgd = alpha_mean_sgd[final_idx_s]
-alpha_final_muon = alpha_mean_muon[final_idx_m]
-
-# T3: Does lambda_max grow faster for SGD?
-lmax_growth_sgd = np.nanmean(results_sgd['lambda_max'][final_idx_s]) / np.nanmean(results_sgd['lambda_max'][0])
-lmax_growth_muon = np.nanmean(results_muon['lambda_max'][final_idx_m]) / np.nanmean(results_muon['lambda_max'][0])
-
-# T4: Does clipping lambda_max change the story for SGD but not Muon?
-clip_effect_sgd = np.nanmean(np.abs(results_sgd['alpha'][final_idx_s] - results_sgd['alpha_clipped'][final_idx_s]))
-clip_effect_muon = np.nanmean(np.abs(results_muon['alpha'][final_idx_m] - results_muon['alpha_clipped'][final_idx_m]))
-
-# Print test results
-test1_sgd_evolves_more = alpha_drift_sgd > alpha_drift_muon
-test2_muon_flatter = alpha_final_muon < alpha_final_sgd
-test3_sgd_lmax_faster = lmax_growth_sgd > lmax_growth_muon
-test4_clip_sgd_more = clip_effect_sgd > clip_effect_muon
-
-print(f"""
-  T1: ALPHA EVOLUTION DIFFERS BETWEEN OPTIMIZERS
-      SGD  alpha drift: |alpha(500) - alpha(0)| = |{alpha_mean_sgd[final_idx_s]:.4f} - {alpha_mean_sgd[0]:.4f}| = {alpha_drift_sgd:.4f}
-      Muon alpha drift: |alpha(500) - alpha(0)| = |{alpha_mean_muon[final_idx_m]:.4f} - {alpha_mean_muon[0]:.4f}| = {alpha_drift_muon:.4f}
-      SGD  alpha change (signed): {alpha_change_sgd:+.4f}
-      Muon alpha change (signed): {alpha_change_muon:+.4f}
-      SGD drifts more: {alpha_drift_sgd:.4f} vs {alpha_drift_muon:.4f}
-      -> {"CONFIRMED" if test1_sgd_evolves_more else "REJECTED"}: SGD alpha drifts {'more' if test1_sgd_evolves_more else 'less'} than Muon
-
-  T2: MUON KEEPS FLATTER SPECTRUM (LOWER alpha = LESS HEAVY-TAILED)
-      SGD  final alpha: {alpha_final_sgd:.4f}
-      Muon final alpha: {alpha_final_muon:.4f}
-      -> {"CONFIRMED" if test2_muon_flatter else "REJECTED"}: Muon spectrum is {'flatter' if test2_muon_flatter else 'steeper'} than SGD
-
-  T3: lambda_max GROWS FASTER FOR SGD
-      SGD  lambda_max growth factor (final/init): {lmax_growth_sgd:.4f}
-      Muon lambda_max growth factor (final/init): {lmax_growth_muon:.4f}
-      -> {"CONFIRMED" if test3_sgd_lmax_faster else "REJECTED"}: SGD lambda_max grows {'faster' if test3_sgd_lmax_faster else 'slower'} than Muon
-
-  T4: CLIPPING lambda_max CHANGES STORY FOR SGD BUT NOT MUON
-      SGD  |alpha - alpha_clipped| at final step:  {clip_effect_sgd:.4f}
-      Muon |alpha - alpha_clipped| at final step:  {clip_effect_muon:.4f}
-      -> {"CONFIRMED" if test4_clip_sgd_more else "REJECTED"}: Clipping lambda_max changes alpha {'more for SGD' if test4_clip_sgd_more else 'more for Muon'}
-""")
-
-tests = [test1_sgd_evolves_more, test2_muon_flatter, test3_sgd_lmax_faster, test4_clip_sgd_more]
-tests_passed = sum(tests)
-tests_total = len(tests)
-
-
-# =============================================================================
-# PLOT: alpha vs step and lambda_max/lambda_median vs step
-# =============================================================================
-
-print(f"\n{'=' * 100}")
-print("GENERATING PLOTS")
-print("=" * 100)
-
-try:
-    import matplotlib
-    matplotlib.use('Agg')
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-    fig.suptitle('1.3c-i: Isolate lambda_max from alpha -- Track Both Independently\n'
-                 f'{NUM_LAYERS}-layer linear net, dim={DIM}, {NUM_STEPS} steps',
-                 fontsize=14, fontweight='bold')
+    config = experiment["config"]
+    results_sgd = experiment["optimizers"]["SGD"]
+    results_muon = experiment["optimizers"]["Muon"]
+    checks = experiment["checks"]
 
-    # --- Panel (a): alpha vs step (mean across layers) ---
+    steps_sgd = results_sgd["measure_steps"]
+    steps_muon = results_muon["measure_steps"]
+
+    alpha_mean_sgd = checks["alpha_mean_sgd"]
+    alpha_mean_muon = checks["alpha_mean_muon"]
+    alpha_clipped_mean_sgd = checks["alpha_clipped_mean_sgd"]
+    alpha_clipped_mean_muon = checks["alpha_clipped_mean_muon"]
+    outlier_mean_sgd = checks["outlier_mean_sgd"]
+    outlier_mean_muon = checks["outlier_mean_muon"]
+
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    fig.suptitle(
+        "1.3c-i: Isolate lambda_max from alpha\n"
+        "Single-seed per-layer W^T W spectrum proxy study"
+        f"\n{config['num_layers']}-layer linear net, dim={config['dim']}, {config['num_steps']} steps",
+        fontsize=14,
+        fontweight="bold",
+    )
+
     ax = axes[0, 0]
-    ax.set_title('(a) Power-Law alpha vs Step (mean across layers)')
-    ax.plot(steps_sgd, alpha_mean_sgd, 'b-o', linewidth=2.5, markersize=3, label='SGD')
-    ax.plot(steps_muon, alpha_mean_muon, 'r--s', linewidth=2.5, markersize=3, label='Muon')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('alpha (power-law exponent)')
+    ax.set_title("(a) alpha proxy vs step (mean across layers)")
+    ax.plot(steps_sgd, alpha_mean_sgd, "b-o", linewidth=2.5, markersize=3, label="SGD")
+    ax.plot(steps_muon, alpha_mean_muon, "r--s", linewidth=2.5, markersize=3, label="Muon")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("alpha proxy")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (b): alpha_clipped vs step (mean across layers) ---
     ax = axes[0, 1]
-    ax.set_title('(b) alpha_clipped (excl. top eigenvalue) vs Step')
-    ax.plot(steps_sgd, alpha_c_mean_sgd, 'b-o', linewidth=2.5, markersize=3, label='SGD (clipped)')
-    ax.plot(steps_muon, alpha_c_mean_muon, 'r--s', linewidth=2.5, markersize=3, label='Muon (clipped)')
-    # Also plot unclipped for reference (thin lines)
-    ax.plot(steps_sgd, alpha_mean_sgd, 'b:', linewidth=1, alpha=0.5, label='SGD (full)')
-    ax.plot(steps_muon, alpha_mean_muon, 'r:', linewidth=1, alpha=0.5, label='Muon (full)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('alpha_clipped')
+    ax.set_title("(b) clipped alpha proxy vs step")
+    ax.plot(steps_sgd, alpha_clipped_mean_sgd, "b-o", linewidth=2.5, markersize=3, label="SGD clipped")
+    ax.plot(steps_muon, alpha_clipped_mean_muon, "r--s", linewidth=2.5, markersize=3, label="Muon clipped")
+    ax.plot(steps_sgd, alpha_mean_sgd, "b:", linewidth=1.0, alpha=0.5, label="SGD full")
+    ax.plot(steps_muon, alpha_mean_muon, "r:", linewidth=1.0, alpha=0.5, label="Muon full")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("alpha proxy")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (c): lambda_max / lambda_median (outlier ratio) ---
     ax = axes[0, 2]
-    ax.set_title('(c) Outlier Ratio lambda_max / lambda_median vs Step')
-    ax.plot(steps_sgd, outlier_mean_sgd, 'b-o', linewidth=2.5, markersize=3, label='SGD')
-    ax.plot(steps_muon, outlier_mean_muon, 'r--s', linewidth=2.5, markersize=3, label='Muon')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('lambda_max / lambda_median')
+    ax.set_title("(c) outlier ratio vs step")
+    ax.plot(steps_sgd, outlier_mean_sgd, "b-o", linewidth=2.5, markersize=3, label="SGD")
+    ax.plot(steps_muon, outlier_mean_muon, "r--s", linewidth=2.5, markersize=3, label="Muon")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("lambda_max / lambda_median")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (d): lambda_max trajectory ---
     ax = axes[1, 0]
-    ax.set_title('(d) lambda_max vs Step (mean across layers)')
-    ax.plot(steps_sgd, np.nanmean(results_sgd['lambda_max'], axis=1),
-            'b-o', linewidth=2.5, markersize=3, label='SGD')
-    ax.plot(steps_muon, np.nanmean(results_muon['lambda_max'], axis=1),
-            'r--s', linewidth=2.5, markersize=3, label='Muon')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('lambda_max (top eigenvalue of W^TW)')
+    ax.set_title("(d) lambda_max vs step (mean across layers)")
+    ax.plot(steps_sgd, results_sgd["trajectory_summary"]["lambda_max_mean"], "b-o", linewidth=2.5, markersize=3, label="SGD")
+    ax.plot(steps_muon, results_muon["trajectory_summary"]["lambda_max_mean"], "r--s", linewidth=2.5, markersize=3, label="Muon")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("lambda_max")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (e): Clipping effect over time ---
     ax = axes[1, 1]
-    ax.set_title('(e) Clipping Effect |alpha - alpha_clipped| vs Step')
-    clip_diff_sgd = np.nanmean(np.abs(results_sgd['alpha'] - results_sgd['alpha_clipped']), axis=1)
-    clip_diff_muon = np.nanmean(np.abs(results_muon['alpha'] - results_muon['alpha_clipped']), axis=1)
-    ax.plot(steps_sgd, clip_diff_sgd, 'b-o', linewidth=2.5, markersize=3, label='SGD')
-    ax.plot(steps_muon, clip_diff_muon, 'r--s', linewidth=2.5, markersize=3, label='Muon')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('|alpha - alpha_clipped|')
+    ax.set_title("(e) clipping effect vs step")
+    ax.plot(steps_sgd, results_sgd["trajectory_summary"]["clip_effect_mean"], "b-o", linewidth=2.5, markersize=3, label="SGD")
+    ax.plot(steps_muon, results_muon["trajectory_summary"]["clip_effect_mean"], "r--s", linewidth=2.5, markersize=3, label="Muon")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("|alpha proxy - alpha proxy clipped|")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (f): Loss ---
     ax = axes[1, 2]
-    ax.set_title('(f) Loss vs Step')
-    ax.semilogy(steps_sgd, results_sgd['losses'], 'b-o', linewidth=2.5, markersize=3, label='SGD')
-    ax.semilogy(steps_muon, results_muon['losses'], 'r--s', linewidth=2.5, markersize=3, label='Muon')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('Loss')
+    ax.set_title("(f) loss vs step")
+    ax.semilogy(steps_sgd, results_sgd["losses"], "b-o", linewidth=2.5, markersize=3, label="SGD")
+    ax.semilogy(steps_muon, results_muon["losses"], "r--s", linewidth=2.5, markersize=3, label="Muon")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plot_path = os.path.join(SCRIPT_DIR, 'alpha_vs_lambda_max.png')
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\n  Plot saved to: {plot_path}")
 
-except ImportError:
-    print("\n  WARNING: matplotlib not available, skipping plots.")
-    plot_path = None
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    if close:
+        plt.close(fig)
+
+    return fig, axes
 
 
-# =============================================================================
-# FINAL VERDICT
-# =============================================================================
+def make_json_safe(obj: Any) -> Any:
+    """Recursively convert numpy-heavy experiment results into JSON-safe objects."""
+    if isinstance(obj, dict):
+        return {str(key): make_json_safe(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_json_safe(value) for value in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
 
-print(f"\n\n{'=' * 100}")
-print("FINAL VERDICT: ISOLATE lambda_max FROM alpha")
-print("=" * 100)
 
-if tests_passed >= 3:
-    overall = "PASS"
-    detail = (
-        f"  {tests_passed}/{tests_total} tests pass.\n"
-        "  Muon controls the BULK spectrum (alpha stays flatter) AND suppresses\n"
-        "  lambda_max growth.  Clipping lambda_max has a larger effect on SGD,\n"
-        "  indicating SGD's heavy tail is driven by outlier eigenvalues while\n"
-        "  Muon distributes spectral energy more uniformly."
+def save_results_bundle(experiment: Dict[str, Any], output_dir: Path = SCRIPT_DIR) -> Dict[str, str]:
+    """Save the plot, a compact JSON summary, and a raw NPZ bundle."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_path = output_dir / "alpha_vs_lambda_max.png"
+    summary_path = output_dir / "alpha_vs_lambda_max_summary.json"
+    raw_path = output_dir / "alpha_vs_lambda_max_raw.npz"
+
+    create_summary_figure(experiment, save_path=plot_path, close=True, use_agg=True)
+
+    sgd = experiment["optimizers"]["SGD"]
+    muon = experiment["optimizers"]["Muon"]
+    config = experiment["config"]
+
+    np.savez(
+        raw_path,
+        seed=np.array(experiment["seed"]),
+        dim=np.array(config["dim"]),
+        num_layers=np.array(config["num_layers"]),
+        num_steps=np.array(config["num_steps"]),
+        batch_size=np.array(config["batch_size"]),
+        lr_muon=np.array(config["lr_muon"]),
+        lr_sgd=np.array(experiment["learning_rate_search"]["chosen_sgd_lr"]),
+        sgd_measure_steps=sgd["measure_steps"],
+        sgd_alpha=sgd["alpha"],
+        sgd_alpha_clipped=sgd["alpha_clipped"],
+        sgd_lambda_max=sgd["lambda_max"],
+        sgd_lambda_median=sgd["lambda_median"],
+        sgd_lambda_min=sgd["lambda_min"],
+        sgd_outlier_ratio=sgd["outlier_ratio"],
+        sgd_losses=sgd["losses"],
+        sgd_initial_eigenvalues=sgd["initial_eigenvalues"],
+        sgd_final_eigenvalues=sgd["final_eigenvalues"],
+        muon_measure_steps=muon["measure_steps"],
+        muon_alpha=muon["alpha"],
+        muon_alpha_clipped=muon["alpha_clipped"],
+        muon_lambda_max=muon["lambda_max"],
+        muon_lambda_median=muon["lambda_median"],
+        muon_lambda_min=muon["lambda_min"],
+        muon_outlier_ratio=muon["outlier_ratio"],
+        muon_losses=muon["losses"],
+        muon_initial_eigenvalues=muon["initial_eigenvalues"],
+        muon_final_eigenvalues=muon["final_eigenvalues"],
     )
-elif tests_passed >= 2:
-    overall = "PARTIAL PASS"
-    detail = (
-        f"  {tests_passed}/{tests_total} tests pass.\n"
-        f"  T1 (alpha evolves differently): {'PASS' if test1_sgd_evolves_more else 'FAIL'}\n"
-        f"  T2 (Muon flatter spectrum):     {'PASS' if test2_muon_flatter else 'FAIL'}\n"
-        f"  T3 (SGD lmax faster):           {'PASS' if test3_sgd_lmax_faster else 'FAIL'}\n"
-        f"  T4 (clipping helps SGD more):   {'PASS' if test4_clip_sgd_more else 'FAIL'}"
-    )
-else:
-    overall = "FAIL"
-    detail = (
-        f"  Only {tests_passed}/{tests_total} tests pass.\n"
-        f"  T1 (alpha evolves differently): {'PASS' if test1_sgd_evolves_more else 'FAIL'}\n"
-        f"  T2 (Muon flatter spectrum):     {'PASS' if test2_muon_flatter else 'FAIL'}\n"
-        f"  T3 (SGD lmax faster):           {'PASS' if test3_sgd_lmax_faster else 'FAIL'}\n"
-        f"  T4 (clipping helps SGD more):   {'PASS' if test4_clip_sgd_more else 'FAIL'}"
-    )
 
-print(f"""
-  +========================================================================+
-  |  VERDICT: {overall:<63}|
-  +========================================================================+
-  |                                                                        |""")
-for line in detail.split('\n'):
-    print(f"  |  {line:<70}|")
-print(f"""  |                                                                        |
-  +========================================================================+
-""")
+    summary_payload = {
+        "metadata": experiment["metadata"],
+        "seed": experiment["seed"],
+        "config": experiment["config"],
+        "problem_stats": experiment["problem_stats"],
+        "learning_rate_search": experiment["learning_rate_search"],
+        "initial_loss": experiment["initial_loss"],
+        "checks": experiment["checks"],
+        "summary": experiment["summary"],
+        "artifacts": {
+            "plot_path": str(plot_path),
+            "summary_path": str(summary_path),
+            "raw_path": str(raw_path),
+        },
+    }
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(make_json_safe(summary_payload), handle, indent=2)
 
-print("=" * 100)
-print(f"  Tests passed: {tests_passed}/{tests_total}")
-print(f"  Overall: {overall}")
-print("=" * 100)
+    artifact_paths = {
+        "plot_path": str(plot_path),
+        "summary_path": str(summary_path),
+        "raw_path": str(raw_path),
+    }
+    experiment["artifacts"] = artifact_paths
+    return artifact_paths
+
+
+def print_report(experiment: Dict[str, Any]) -> None:
+    """Print a calibrated text report from structured experiment results."""
+    config = experiment["config"]
+    results_sgd = experiment["optimizers"]["SGD"]
+    results_muon = experiment["optimizers"]["Muon"]
+    checks = experiment["checks"]
+
+    steps_sgd = results_sgd["measure_steps"]
+    steps_muon = results_muon["measure_steps"]
+    table_steps = config["table_steps"]
+
+    print("=" * 100)
+    print("1.3c-i: ISOLATE lambda_max FROM alpha")
+    print("=" * 100)
+    print("Scope: single-seed per-layer W^T W spectrum proxy study")
+    print("Alpha note: the reported alpha is a rank-decay proxy, not a full WeightWatcher fit.")
+    print(
+        f"Setup: {config['num_layers']}-layer deep linear net (dim={config['dim']}), "
+        f"batch={config['batch_size']}, {config['num_steps']} steps"
+    )
+    print(
+        f"Measure every {config['measure_every']} steps | Momentum={config['momentum']} | "
+        f"Muon LR={config['lr_muon']}"
+    )
+    print("Learning-rate note: SGD LR is chosen by a short candidate-grid stability heuristic.")
+    print("=" * 100)
+
+    print(f"\nSeed: {experiment['seed']}")
+    print(f"Initial loss: {experiment['initial_loss']:.6e}")
+    print(f"Chosen SGD LR: {experiment['learning_rate_search']['chosen_sgd_lr']}")
+    print(f"Final SGD loss:  {results_sgd['final_loss']:.6e}")
+    print(f"Final Muon loss: {results_muon['final_loss']:.6e}")
+    print(f"Total runtime:   {experiment['metadata']['runtime_seconds']:.2f} s")
+
+    print(f"\n{'=' * 100}")
+    print("TABLE 1: alpha proxy vs step (mean across layers)")
+    print("  Lower alpha proxy = flatter rank-decay fit in this toy metric.")
+    print("=" * 100)
+    print(
+        f"\n  {'Step':>6} | {'SGD alpha':>10} | {'Muon alpha':>11} | {'SGD-Muon':>10} | "
+        f"{'SGD alpha_c':>12} | {'Muon alpha_c':>13} | {'SGD-Muon clip':>14}"
+    )
+    print("  " + "-" * 95)
+    for table_step in table_steps:
+        idx_s = step_idx(steps_sgd, table_step)
+        idx_m = step_idx(steps_muon, table_step)
+        if idx_s is None or idx_m is None:
+            continue
+        alpha_sgd = float(np.nanmean(results_sgd["alpha"][idx_s]))
+        alpha_muon = float(np.nanmean(results_muon["alpha"][idx_m]))
+        alpha_clip_sgd = float(np.nanmean(results_sgd["alpha_clipped"][idx_s]))
+        alpha_clip_muon = float(np.nanmean(results_muon["alpha_clipped"][idx_m]))
+        print(
+            f"  {table_step:6d} | {alpha_sgd:10.4f} | {alpha_muon:11.4f} | {alpha_sgd - alpha_muon:+10.4f} | "
+            f"{alpha_clip_sgd:12.4f} | {alpha_clip_muon:13.4f} | {alpha_clip_sgd - alpha_clip_muon:+14.4f}"
+        )
+
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 2: outlier ratio lambda_max / lambda_median (mean across layers)")
+    print("=" * 100)
+    print(f"\n  {'Step':>6} | {'SGD ratio':>10} | {'Muon ratio':>11} | {'SGD/Muon':>10}")
+    print("  " + "-" * 52)
+    for table_step in table_steps:
+        idx_s = step_idx(steps_sgd, table_step)
+        idx_m = step_idx(steps_muon, table_step)
+        if idx_s is None or idx_m is None:
+            continue
+        ratio_sgd = float(np.nanmean(results_sgd["outlier_ratio"][idx_s]))
+        ratio_muon = float(np.nanmean(results_muon["outlier_ratio"][idx_m]))
+        ratio_string = f"{ratio_sgd / ratio_muon:.4f}" if ratio_muon > 1e-10 else "N/A"
+        print(f"  {table_step:6d} | {ratio_sgd:10.4f} | {ratio_muon:11.4f} | {ratio_string:>10}")
+
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 3: per-layer alpha proxy at key steps")
+    print("=" * 100)
+    print(f"\n  {'Step':>6} | ", end="")
+    for layer in range(int(config["num_layers"])):
+        print(f"{'SGD L' + str(layer):>8} {'Muon L' + str(layer):>8} | ", end="")
+    print()
+    print("  " + "-" * (8 + (18 + 3) * int(config["num_layers"])))
+    for table_step in table_steps:
+        idx_s = step_idx(steps_sgd, table_step)
+        idx_m = step_idx(steps_muon, table_step)
+        if idx_s is None or idx_m is None:
+            continue
+        print(f"  {table_step:6d} | ", end="")
+        for layer in range(int(config["num_layers"])):
+            alpha_sgd = float(results_sgd["alpha"][idx_s, layer])
+            alpha_muon = float(results_muon["alpha"][idx_m, layer])
+            print(f"{alpha_sgd:8.4f} {alpha_muon:8.4f} | ", end="")
+        print()
+
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 4: eigenvalue summary (layer means) at key steps")
+    print("=" * 100)
+    print(
+        f"\n  {'Step':>6} | {'SGD lmax':>10} {'SGD lmed':>10} {'SGD lmin':>10} | "
+        f"{'Muon lmax':>10} {'Muon lmed':>10} {'Muon lmin':>10}"
+    )
+    print("  " + "-" * 85)
+    for table_step in table_steps:
+        idx_s = step_idx(steps_sgd, table_step)
+        idx_m = step_idx(steps_muon, table_step)
+        if idx_s is None or idx_m is None:
+            continue
+        lmax_sgd = float(np.nanmean(results_sgd["lambda_max"][idx_s]))
+        lmed_sgd = float(np.nanmean(results_sgd["lambda_median"][idx_s]))
+        lmin_sgd = float(np.nanmean(results_sgd["lambda_min"][idx_s]))
+        lmax_muon = float(np.nanmean(results_muon["lambda_max"][idx_m]))
+        lmed_muon = float(np.nanmean(results_muon["lambda_median"][idx_m]))
+        lmin_muon = float(np.nanmean(results_muon["lambda_min"][idx_m]))
+        print(
+            f"  {table_step:6d} | {lmax_sgd:10.4f} {lmed_sgd:10.4f} {lmin_sgd:10.4f} | "
+            f"{lmax_muon:10.4f} {lmed_muon:10.4f} {lmin_muon:10.4f}"
+        )
+
+    print(f"\n\n{'=' * 100}")
+    print("TABLE 5: clipping effect |alpha proxy - alpha proxy clipped| (mean across layers)")
+    print("=" * 100)
+    print(f"\n  {'Step':>6} | {'SGD |da|':>10} | {'Muon |da|':>11} | {'SGD-Muon':>10}")
+    print("  " + "-" * 52)
+    for table_step in table_steps:
+        idx_s = step_idx(steps_sgd, table_step)
+        idx_m = step_idx(steps_muon, table_step)
+        if idx_s is None or idx_m is None:
+            continue
+        delta_sgd = float(np.nanmean(np.abs(results_sgd["alpha"][idx_s] - results_sgd["alpha_clipped"][idx_s])))
+        delta_muon = float(np.nanmean(np.abs(results_muon["alpha"][idx_m] - results_muon["alpha_clipped"][idx_m])))
+        print(f"  {table_step:6d} | {delta_sgd:10.4f} | {delta_muon:11.4f} | {delta_sgd - delta_muon:+10.4f}")
+
+    print(f"\n\n{'=' * 100}")
+    print("DETERMINISTIC CHECKS (single seed)")
+    print("=" * 100)
+    for test in checks["tests_in_order"]:
+        print(f"\n  {test['label']}: {test['claim']}")
+        print(f"      Metric: {test['metric_name']}")
+        print(f"      SGD value:  {test['sgd_value']:.4f}")
+        print(f"      Muon value: {test['muon_value']:.4f}")
+        print(f"      Result: {test['outcome_text']}")
+        print(f"      Note: {test['note']}")
+        if test['label'] == 'T1':
+            print(f"      Signed alpha-proxy change: SGD {test['sgd_signed_change']:+.4f}, Muon {test['muon_signed_change']:+.4f}")
+
+    print(f"\n{'=' * 100}")
+    print("FINAL VERDICT")
+    print("=" * 100)
+    print(f"Legacy rule: {checks['legacy_pass_rule']}")
+    print(f"Tests passed: {checks['tests_passed']}/{checks['tests_total']}")
+    print(f"Overall: {checks['overall']}")
+    print(f"Conclusion: {checks['calibrated_conclusion']}")
+    if "artifacts" in experiment:
+        print("Artifacts:")
+        for key, path in experiment["artifacts"].items():
+            print(f"  {key}: {path}")
+    print("=" * 100)
+
+
+def main() -> None:
+    """Entry point preserving normal script behavior while keeping import safety."""
+    experiment = run_experiment()
+    artifact_paths = save_results_bundle(experiment, output_dir=SCRIPT_DIR)
+    experiment["artifacts"] = artifact_paths
+    print_report(experiment)
+
+
+if __name__ == "__main__":
+    main()

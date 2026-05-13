@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-Exp 2.5: Muon worse for fine-tuning -- chaos prevents settling near pre-trained minimum
-========================================================================================
+Experiment 2.5: Fine-tuning vs scratch in a deep-linear toy model
+=================================================================
 
-HYPOTHESIS:
-  Muon's higher Lyapunov exponent means it is better for exploration (training
-  from scratch) but worse for exploitation (fine-tuning from a checkpoint).
-  The Newton-Schulz orthogonalization injects gauge-direction chaos that
-  destabilises the basin around a pre-trained minimum, whereas SGD can gently
-  slide into the nearest good minimum.
+Question:
+  In this toy setup, does Muon behave differently from SGD when adapting a
+  pre-trained checkpoint versus training from scratch after a target shift?
 
-PROTOCOL:
+Protocol:
   Phase 1 -- Pre-training (shared):
-      Train a 4-layer deep linear net (32x32) from random init with SGD
-      for 500 steps on target W_target.  Save checkpoint.
+      Train a 4-layer deep linear net (32x32) from random init with SGD for
+      500 steps on the original target. Save checkpoint.
 
   Phase 2 -- Fine-tuning (from checkpoint):
       Modify 20% of the target matrix -> W_target_modified.
@@ -25,468 +22,753 @@ PROTOCOL:
       Train from random init for 700 steps on W_target_modified with both
       optimizers.
 
-MEASUREMENTS:
-  - Fine-tuning loss curves  (SGD vs Muon)
-  - From-scratch loss curves  (SGD vs Muon)
-  - Distance from checkpoint  ||W_t - W_checkpoint||_F  for fine-tuning runs
+Measured quantities:
+  - Pre-training loss curves
+  - Fine-tuning loss curves (SGD vs Muon)
+  - From-scratch loss curves (SGD vs Muon)
+  - Fine-tuning checkpoint parameter distance ||theta_t - theta_ckpt||_2
 
-PREDICTIONS:
-  - Fine-tuning: SGD stays closer to checkpoint, Muon wanders further
-  - Fine-tuning final loss: SGD < Muon (SGD exploits the nearby minimum)
-  - From-scratch final loss: Muon < SGD (Muon explores better)
+Important scope limitations:
+  - This script does NOT measure Lyapunov exponents.
+  - It does NOT directly diagnose chaos.
+  - It does NOT measure Hessian geometry.
+  - Checkpoint distance is a total parameter-space metric, not a direct
+    gauge-direction or function-space decomposition.
 """
 
+from __future__ import annotations
+
+import time
 import numpy as np
-import os
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
 
-SEED = 42
-np.random.seed(SEED)
+DEFAULT_CONFIG = {
+    "seed": 42,
+    "seed_stride": 137,
+    "dim": 32,
+    "num_layers": 4,
+    "batch_size": 64,
+    "input_scale": 0.3,
+    "target_scale": 0.5,
+    "init_scale": 0.1,
+    "pretrain_steps": 500,
+    "pretrain_lr": 0.01,
+    "finetune_steps": 200,
+    "sgd_finetune_lr": 0.01,
+    "muon_finetune_lr": 0.005,
+    "scratch_steps": 700,
+    "sgd_scratch_lr": 0.01,
+    "muon_scratch_lr": 0.005,
+    "momentum": 0.9,
+    "ns_iters": 5,
+    "modify_frac": 0.20,
+    "num_runs": 5,
+    "threshold_fraction": 0.50,
+}
 
-DIM = 32
-NUM_LAYERS = 4
-BATCH_SIZE = 64
 
-# Phase 1 -- pre-training
-PRETRAIN_STEPS = 500
-PRETRAIN_LR = 0.01
+def get_default_config():
+    """Return a copy of the default experiment configuration."""
+    return dict(DEFAULT_CONFIG)
 
-# Phase 2 -- fine-tuning
-FINETUNE_STEPS = 200
-SGD_FT_LR = 0.01
-MUON_FT_LR = 0.005
 
-# Phase 3 -- from scratch
-SCRATCH_STEPS = 700
-SGD_SCRATCH_LR = 0.01
-MUON_SCRATCH_LR = 0.005
+def build_run_seeds(config):
+    return [config["seed"] + idx * config["seed_stride"] for idx in range(config["num_runs"])]
 
-# Muon parameters
-MOMENTUM = 0.9
-NS_ITERS = 5
 
-# Target modification fraction
-MODIFY_FRAC = 0.20
+def make_base_problem(config):
+    """Construct the fixed data/target pair used across runs."""
+    base_rng = np.random.RandomState(config["seed"])
+    dim = config["dim"]
+    batch_size = config["batch_size"]
 
-# Number of runs to average over for robustness
-NUM_RUNS = 5
+    x_data = base_rng.randn(dim, batch_size) * config["input_scale"]
+    w_target_original = base_rng.randn(dim, dim) * config["target_scale"]
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    return {
+        "X_data": x_data,
+        "W_target_original": w_target_original,
+        "summary": {
+            "x_shape": x_data.shape,
+            "target_shape": w_target_original.shape,
+            "input_scale": config["input_scale"],
+            "target_scale": config["target_scale"],
+        },
+    }
 
-# Fixed data
-X_data = np.random.randn(DIM, BATCH_SIZE) * 0.3
 
 # =============================================================================
 # TARGET MATRICES
 # =============================================================================
 
-W_target_original = np.random.randn(DIM, DIM) * 0.5
 
-def make_modified_target(W_original, frac, rng):
+def make_modified_target(w_original, frac, rng, target_scale):
     """Change `frac` of entries to new random values."""
-    W_mod = W_original.copy()
-    n_entries = W_mod.size
+    w_mod = w_original.copy()
+    n_entries = w_mod.size
     n_change = int(frac * n_entries)
     indices = rng.choice(n_entries, size=n_change, replace=False)
-    flat = W_mod.ravel()
-    flat[indices] = rng.randn(n_change) * 0.5
-    return W_mod
+    flat = w_mod.ravel()
+    flat[indices] = rng.randn(n_change) * target_scale
+    return w_mod
+
 
 # =============================================================================
 # NETWORK HELPERS
 # =============================================================================
 
-def init_weights(num_layers, rng):
+
+def init_weights(num_layers, dim, rng, init_scale):
     """Initialize layers near identity for stability."""
     weights = []
     for _ in range(num_layers):
-        W = np.eye(DIM) + rng.randn(DIM, DIM) * 0.1
-        weights.append(W.copy())
+        w = np.eye(dim) + rng.randn(dim, dim) * init_scale
+        weights.append(w.copy())
     return weights
 
 
-def forward_linear(weights, X):
+def forward_linear(weights, x):
     """Forward pass through deep linear net."""
-    out = X.copy()
-    for W in weights:
-        out = W @ out
+    out = x.copy()
+    for w in weights:
+        out = w @ out
     return out
 
 
-def compute_loss(weights, X, Y_target):
+def compute_loss(weights, x, y_target):
     """Quadratic loss: 0.5 * ||f(X) - Y||^2 / N."""
-    Y_pred = forward_linear(weights, X)
-    diff = Y_pred - Y_target
+    y_pred = forward_linear(weights, x)
+    diff = y_pred - y_target
     return 0.5 * np.mean(np.sum(diff**2, axis=0))
 
 
-def compute_gradients(weights, X, Y_target):
+def compute_gradients(weights, x, y_target):
     """Backprop through deep linear net for quadratic loss."""
     num_layers = len(weights)
-    N = X.shape[1]
+    n = x.shape[1]
 
-    # Forward pass -- store activations
-    activations = [X.copy()]
-    for W in weights:
-        activations.append(W @ activations[-1])
+    activations = [x.copy()]
+    for w in weights:
+        activations.append(w @ activations[-1])
 
-    # Output error
-    delta = (activations[-1] - Y_target) / N
+    delta = (activations[-1] - y_target) / n
 
-    # Backward pass
     grads = [None] * num_layers
-    for l in range(num_layers - 1, -1, -1):
-        grads[l] = delta @ activations[l].T
-        if l > 0:
-            delta = weights[l].T @ delta
+    for layer_idx in range(num_layers - 1, -1, -1):
+        grads[layer_idx] = delta @ activations[layer_idx].T
+        if layer_idx > 0:
+            delta = weights[layer_idx].T @ delta
 
     return grads
 
 
 def flatten_weights(weights):
-    return np.concatenate([W.ravel() for W in weights])
+    return np.concatenate([w.ravel() for w in weights])
 
 
 def checkpoint_distance(weights, checkpoint_weights):
-    """Frobenius distance between current weights and checkpoint."""
+    """Euclidean distance over all layer parameters relative to the checkpoint."""
     flat_w = flatten_weights(weights)
     flat_c = flatten_weights(checkpoint_weights)
     return np.linalg.norm(flat_w - flat_c)
 
 
 def copy_weights(weights):
-    return [W.copy() for W in weights]
+    return [w.copy() for w in weights]
+
 
 # =============================================================================
 # OPTIMIZERS
 # =============================================================================
 
-def newton_schulz_ortho(M, n_iters=NS_ITERS):
-    """Newton-Schulz iteration to approximate the orthogonal polar factor."""
+
+def newton_schulz_ortho(matrix, n_iters=5):
+    """Approximate the orthogonal polar factor via Newton-Schulz iteration."""
     a, b, c = 3.4445, -4.7750, 2.0315
-    X = M / (np.linalg.norm(M, ord='fro') + 1e-7)
-    if X.shape[0] > X.shape[1]:
-        X = X.T
+    x = matrix / (np.linalg.norm(matrix, ord="fro") + 1e-7)
+    if x.shape[0] > x.shape[1]:
+        x = x.T
         transposed = True
     else:
         transposed = False
-    Id = np.eye(X.shape[0])
+
+    identity = np.eye(x.shape[0])
     for _ in range(n_iters):
-        A = X @ X.T
-        X = (a * Id + b * A + c * A @ A) @ X
+        gram = x @ x.T
+        x = (a * identity + b * gram + c * gram @ gram) @ x
+
     if transposed:
-        X = X.T
-    return X
+        x = x.T
+    return x
 
 
 class SGDOptimizer:
     def __init__(self, weights, lr, momentum=0.9):
         self.lr = lr
         self.momentum = momentum
-        self.velocity = [np.zeros_like(W) for W in weights]
+        self.velocity = [np.zeros_like(w) for w in weights]
 
     def step(self, weights, grads):
-        for i in range(len(weights)):
-            self.velocity[i] = self.momentum * self.velocity[i] + grads[i]
-            weights[i] -= self.lr * self.velocity[i]
+        for idx in range(len(weights)):
+            self.velocity[idx] = self.momentum * self.velocity[idx] + grads[idx]
+            weights[idx] -= self.lr * self.velocity[idx]
         return weights
 
 
 class MuonOptimizer:
-    def __init__(self, weights, lr, momentum=0.9, ns_iters=NS_ITERS):
+    def __init__(self, weights, lr, momentum=0.9, ns_iters=5):
         self.lr = lr
         self.momentum = momentum
         self.ns_iters = ns_iters
-        self.velocity = [np.zeros_like(W) for W in weights]
+        self.velocity = [np.zeros_like(w) for w in weights]
 
     def step(self, weights, grads):
-        for i in range(len(weights)):
-            self.velocity[i] = self.momentum * self.velocity[i] + grads[i]
-            ortho_update = newton_schulz_ortho(self.velocity[i], self.ns_iters)
-            weights[i] -= self.lr * ortho_update
+        for idx in range(len(weights)):
+            self.velocity[idx] = self.momentum * self.velocity[idx] + grads[idx]
+            ortho_update = newton_schulz_ortho(self.velocity[idx], self.ns_iters)
+            weights[idx] -= self.lr * ortho_update
         return weights
+
 
 # =============================================================================
 # TRAINING LOOP
 # =============================================================================
 
-def train(weights, optimizer, W_target, X, n_steps, checkpoint_weights=None):
-    """Train and record loss + distance from checkpoint at each step."""
+
+def train(weights, optimizer, w_target, x, n_steps, checkpoint_weights=None):
+    """Train and record loss + checkpoint distance at each step."""
     losses = []
     distances = []
-    Y_target = W_target @ X
+    y_target = w_target @ x
 
-    for step in range(n_steps):
-        loss = compute_loss(weights, X, Y_target)
+    for _ in range(n_steps):
+        loss = compute_loss(weights, x, y_target)
         losses.append(loss)
 
         if checkpoint_weights is not None:
-            dist = checkpoint_distance(weights, checkpoint_weights)
-            distances.append(dist)
+            distances.append(checkpoint_distance(weights, checkpoint_weights))
 
-        grads = compute_gradients(weights, X, Y_target)
+        grads = compute_gradients(weights, x, y_target)
         weights = optimizer.step(weights, grads)
 
-    # Final loss
-    loss = compute_loss(weights, X, Y_target)
-    losses.append(loss)
+    final_loss = compute_loss(weights, x, y_target)
+    losses.append(final_loss)
     if checkpoint_weights is not None:
         distances.append(checkpoint_distance(weights, checkpoint_weights))
 
-    return weights, np.array(losses), np.array(distances) if distances else None
+    losses = np.asarray(losses, dtype=float)
+    distances = np.asarray(distances, dtype=float) if distances else None
+    return weights, losses, distances
+
+
+# =============================================================================
+# ANALYSIS HELPERS
+# =============================================================================
+
+
+def steps_to_threshold(losses, frac=0.5):
+    threshold = losses[0] * frac
+    for idx, loss in enumerate(losses):
+        if loss <= threshold:
+            return idx
+    return len(losses)
+
+
+def validate_curve(name, curve, expected_length):
+    if curve.shape != (expected_length,):
+        raise ValueError(f"{name} has shape {curve.shape}, expected {(expected_length,)}")
+    if not np.all(np.isfinite(curve)):
+        raise ValueError(f"{name} contains non-finite values")
+
+
+def validate_run_result(run_result, config):
+    validate_curve("pretrain_losses", run_result["pretrain_losses"], config["pretrain_steps"] + 1)
+    validate_curve("ft_sgd_losses", run_result["ft_sgd_losses"], config["finetune_steps"] + 1)
+    validate_curve("ft_muon_losses", run_result["ft_muon_losses"], config["finetune_steps"] + 1)
+    validate_curve("ft_sgd_dists", run_result["ft_sgd_dists"], config["finetune_steps"] + 1)
+    validate_curve("ft_muon_dists", run_result["ft_muon_dists"], config["finetune_steps"] + 1)
+    validate_curve("scratch_sgd_losses", run_result["scratch_sgd_losses"], config["scratch_steps"] + 1)
+    validate_curve("scratch_muon_losses", run_result["scratch_muon_losses"], config["scratch_steps"] + 1)
+
 
 # =============================================================================
 # MAIN EXPERIMENT
 # =============================================================================
 
-def run_single_experiment(run_seed):
+
+def run_single_experiment(run_seed, config, base_problem):
     """Run one full experiment with a given seed."""
     rng = np.random.RandomState(run_seed)
+    x_data = base_problem["X_data"]
+    w_target_original = base_problem["W_target_original"]
 
-    # ---- Targets ----
-    W_target_mod = make_modified_target(W_target_original, MODIFY_FRAC, rng)
+    w_target_mod = make_modified_target(
+        w_target_original,
+        config["modify_frac"],
+        rng,
+        config["target_scale"],
+    )
 
-    # ---- Phase 1: Pre-train with SGD on original target ----
-    weights_init = init_weights(NUM_LAYERS, rng)
-    pretrain_opt = SGDOptimizer(copy_weights(weights_init), lr=PRETRAIN_LR, momentum=MOMENTUM)
+    weights_init = init_weights(
+        config["num_layers"],
+        config["dim"],
+        rng,
+        config["init_scale"],
+    )
+    pretrain_opt = SGDOptimizer(
+        copy_weights(weights_init),
+        lr=config["pretrain_lr"],
+        momentum=config["momentum"],
+    )
     weights_pretrained, pretrain_losses, _ = train(
-        copy_weights(weights_init), pretrain_opt, W_target_original, X_data, PRETRAIN_STEPS
+        copy_weights(weights_init),
+        pretrain_opt,
+        w_target_original,
+        x_data,
+        config["pretrain_steps"],
     )
     checkpoint = copy_weights(weights_pretrained)
 
-    # ---- Phase 2a: Fine-tune from checkpoint with SGD ----
-    ft_sgd_opt = SGDOptimizer(copy_weights(checkpoint), lr=SGD_FT_LR, momentum=MOMENTUM)
-    ft_sgd_weights, ft_sgd_losses, ft_sgd_dists = train(
-        copy_weights(checkpoint), ft_sgd_opt, W_target_mod, X_data, FINETUNE_STEPS,
-        checkpoint_weights=checkpoint
+    ft_sgd_opt = SGDOptimizer(
+        copy_weights(checkpoint),
+        lr=config["sgd_finetune_lr"],
+        momentum=config["momentum"],
+    )
+    _, ft_sgd_losses, ft_sgd_dists = train(
+        copy_weights(checkpoint),
+        ft_sgd_opt,
+        w_target_mod,
+        x_data,
+        config["finetune_steps"],
+        checkpoint_weights=checkpoint,
     )
 
-    # ---- Phase 2b: Fine-tune from checkpoint with Muon ----
-    ft_muon_opt = MuonOptimizer(copy_weights(checkpoint), lr=MUON_FT_LR, momentum=MOMENTUM)
-    ft_muon_weights, ft_muon_losses, ft_muon_dists = train(
-        copy_weights(checkpoint), ft_muon_opt, W_target_mod, X_data, FINETUNE_STEPS,
-        checkpoint_weights=checkpoint
+    ft_muon_opt = MuonOptimizer(
+        copy_weights(checkpoint),
+        lr=config["muon_finetune_lr"],
+        momentum=config["momentum"],
+        ns_iters=config["ns_iters"],
+    )
+    _, ft_muon_losses, ft_muon_dists = train(
+        copy_weights(checkpoint),
+        ft_muon_opt,
+        w_target_mod,
+        x_data,
+        config["finetune_steps"],
+        checkpoint_weights=checkpoint,
     )
 
-    # ---- Phase 3a: From scratch with SGD ----
-    scratch_init = init_weights(NUM_LAYERS, rng)
-    scratch_sgd_opt = SGDOptimizer(copy_weights(scratch_init), lr=SGD_SCRATCH_LR, momentum=MOMENTUM)
+    scratch_init = init_weights(
+        config["num_layers"],
+        config["dim"],
+        rng,
+        config["init_scale"],
+    )
+    scratch_sgd_opt = SGDOptimizer(
+        copy_weights(scratch_init),
+        lr=config["sgd_scratch_lr"],
+        momentum=config["momentum"],
+    )
     _, scratch_sgd_losses, _ = train(
-        copy_weights(scratch_init), scratch_sgd_opt, W_target_mod, X_data, SCRATCH_STEPS
+        copy_weights(scratch_init),
+        scratch_sgd_opt,
+        w_target_mod,
+        x_data,
+        config["scratch_steps"],
     )
 
-    # ---- Phase 3b: From scratch with Muon ----
-    scratch_muon_opt = MuonOptimizer(copy_weights(scratch_init), lr=MUON_SCRATCH_LR, momentum=MOMENTUM)
+    scratch_muon_opt = MuonOptimizer(
+        copy_weights(scratch_init),
+        lr=config["muon_scratch_lr"],
+        momentum=config["momentum"],
+        ns_iters=config["ns_iters"],
+    )
     _, scratch_muon_losses, _ = train(
-        copy_weights(scratch_init), scratch_muon_opt, W_target_mod, X_data, SCRATCH_STEPS
+        copy_weights(scratch_init),
+        scratch_muon_opt,
+        w_target_mod,
+        x_data,
+        config["scratch_steps"],
     )
 
+    threshold_fraction = config["threshold_fraction"]
+    run_result = {
+        "run_seed": run_seed,
+        "target_shift_frobenius": float(np.linalg.norm(w_target_mod - w_target_original)),
+        "pretrain_losses": pretrain_losses,
+        "ft_sgd_losses": ft_sgd_losses,
+        "ft_muon_losses": ft_muon_losses,
+        "ft_sgd_dists": ft_sgd_dists,
+        "ft_muon_dists": ft_muon_dists,
+        "scratch_sgd_losses": scratch_sgd_losses,
+        "scratch_muon_losses": scratch_muon_losses,
+        "pretrain_final_loss": float(pretrain_losses[-1]),
+        "ft_sgd_final_loss": float(ft_sgd_losses[-1]),
+        "ft_muon_final_loss": float(ft_muon_losses[-1]),
+        "ft_sgd_final_checkpoint_distance": float(ft_sgd_dists[-1]),
+        "ft_muon_final_checkpoint_distance": float(ft_muon_dists[-1]),
+        "scratch_sgd_final_loss": float(scratch_sgd_losses[-1]),
+        "scratch_muon_final_loss": float(scratch_muon_losses[-1]),
+        "threshold_steps": {
+            "ft_sgd_half_loss": int(steps_to_threshold(ft_sgd_losses, threshold_fraction)),
+            "ft_muon_half_loss": int(steps_to_threshold(ft_muon_losses, threshold_fraction)),
+            "scratch_sgd_half_loss": int(steps_to_threshold(scratch_sgd_losses, threshold_fraction)),
+            "scratch_muon_half_loss": int(steps_to_threshold(scratch_muon_losses, threshold_fraction)),
+        },
+    }
+    validate_run_result(run_result, config)
+    return run_result
+
+
+def mean_sd(values):
+    values = np.asarray(values, dtype=float)
+    sd = np.std(values, ddof=1) if values.size > 1 else 0.0
     return {
-        'pretrain_final_loss': pretrain_losses[-1],
-        'ft_sgd_losses': ft_sgd_losses,
-        'ft_muon_losses': ft_muon_losses,
-        'ft_sgd_dists': ft_sgd_dists,
-        'ft_muon_dists': ft_muon_dists,
-        'scratch_sgd_losses': scratch_sgd_losses,
-        'scratch_muon_losses': scratch_muon_losses,
+        "mean": float(np.mean(values)),
+        "sd": float(sd),
+        "n": int(values.size),
+        "values": values,
     }
 
 
-def main():
-    print("=" * 80)
-    print("Exp 2.5: Muon worse for fine-tuning?")
-    print("       Chaos prevents settling near pre-trained minimum")
-    print("=" * 80)
+def stack_curve_stats(curves):
+    stacked = np.stack(curves, axis=0)
+    sd = np.std(stacked, axis=0, ddof=1) if stacked.shape[0] > 1 else np.zeros_like(stacked[0])
+    return {
+        "mean": np.mean(stacked, axis=0),
+        "sd": sd,
+        "n": int(stacked.shape[0]),
+        "all_curves": stacked,
+    }
+
+
+def aggregate_results(run_results, config):
+    curve_stats = {
+        "pretrain_losses": stack_curve_stats([r["pretrain_losses"] for r in run_results]),
+        "ft_sgd_losses": stack_curve_stats([r["ft_sgd_losses"] for r in run_results]),
+        "ft_muon_losses": stack_curve_stats([r["ft_muon_losses"] for r in run_results]),
+        "ft_sgd_dists": stack_curve_stats([r["ft_sgd_dists"] for r in run_results]),
+        "ft_muon_dists": stack_curve_stats([r["ft_muon_dists"] for r in run_results]),
+        "scratch_sgd_losses": stack_curve_stats([r["scratch_sgd_losses"] for r in run_results]),
+        "scratch_muon_losses": stack_curve_stats([r["scratch_muon_losses"] for r in run_results]),
+    }
+
+    final_metrics = {
+        "pretrain_final_loss": mean_sd([r["pretrain_final_loss"] for r in run_results]),
+        "ft_sgd_final_loss": mean_sd([r["ft_sgd_final_loss"] for r in run_results]),
+        "ft_muon_final_loss": mean_sd([r["ft_muon_final_loss"] for r in run_results]),
+        "ft_sgd_final_checkpoint_distance": mean_sd(
+            [r["ft_sgd_final_checkpoint_distance"] for r in run_results]
+        ),
+        "ft_muon_final_checkpoint_distance": mean_sd(
+            [r["ft_muon_final_checkpoint_distance"] for r in run_results]
+        ),
+        "scratch_sgd_final_loss": mean_sd([r["scratch_sgd_final_loss"] for r in run_results]),
+        "scratch_muon_final_loss": mean_sd([r["scratch_muon_final_loss"] for r in run_results]),
+        "target_shift_frobenius": mean_sd([r["target_shift_frobenius"] for r in run_results]),
+    }
+
+    threshold_steps = {
+        "ft_sgd_half_loss": mean_sd([r["threshold_steps"]["ft_sgd_half_loss"] for r in run_results]),
+        "ft_muon_half_loss": mean_sd([r["threshold_steps"]["ft_muon_half_loss"] for r in run_results]),
+        "scratch_sgd_half_loss": mean_sd(
+            [r["threshold_steps"]["scratch_sgd_half_loss"] for r in run_results]
+        ),
+        "scratch_muon_half_loss": mean_sd(
+            [r["threshold_steps"]["scratch_muon_half_loss"] for r in run_results]
+        ),
+    }
+
+    paired_differences = {
+        "finetune_final_loss_muon_minus_sgd": mean_sd(
+            [r["ft_muon_final_loss"] - r["ft_sgd_final_loss"] for r in run_results]
+        ),
+        "finetune_final_checkpoint_distance_muon_minus_sgd": mean_sd(
+            [
+                r["ft_muon_final_checkpoint_distance"]
+                - r["ft_sgd_final_checkpoint_distance"]
+                for r in run_results
+            ]
+        ),
+        "scratch_final_loss_muon_minus_sgd": mean_sd(
+            [r["scratch_muon_final_loss"] - r["scratch_sgd_final_loss"] for r in run_results]
+        ),
+    }
+
+    early_vs_late = {}
+    for label, key in (("sgd", "ft_sgd_losses"), ("muon", "ft_muon_losses")):
+        early_drops = [r[key][0] - r[key][50] for r in run_results]
+        late_drops = [r[key][150] - r[key][200] for r in run_results]
+        early_vs_late[label] = {
+            "early_drop_0_to_50": mean_sd(early_drops),
+            "late_drop_150_to_200": mean_sd(late_drops),
+        }
+
+    h1_confirmed = (
+        final_metrics["ft_muon_final_checkpoint_distance"]["mean"]
+        > final_metrics["ft_sgd_final_checkpoint_distance"]["mean"]
+    )
+    h2_confirmed = (
+        final_metrics["ft_muon_final_loss"]["mean"]
+        > final_metrics["ft_sgd_final_loss"]["mean"]
+    )
+    h3_confirmed = final_metrics["scratch_muon_final_loss"]["mean"] < final_metrics["scratch_sgd_final_loss"]["mean"]
+
+    hypothesis_tests = {
+        "H1": {
+            "question": "By the end of fine-tuning, does Muon end farther from the checkpoint in parameter space than SGD?",
+            "measured_quantity": "Final checkpoint parameter distance over concatenated layer weights",
+            "lhs_name": "Muon final checkpoint distance",
+            "lhs_mean": final_metrics["ft_muon_final_checkpoint_distance"]["mean"],
+            "rhs_name": "SGD final checkpoint distance",
+            "rhs_mean": final_metrics["ft_sgd_final_checkpoint_distance"]["mean"],
+            "confirmed": bool(h1_confirmed),
+            "verdict": "CONFIRMED" if h1_confirmed else "REJECTED",
+        },
+        "H2": {
+            "question": "Does Muon finish fine-tuning with a higher final loss than SGD?",
+            "measured_quantity": "Final fine-tuning loss at the 200-step budget",
+            "lhs_name": "Muon final fine-tune loss",
+            "lhs_mean": final_metrics["ft_muon_final_loss"]["mean"],
+            "rhs_name": "SGD final fine-tune loss",
+            "rhs_mean": final_metrics["ft_sgd_final_loss"]["mean"],
+            "confirmed": bool(h2_confirmed),
+            "verdict": "CONFIRMED" if h2_confirmed else "REJECTED",
+        },
+        "H3": {
+            "question": "Does Muon finish from-scratch training with a lower final loss than SGD?",
+            "measured_quantity": "Final from-scratch loss at the 700-step budget",
+            "lhs_name": "Muon final scratch loss",
+            "lhs_mean": final_metrics["scratch_muon_final_loss"]["mean"],
+            "rhs_name": "SGD final scratch loss",
+            "rhs_mean": final_metrics["scratch_sgd_final_loss"]["mean"],
+            "confirmed": bool(h3_confirmed),
+            "verdict": "CONFIRMED" if h3_confirmed else "REJECTED",
+        },
+    }
+
+    if threshold_steps["ft_muon_half_loss"]["mean"] > threshold_steps["ft_sgd_half_loss"]["mean"]:
+        early_speed_clause = "Muon is slower than SGD on the fine-tuning half-loss threshold"
+    elif threshold_steps["ft_muon_half_loss"]["mean"] < threshold_steps["ft_sgd_half_loss"]["mean"]:
+        early_speed_clause = "Muon is faster than SGD on the fine-tuning half-loss threshold"
+    else:
+        early_speed_clause = "Muon and SGD are tied on the fine-tuning half-loss threshold"
+
+    fine_tune_endpoint_clause = (
+        "Muon finishes fine-tuning with a higher final loss than SGD"
+        if h2_confirmed
+        else "Muon finishes fine-tuning with a lower final loss than SGD"
+    )
+    scratch_clause = (
+        "Muon finishes from-scratch training with a lower final loss than SGD"
+        if h3_confirmed
+        else "Muon does not finish from-scratch training with a lower final loss than SGD"
+    )
+    distance_clause = (
+        "Muon ends farther from the checkpoint in parameter space by the fine-tuning endpoint"
+        if h1_confirmed
+        else "Muon does not end farther from the checkpoint in parameter space by the fine-tuning endpoint"
+    )
+
+    overall_conclusion = (
+        f"{early_speed_clause}; {distance_clause}; {fine_tune_endpoint_clause}; and {scratch_clause}. "
+        "This toy experiment therefore distinguishes slower early adaptation from final-loss performance, "
+        "and checkpoint parameter distance should not be interpreted as a direct gauge-only metric."
+    )
+
+    return {
+        "curve_stats": curve_stats,
+        "final_metrics": final_metrics,
+        "threshold_steps": threshold_steps,
+        "paired_differences": paired_differences,
+        "early_vs_late_finetune_loss_drop": early_vs_late,
+        "hypothesis_tests": hypothesis_tests,
+        "overall_conclusion": overall_conclusion,
+    }
+
+
+def run_experiment(config_overrides=None, verbose=False):
+    """Run the full experiment and return structured results."""
+    config = get_default_config()
+    if config_overrides:
+        config.update(config_overrides)
+
+    base_problem = make_base_problem(config)
+    run_seeds = build_run_seeds(config)
+
+    start_time = time.perf_counter()
+    run_results = []
+    for run_idx, run_seed in enumerate(run_seeds, start=1):
+        if verbose:
+            print(f"  Run {run_idx}/{config['num_runs']} (seed={run_seed})...")
+        run_results.append(run_single_experiment(run_seed, config, base_problem))
+    runtime_seconds = time.perf_counter() - start_time
+
+    aggregates = aggregate_results(run_results, config)
+
+    return {
+        "config": config,
+        "run_seeds": run_seeds,
+        "runtime_seconds": runtime_seconds,
+        "base_problem_summary": base_problem["summary"],
+        "per_run_results": run_results,
+        "aggregates": {
+            "curve_stats": aggregates["curve_stats"],
+            "final_metrics": aggregates["final_metrics"],
+            "threshold_steps": aggregates["threshold_steps"],
+            "paired_differences": aggregates["paired_differences"],
+            "early_vs_late_finetune_loss_drop": aggregates["early_vs_late_finetune_loss_drop"],
+        },
+        "hypothesis_tests": aggregates["hypothesis_tests"],
+        "overall_conclusion": aggregates["overall_conclusion"],
+        "limitations": [
+            "No Lyapunov exponent is measured.",
+            "No direct chaos diagnostic is measured.",
+            "No Hessian or local-curvature quantity is measured.",
+            "Checkpoint distance is a parameter-space proxy, not a direct gauge-direction metric.",
+        ],
+    }
+
+
+def format_mean_sd(summary, precision=6):
+    return f"{summary['mean']:.{precision}f} +/- {summary['sd']:.{precision}f}"
+
+
+def print_curve_snapshot_table(results):
+    curve_stats = results["aggregates"]["curve_stats"]
+
+    ft_sgd_curve = curve_stats["ft_sgd_losses"]["mean"]
+    ft_muon_curve = curve_stats["ft_muon_losses"]["mean"]
+    ft_sgd_dist_curve = curve_stats["ft_sgd_dists"]["mean"]
+    ft_muon_dist_curve = curve_stats["ft_muon_dists"]["mean"]
+    sc_sgd_curve = curve_stats["scratch_sgd_losses"]["mean"]
+    sc_muon_curve = curve_stats["scratch_muon_losses"]["mean"]
+
     print()
-
-    # Collect results across runs
-    all_results = []
-    for run_idx in range(NUM_RUNS):
-        seed = SEED + run_idx * 137
-        print(f"  Run {run_idx + 1}/{NUM_RUNS} (seed={seed})...")
-        result = run_single_experiment(seed)
-        all_results.append(result)
-
-    # Aggregate
-    ft_sgd_final_losses   = [r['ft_sgd_losses'][-1] for r in all_results]
-    ft_muon_final_losses  = [r['ft_muon_losses'][-1] for r in all_results]
-    ft_sgd_final_dists    = [r['ft_sgd_dists'][-1] for r in all_results]
-    ft_muon_final_dists   = [r['ft_muon_dists'][-1] for r in all_results]
-    sc_sgd_final_losses   = [r['scratch_sgd_losses'][-1] for r in all_results]
-    sc_muon_final_losses  = [r['scratch_muon_losses'][-1] for r in all_results]
-    pretrain_final_losses = [r['pretrain_final_loss'] for r in all_results]
-
-    # Means and stds
-    def ms(arr):
-        return np.mean(arr), np.std(arr)
-
-    pt_m, pt_s     = ms(pretrain_final_losses)
-    ft_sgd_m, ft_sgd_s   = ms(ft_sgd_final_losses)
-    ft_muon_m, ft_muon_s = ms(ft_muon_final_losses)
-    ft_sgd_d_m, ft_sgd_d_s   = ms(ft_sgd_final_dists)
-    ft_muon_d_m, ft_muon_d_s = ms(ft_muon_final_dists)
-    sc_sgd_m, sc_sgd_s   = ms(sc_sgd_final_losses)
-    sc_muon_m, sc_muon_s = ms(sc_muon_final_losses)
-
-    # ---- Loss curves (averaged) ----
+    print("-" * 80)
+    print("LOSS CURVE SNAPSHOTS (mean over runs)")
+    print("-" * 80)
     print()
-    print("-" * 70)
-    print("LOSS CURVE SNAPSHOTS (averaged over runs)")
-    print("-" * 70)
-
-    # Fine-tuning curves
-    ft_steps = len(all_results[0]['ft_sgd_losses'])
-    ft_sgd_curve = np.mean([r['ft_sgd_losses'] for r in all_results], axis=0)
-    ft_muon_curve = np.mean([r['ft_muon_losses'] for r in all_results], axis=0)
-
-    print("\nFine-tuning from checkpoint (200 steps):")
+    print("Fine-tuning from checkpoint:")
     print(f"  {'Step':>6}  {'SGD loss':>12}  {'Muon loss':>12}  {'SGD dist':>12}  {'Muon dist':>12}")
-    ft_sgd_dist_curve = np.mean([r['ft_sgd_dists'] for r in all_results], axis=0)
-    ft_muon_dist_curve = np.mean([r['ft_muon_dists'] for r in all_results], axis=0)
     for step_idx in [0, 10, 25, 50, 100, 150, 200]:
-        if step_idx < ft_steps:
-            print(f"  {step_idx:>6}  {ft_sgd_curve[step_idx]:>12.6f}  "
-                  f"{ft_muon_curve[step_idx]:>12.6f}  "
-                  f"{ft_sgd_dist_curve[step_idx]:>12.4f}  "
-                  f"{ft_muon_dist_curve[step_idx]:>12.4f}")
+        print(
+            f"  {step_idx:>6}  {ft_sgd_curve[step_idx]:>12.6f}  {ft_muon_curve[step_idx]:>12.6f}  "
+            f"{ft_sgd_dist_curve[step_idx]:>12.4f}  {ft_muon_dist_curve[step_idx]:>12.4f}"
+        )
 
-    # From-scratch curves
-    sc_steps = len(all_results[0]['scratch_sgd_losses'])
-    sc_sgd_curve = np.mean([r['scratch_sgd_losses'] for r in all_results], axis=0)
-    sc_muon_curve = np.mean([r['scratch_muon_losses'] for r in all_results], axis=0)
-
-    print("\nFrom scratch (700 steps):")
+    print()
+    print("From scratch:")
     print(f"  {'Step':>6}  {'SGD loss':>12}  {'Muon loss':>12}")
     for step_idx in [0, 50, 100, 200, 350, 500, 700]:
-        if step_idx < sc_steps:
-            print(f"  {step_idx:>6}  {sc_sgd_curve[step_idx]:>12.6f}  "
-                  f"{sc_muon_curve[step_idx]:>12.6f}")
+        print(f"  {step_idx:>6}  {sc_sgd_curve[step_idx]:>12.6f}  {sc_muon_curve[step_idx]:>12.6f}")
 
-    # ---- Main results table ----
-    print()
+
+def print_results_report(results):
+    config = results["config"]
+    final_metrics = results["aggregates"]["final_metrics"]
+    threshold_steps = results["aggregates"]["threshold_steps"]
+    paired_differences = results["aggregates"]["paired_differences"]
+    early_vs_late = results["aggregates"]["early_vs_late_finetune_loss_drop"]
+    hypothesis_tests = results["hypothesis_tests"]
+
     print("=" * 80)
-    print("MAIN RESULTS TABLE")
-    print("=" * 80)
-    print()
-    print(f"Pre-training final loss (SGD, 500 steps): {pt_m:.6f} +/- {pt_s:.6f}")
-    print()
-
-    header = (f"  {'Scenario':<30}  {'SGD final loss':>16}  {'Muon final loss':>17}  "
-              f"{'SGD dist':>14}  {'Muon dist':>14}")
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-
-    print(f"  {'Fine-tune (from ckpt)':<30}  "
-          f"{ft_sgd_m:>10.6f}+/-{ft_sgd_s:<5.4f}  "
-          f"{ft_muon_m:>10.6f}+/-{ft_muon_s:<6.4f}  "
-          f"{ft_sgd_d_m:>8.4f}+/-{ft_sgd_d_s:<4.3f}  "
-          f"{ft_muon_d_m:>8.4f}+/-{ft_muon_d_s:<4.3f}")
-
-    print(f"  {'From scratch (700 steps)':<30}  "
-          f"{sc_sgd_m:>10.6f}+/-{sc_sgd_s:<5.4f}  "
-          f"{sc_muon_m:>10.6f}+/-{sc_muon_s:<6.4f}  "
-          f"{'n/a':>14}  {'n/a':>14}")
-
-    # ---- Verdict ----
-    print()
-    print("=" * 80)
-    print("HYPOTHESIS TESTS")
+    print("Experiment 2.5: Fine-tuning vs scratch in a deep-linear toy model")
     print("=" * 80)
     print()
-
-    # Test 1: Fine-tuning distance
-    dist_test = ft_muon_d_m > ft_sgd_d_m
-    print(f"[H1] Muon wanders further from checkpoint during fine-tuning?")
-    print(f"     SGD dist = {ft_sgd_d_m:.4f},  Muon dist = {ft_muon_d_m:.4f}")
-    print(f"     Ratio Muon/SGD = {ft_muon_d_m / (ft_sgd_d_m + 1e-12):.2f}x")
-    print(f"     --> {'CONFIRMED' if dist_test else 'REJECTED'}")
+    print("Question:")
+    print("  Does Muon adapt differently from SGD when starting from a pre-trained")
+    print("  checkpoint versus training from scratch after a target perturbation?")
     print()
-
-    # Test 2: Fine-tuning loss -- SGD < Muon
-    ft_loss_test = ft_sgd_m < ft_muon_m
-    print(f"[H2] Fine-tuning: SGD reaches lower loss than Muon?")
-    print(f"     SGD loss = {ft_sgd_m:.6f},  Muon loss = {ft_muon_m:.6f}")
-    if ft_sgd_m > 0:
-        print(f"     Muon/SGD ratio = {ft_muon_m / ft_sgd_m:.2f}")
-    print(f"     --> {'CONFIRMED' if ft_loss_test else 'REJECTED'}")
+    print("Scope note:")
+    print("  This run measures losses and checkpoint parameter distance only.")
+    print("  It does not directly measure Lyapunov exponents, chaos, Hessians,")
+    print("  or gauge-only motion.")
     print()
+    print("Configuration:")
+    print(
+        f"  dim={config['dim']}, layers={config['num_layers']}, batch={config['batch_size']}, "
+        f"pretrain_steps={config['pretrain_steps']}, finetune_steps={config['finetune_steps']}, "
+        f"scratch_steps={config['scratch_steps']}, num_runs={config['num_runs']}"
+    )
+    print(f"  run_seeds={results['run_seeds']}")
+    print(f"  runtime={results['runtime_seconds']:.2f}s")
 
-    # Test 3: From-scratch loss -- Muon < SGD
-    scratch_loss_test = sc_muon_m < sc_sgd_m
-    print(f"[H3] From scratch: Muon reaches lower loss than SGD?")
-    print(f"     SGD loss = {sc_sgd_m:.6f},  Muon loss = {sc_muon_m:.6f}")
-    if sc_sgd_m > 0:
-        print(f"     SGD/Muon ratio = {sc_sgd_m / (sc_muon_m + 1e-12):.2f}")
-    print(f"     --> {'CONFIRMED' if scratch_loss_test else 'REJECTED'}")
+    print_curve_snapshot_table(results)
+
     print()
-
-    # Overall
-    all_confirmed = dist_test and ft_loss_test and scratch_loss_test
-    partial = sum([dist_test, ft_loss_test, scratch_loss_test])
     print("=" * 80)
-    if all_confirmed:
-        print("OVERALL VERDICT: HYPOTHESIS FULLY CONFIRMED (3/3)")
-        print("  Muon is worse for fine-tuning (chaos prevents settling)")
-        print("  but better from scratch (exploration advantage).")
-    elif partial >= 2:
-        print(f"OVERALL VERDICT: HYPOTHESIS PARTIALLY CONFIRMED ({partial}/3)")
-        if not dist_test:
-            print("  Surprise: Muon did NOT wander further from checkpoint.")
-        if not ft_loss_test:
-            print("  Surprise: Muon actually fine-tuned to LOWER loss than SGD.")
-        if not scratch_loss_test:
-            print("  Surprise: SGD actually trained from scratch to LOWER loss.")
-    else:
-        print(f"OVERALL VERDICT: HYPOTHESIS REJECTED ({partial}/3)")
-        if not ft_loss_test:
-            print("  Key finding: Muon fine-tunes as well or better than SGD.")
-        if not scratch_loss_test:
-            print("  Key finding: SGD trains from scratch as well or better.")
+    print("FINAL METRICS (mean +/- sample sd)")
     print("=" * 80)
-
-    # ---- Additional analysis: convergence speed ----
+    print(f"Pre-training final loss (SGD):      {format_mean_sd(final_metrics['pretrain_final_loss'])}")
+    print(f"Fine-tune final loss (SGD):         {format_mean_sd(final_metrics['ft_sgd_final_loss'])}")
+    print(f"Fine-tune final loss (Muon):        {format_mean_sd(final_metrics['ft_muon_final_loss'])}")
+    print(
+        f"Fine-tune final ckpt dist (SGD):    {format_mean_sd(final_metrics['ft_sgd_final_checkpoint_distance'], precision=4)}"
+    )
+    print(
+        f"Fine-tune final ckpt dist (Muon):   {format_mean_sd(final_metrics['ft_muon_final_checkpoint_distance'], precision=4)}"
+    )
+    print(f"Scratch final loss (SGD):           {format_mean_sd(final_metrics['scratch_sgd_final_loss'])}")
+    print(f"Scratch final loss (Muon):          {format_mean_sd(final_metrics['scratch_muon_final_loss'])}")
     print()
-    print("-" * 70)
-    print("ADDITIONAL ANALYSIS: Convergence Speed")
-    print("-" * 70)
-
-    # For fine-tuning: steps to reach 50% of initial loss
-    def steps_to_threshold(losses, frac=0.5):
-        threshold = losses[0] * frac
-        for i, l in enumerate(losses):
-            if l <= threshold:
-                return i
-        return len(losses)
-
-    ft_sgd_half = np.mean([steps_to_threshold(r['ft_sgd_losses']) for r in all_results])
-    ft_muon_half = np.mean([steps_to_threshold(r['ft_muon_losses']) for r in all_results])
-    sc_sgd_half = np.mean([steps_to_threshold(r['scratch_sgd_losses']) for r in all_results])
-    sc_muon_half = np.mean([steps_to_threshold(r['scratch_muon_losses']) for r in all_results])
-
-    print(f"\nSteps to reach 50% of initial loss:")
-    print(f"  Fine-tune SGD:      {ft_sgd_half:.1f}")
-    print(f"  Fine-tune Muon:     {ft_muon_half:.1f}")
-    print(f"  From-scratch SGD:   {sc_sgd_half:.1f}")
-    print(f"  From-scratch Muon:  {sc_muon_half:.1f}")
-
-    # ---- Early vs Late fine-tuning comparison ----
+    print("Threshold summary: steps to reach 50% of initial loss")
+    print(f"  Fine-tune SGD:      {format_mean_sd(threshold_steps['ft_sgd_half_loss'], precision=1)}")
+    print(f"  Fine-tune Muon:     {format_mean_sd(threshold_steps['ft_muon_half_loss'], precision=1)}")
+    print(f"  Scratch SGD:        {format_mean_sd(threshold_steps['scratch_sgd_half_loss'], precision=1)}")
+    print(f"  Scratch Muon:       {format_mean_sd(threshold_steps['scratch_muon_half_loss'], precision=1)}")
     print()
-    print("-" * 70)
-    print("FINE-TUNING DYNAMICS: Early vs Late")
-    print("-" * 70)
-    # Compare loss reduction in first 50 steps vs last 50 steps
-    for name, curve in [("SGD", ft_sgd_curve), ("Muon", ft_muon_curve)]:
-        early_drop = curve[0] - curve[50]
-        late_drop = curve[150] - curve[200] if len(curve) > 200 else curve[-51] - curve[-1]
-        print(f"  {name}: early drop (0-50) = {early_drop:.6f},  "
-              f"late drop (150-200) = {late_drop:.6f},  "
-              f"ratio = {early_drop / (abs(late_drop) + 1e-12):.1f}x")
+    print("Paired differences (Muon - SGD; mean +/- sample sd)")
+    print(
+        f"  Fine-tune final loss:             {format_mean_sd(paired_differences['finetune_final_loss_muon_minus_sgd'])}"
+    )
+    print(
+        "  Fine-tune final ckpt distance:    "
+        f"{format_mean_sd(paired_differences['finetune_final_checkpoint_distance_muon_minus_sgd'], precision=4)}"
+    )
+    print(
+        f"  Scratch final loss:               {format_mean_sd(paired_differences['scratch_final_loss_muon_minus_sgd'])}"
+    )
+    print()
+    print("Fine-tuning loss-drop summary (mean +/- sample sd)")
+    print(
+        "  SGD  early 0->50:  "
+        f"{format_mean_sd(early_vs_late['sgd']['early_drop_0_to_50'])}"
+        f" | late 150->200: {format_mean_sd(early_vs_late['sgd']['late_drop_150_to_200'])}"
+    )
+    print(
+        "  Muon early 0->50:  "
+        f"{format_mean_sd(early_vs_late['muon']['early_drop_0_to_50'])}"
+        f" | late 150->200: {format_mean_sd(early_vs_late['muon']['late_drop_150_to_200'])}"
+    )
 
+    print()
+    print("=" * 80)
+    print("HYPOTHESIS CHECKS")
+    print("=" * 80)
+    for key in ["H1", "H2", "H3"]:
+        test = hypothesis_tests[key]
+        print(f"[{key}] {test['question']}")
+        print(f"     measured quantity: {test['measured_quantity']}")
+        print(f"     {test['lhs_name']} = {test['lhs_mean']:.6f}")
+        print(f"     {test['rhs_name']} = {test['rhs_mean']:.6f}")
+        print(f"     --> {test['verdict']}")
+        print()
+
+    print("Calibrated overall conclusion:")
+    print(f"  {results['overall_conclusion']}")
+    print()
+    print("Caveats:")
+    for limitation in results["limitations"]:
+        print(f"  - {limitation}")
     print()
     print("Experiment complete.")
+
+
+def main():
+    results = run_experiment(verbose=True)
+    print_results_report(results)
+    return results
 
 
 if __name__ == "__main__":

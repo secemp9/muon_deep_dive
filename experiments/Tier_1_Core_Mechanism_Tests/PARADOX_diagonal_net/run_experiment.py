@@ -1,300 +1,227 @@
 #!/usr/bin/env python3
 """
-Experiment 3.18: Paradox on Diagonal Nets
-==========================================
+Experiment 3.18: Paradox on Diagonal Factorized Nets
+====================================================
 
-HYPOTHESIS:
-  The Muon Paradox (diverse weights, consistent losses) requires gauge symmetry.
-  It should VANISH for diagonal networks where dim(gauge) = 0.
+This benchmark compares a diagonal-factorized deep linear control against a
+full-matrix deep linear reference. It preserves the original paradox protocol as
+closely as possible while narrowing the interpretation:
 
-  Each layer is a diagonal matrix d_i in R^n. The product = element-wise product
-  of diagonals. There is no O(n) gauge group -- every parameter is physical.
+- The diagonal-factorized model removes inter-layer orthogonal gauge freedom,
+  but it does NOT establish a completely gauge-free or fully physical
+  parameterization. Continuous reparameterization symmetries of the factorized
+  product remain.
+- The diagonal "Muon" update is a finite-iteration Newton-Schulz transform of
+  the diagonal gradient. It is sign-like, but not exact coordinate-wise sign
+  normalization after only a small number of iterations.
+- Sampled output diversity is measured on a fixed finite test set X_test. This
+  is a useful surrogate for functional diversity, but it is not by itself an
+  exact operator comparison.
+- To make the benchmark more honest, the script also reports exact end-to-end
+  operator diversity computed from the trained weights.
 
-  "Muon" on a diagonal = Newton-Schulz ortho of diag(d) -> sign normalization,
-  i.e. each element -> +/- 1.  This is coordinate-wise sign(G).
-
-PROTOCOL:
-  4-layer diagonal deep linear (n=32), 20 independent runs, 500 steps.
-  Compare weight diversity ratio and loss std for Muon vs SGD.
-
-PREDICTION:
-  No paradox -- diversity ratios (func_div / weight_div) should be SIMILAR
-  for Muon and SGD, because there are no gauge directions to explore.
-
-SETUP:
-  - Target: random diagonal d_target in R^n
-  - Each layer: diagonal d_i in R^n  (stored as 1D vectors, not full matrices)
-  - Forward: f(x) = diag(d_L * d_{L-1} * ... * d_1) @ x  (element-wise product)
-  - Loss: 0.5 * ||f(X) - diag(d_target) @ X||^2 / N
-  - Muon: Newton-Schulz on diag(g_i) -> sign(g_i) * ones  (orthogonal diagonal)
+The heuristic decision rules retained at the end of the script are benchmark
+sanity checks, not formal statistical hypothesis tests.
 """
 
+from __future__ import annotations
+
+import copy
+import time
+from typing import Dict, Iterable, List, Tuple
+
 import numpy as np
-import os
 
-np.random.seed(42)
+
+DEFAULT_CONFIG = {
+    "global_seed": 42,
+    "dim": 32,
+    "num_layers": 4,
+    "num_steps": 500,
+    "batch_size": 64,
+    "momentum": 0.9,
+    "ns_iters": 5,
+    "num_independent_runs": 20,
+    "num_test_inputs": 50,
+    "data_scale": 0.3,
+    "warmup_steps": 100,
+    "divergence_multiplier": 50.0,
+    "divergence_loss_cap": 1e10,
+    "init_seed_base": 1000,
+    "diag_lr_candidates": [0.05, 0.03, 0.02, 0.01, 0.005, 0.003, 0.001],
+    "full_lr_candidates": [0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001],
+}
+
+
+def build_config(overrides: Dict | None = None) -> Dict:
+    """Return a config dict with optional overrides."""
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    if overrides:
+        config.update(overrides)
+    return config
+
 
 # =============================================================================
-# CONFIGURATION
+# DATA GENERATION
 # =============================================================================
 
-DIM = 32
-NUM_LAYERS = 4
-NUM_STEPS = 500
-BATCH_SIZE = 64
-LR_MUON = 0.02
-LR_SGD = 0.01
-MOMENTUM = 0.9
-NS_ITERS = 5
-NUM_INDEPENDENT_RUNS = 20
-NUM_TEST_INPUTS = 50
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+def generate_problem(config: Dict) -> Dict[str, np.ndarray]:
+    """Generate the fixed target and train/test inputs for a given config."""
+    rng = np.random.RandomState(config["global_seed"])
+    dim = config["dim"]
+    batch_size = config["batch_size"]
+    num_test_inputs = config["num_test_inputs"]
+    scale = config["data_scale"]
 
-# Fixed target and data
-d_target = np.random.randn(DIM)  # target diagonal
-X_data = np.random.randn(DIM, BATCH_SIZE) * 0.3
-X_test = np.random.randn(DIM, NUM_TEST_INPUTS) * 0.3
+    d_target = rng.randn(dim)
+    X_data = rng.randn(dim, batch_size) * scale
+    X_test = rng.randn(dim, num_test_inputs) * scale
+
+    return {
+        "d_target": d_target,
+        "X_data": X_data,
+        "X_test": X_test,
+        "W_target_full": np.diag(d_target),
+    }
 
 
 # =============================================================================
 # DIAGONAL NETWORK
 # =============================================================================
 
-def init_diag(num_layers, seed=42):
+
+def init_diag(num_layers: int, dim: int, seed: int = 42) -> List[np.ndarray]:
     """Initialize diagonal layers near ones for stability."""
     rng = np.random.RandomState(seed)
     diags = []
     for _ in range(num_layers):
-        d = np.ones(DIM) + rng.randn(DIM) * 0.1
-        diags.append(d.copy())
+        diags.append(np.ones(dim) + rng.randn(dim) * 0.1)
     return diags
 
 
-def forward_diag(diags, X):
-    """Forward pass: multiply X by product of diagonals."""
-    prod = np.ones(DIM)
+def forward_diag(diags: List[np.ndarray], X: np.ndarray) -> np.ndarray:
+    """Forward pass: multiply X by the product of diagonals."""
+    prod = np.ones_like(diags[0])
     for d in diags:
-        prod = prod * d  # element-wise product
-    # Apply: diag(prod) @ X = prod[:, None] * X
+        prod = prod * d
     return prod[:, None] * X
 
 
-def compute_loss_diag(diags, X, target_diag):
-    """Quadratic loss."""
+def effective_operator_diag(diags: List[np.ndarray]) -> np.ndarray:
+    """Return the exact end-to-end diagonal operator as a vector of diagonal entries."""
+    prod = np.ones_like(diags[0])
+    for d in diags:
+        prod = prod * d
+    return prod
+
+
+def compute_loss_diag(diags: List[np.ndarray], X: np.ndarray, target_diag: np.ndarray) -> float:
+    """Quadratic loss for the diagonal network."""
     pred = forward_diag(diags, X)
     target_out = target_diag[:, None] * X
     diff = pred - target_out
     return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
 
 
-def compute_gradients_diag(diags, X, target_diag):
-    """Backprop for diagonal network."""
-    num_layers = len(diags)
-    N = X.shape[1]
+def compute_gradients_diag(diags: List[np.ndarray], X: np.ndarray, target_diag: np.ndarray) -> List[np.ndarray]:
+    """Backpropagation for the diagonal network."""
+    prod = effective_operator_diag(diags)
+    err = prod - target_diag
+    x_sq_mean = np.mean(X ** 2, axis=1)
+    dL_dprod = err * x_sq_mean
 
-    # Product of all diagonals
-    prod = np.ones(DIM)
-    for d in diags:
-        prod = prod * d
-
-    # Error: (prod - target_diag) element-wise
-    err = prod - target_diag  # (DIM,)
-
-    # Loss = 0.5 * mean_over_samples(sum_i (err_i * x_i)^2)
-    # dL/d_prod_i = err_i * mean(x_i^2 across batch)  ... but let me be precise.
-    # pred = prod[:, None] * X
-    # target_out = target_diag[:, None] * X
-    # diff = (prod - target_diag)[:, None] * X
-    # loss = 0.5 * mean_cols(sum_rows(diff^2))
-    # dL/dprod_i = err_i * mean(X_i^2 across batch)
-
-    # Compute mean(X_i^2) for each dimension
-    x_sq_mean = np.mean(X ** 2, axis=1)  # (DIM,)
-    dL_dprod = err * x_sq_mean  # (DIM,)
-
-    # Gradient for each layer:
-    # prod = d_1 * d_2 * ... * d_L (element-wise)
-    # dprod/d_{k,i} = prod_i / d_{k,i}
     grads = []
-    for k in range(num_layers):
-        # grad_k_i = dL_dprod_i * prod_i / d_k_i
-        with np.errstate(divide='ignore', invalid='ignore'):
-            grad_k = dL_dprod * prod / (diags[k] + 1e-30)
+    for d in diags:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            grad_k = dL_dprod * prod / (d + 1e-30)
         grads.append(grad_k)
-
     return grads
 
 
-def newton_schulz_diagonal(g_vec, num_iters=NS_ITERS):
+def newton_schulz_diagonal(g_vec: np.ndarray, num_iters: int) -> np.ndarray:
     """
-    Newton-Schulz orthogonalization of a diagonal matrix diag(g_vec).
-    A diagonal orthogonal matrix has entries +/-1.
-    NS iteration on diag(g) converges to diag(sign(g)).
-    We can verify: for diagonal X, A = X^T X = X^2 (diagonal),
-    and 1.5*X - 0.5*X*A = 1.5*X - 0.5*X^3. Fixed points: x_i = +/-1.
+    Finite-iteration Newton-Schulz transform for a diagonal gradient.
+
+    For a diagonal matrix, the fixed points are sign-like (+/-1) entries, but
+    with only a finite number of iterations the output is generally not exactly
+    coordinate-wise sign(g_vec).
     """
     norm = np.linalg.norm(g_vec)
     if norm < 1e-12:
         return g_vec.copy()
     x = g_vec / norm
     for _ in range(num_iters):
-        # For diagonal: X_{k+1} = 1.5 * X_k - 0.5 * X_k^3
         x = 1.5 * x - 0.5 * x ** 3
     return x
 
 
 # =============================================================================
-# OPTIMIZERS
+# FULL-MATRIX NETWORK
 # =============================================================================
 
-def sgd_step_diag(diags, velocities, grads, lr):
-    for i in range(len(diags)):
-        velocities[i] = MOMENTUM * velocities[i] + grads[i]
-        diags[i] = diags[i] - lr * velocities[i]
-    return diags, velocities
 
-
-def muon_step_diag(diags, velocities, grads, lr):
-    for i in range(len(diags)):
-        ortho_grad = newton_schulz_diagonal(grads[i])
-        velocities[i] = MOMENTUM * velocities[i] + ortho_grad
-        diags[i] = diags[i] - lr * velocities[i]
-    return diags, velocities
-
-
-# =============================================================================
-# LEARNING RATE FINDER
-# =============================================================================
-
-def find_stable_lr(optimizer_fn, candidates):
-    for lr in candidates:
-        np.random.seed(42)
-        diags = init_diag(NUM_LAYERS)
-        velocities = [np.zeros(DIM) for _ in range(NUM_LAYERS)]
-        initial_loss = compute_loss_diag(diags, X_data, d_target)
-        stable = True
-        for step in range(100):
-            grads = compute_gradients_diag(diags, X_data, d_target)
-            diags, velocities = optimizer_fn(diags, velocities, grads, lr)
-            loss = compute_loss_diag(diags, X_data, d_target)
-            if np.isnan(loss) or loss > initial_loss * 50:
-                stable = False
-                break
-        if stable:
-            return lr
-    return candidates[-1]
-
-
-# =============================================================================
-# CONVERGENCE BASIN ANALYSIS (same as MUON_PARADOX Face 2)
-# =============================================================================
-
-def measure_convergence_basin(lr_sgd, lr_muon, num_runs, num_steps):
-    """
-    Run many independent initializations with each optimizer.
-    Measure weight diversity, function diversity, loss diversity.
-    """
-    results = {}
-
-    for opt_name, opt_fn, lr in [('SGD', sgd_step_diag, lr_sgd),
-                                   ('Muon', muon_step_diag, lr_muon)]:
-        final_diags_list = []
-        final_functions = []
-        final_losses = []
-
-        for run_idx in range(num_runs):
-            diags = init_diag(NUM_LAYERS, seed=1000 + run_idx)
-            velocities = [np.zeros(DIM) for _ in range(NUM_LAYERS)]
-
-            for step in range(num_steps):
-                grads = compute_gradients_diag(diags, X_data, d_target)
-                diags, velocities = opt_fn(diags, velocities, grads, lr)
-                loss = compute_loss_diag(diags, X_data, d_target)
-                if np.isnan(loss) or loss > 1e10:
-                    break
-
-            final_diags_list.append([d.copy() for d in diags])
-            final_functions.append(forward_diag(diags, X_test).copy())
-            final_losses.append(compute_loss_diag(diags, X_data, d_target))
-
-        # Compute pairwise diversity
-        n = len(final_diags_list)
-        weight_dists = []
-        func_dists = []
-        for i in range(n):
-            for j in range(i + 1, n):
-                d_w = 0.0
-                for k in range(NUM_LAYERS):
-                    d_w += np.linalg.norm(final_diags_list[i][k] - final_diags_list[j][k]) ** 2
-                weight_dists.append(np.sqrt(d_w))
-                d_f = np.linalg.norm(final_functions[i] - final_functions[j], 'fro')
-                d_f /= np.linalg.norm(X_test, 'fro')
-                func_dists.append(d_f)
-
-        results[opt_name] = {
-            'weight_diversity_mean': np.mean(weight_dists),
-            'weight_diversity_std': np.std(weight_dists),
-            'func_diversity_mean': np.mean(func_dists),
-            'func_diversity_std': np.std(func_dists),
-            'loss_mean': np.mean(final_losses),
-            'loss_std': np.std(final_losses),
-            'losses': np.array(final_losses),
-        }
-
-    return results
-
-
-# =============================================================================
-# FULL-MATRIX REFERENCE (for comparison)
-# =============================================================================
-
-def init_weights_full(num_layers, seed=42):
+def init_weights_full(num_layers: int, dim: int, seed: int = 42) -> List[np.ndarray]:
+    """Initialize full matrices near identity for stability."""
     rng = np.random.RandomState(seed)
     weights = []
     for _ in range(num_layers):
-        W = np.eye(DIM) + rng.randn(DIM, DIM) * 0.1
-        weights.append(W.copy())
+        weights.append(np.eye(dim) + rng.randn(dim, dim) * 0.1)
     return weights
 
 
-def forward_full(weights, X):
+def forward_full(weights: List[np.ndarray], X: np.ndarray) -> np.ndarray:
+    """Forward pass for the full-matrix network."""
     out = X.copy()
     for W in weights:
         out = W @ out
     return out
 
 
-def compute_loss_full(weights, X, W_target):
+def effective_operator_full(weights: List[np.ndarray]) -> np.ndarray:
+    """Return the exact end-to-end linear operator W_L ... W_1."""
+    out = np.eye(weights[0].shape[0])
+    for W in weights:
+        out = W @ out
+    return out
+
+
+def compute_loss_full(weights: List[np.ndarray], X: np.ndarray, W_target: np.ndarray) -> float:
+    """Quadratic loss for the full-matrix network."""
     pred = forward_full(weights, X)
     target_out = W_target @ X
     diff = pred - target_out
     return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
 
 
-def compute_gradients_full(weights, X, W_target):
+def compute_gradients_full(weights: List[np.ndarray], X: np.ndarray, W_target: np.ndarray) -> List[np.ndarray]:
+    """Backpropagation for the full-matrix network."""
     num_layers = len(weights)
-    N = X.shape[1]
+    batch_size = X.shape[1]
+
     activations = [X.copy()]
     out = X.copy()
     for W in weights:
         out = W @ out
         activations.append(out.copy())
+
     target_out = W_target @ X
-    delta = (activations[-1] - target_out) / N
+    delta = (activations[-1] - target_out) / batch_size
+
     grads = []
     for i in range(num_layers - 1, -1, -1):
-        G = delta @ activations[i].T
-        grads.insert(0, G)
+        grad = delta @ activations[i].T
+        grads.insert(0, grad)
         if i > 0:
             delta = weights[i].T @ delta
     return grads
 
 
-def newton_schulz_full(G, num_iters=NS_ITERS):
-    norm = np.linalg.norm(G, ord='fro')
+def newton_schulz_full(G: np.ndarray, num_iters: int) -> np.ndarray:
+    """Finite-iteration Newton-Schulz transform for a full matrix gradient."""
+    norm = np.linalg.norm(G, ord="fro")
     if norm < 1e-12:
-        return G
+        return G.copy()
     X = G / norm
     for _ in range(num_iters):
         A = X.T @ X
@@ -302,248 +229,728 @@ def newton_schulz_full(G, num_iters=NS_ITERS):
     return X
 
 
-def measure_convergence_basin_full(lr_sgd, lr_muon, num_runs, num_steps):
-    W_target_full = np.diag(d_target)  # Use same target, but as full matrix
+# =============================================================================
+# OPTIMIZER STEPS
+# =============================================================================
 
-    results = {}
-    for opt_name, lr in [('SGD', lr_sgd), ('Muon', lr_muon)]:
-        final_weights_list = []
-        final_functions = []
-        final_losses = []
 
-        for run_idx in range(num_runs):
-            weights = init_weights_full(NUM_LAYERS, seed=1000 + run_idx)
-            velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
+def sgd_step_diag(
+    diags: List[np.ndarray],
+    velocities: List[np.ndarray],
+    grads: List[np.ndarray],
+    lr: float,
+    momentum: float,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    for i in range(len(diags)):
+        velocities[i] = momentum * velocities[i] + grads[i]
+        diags[i] = diags[i] - lr * velocities[i]
+    return diags, velocities
 
-            for step in range(num_steps):
-                grads = compute_gradients_full(weights, X_data, W_target_full)
-                if opt_name == 'SGD':
-                    for i in range(NUM_LAYERS):
-                        velocities[i] = MOMENTUM * velocities[i] + grads[i]
-                        weights[i] = weights[i] - lr * velocities[i]
-                else:
-                    for i in range(NUM_LAYERS):
-                        ortho_grad = newton_schulz_full(grads[i])
-                        velocities[i] = MOMENTUM * velocities[i] + ortho_grad
-                        weights[i] = weights[i] - lr * velocities[i]
-                loss = compute_loss_full(weights, X_data, W_target_full)
-                if np.isnan(loss) or loss > 1e10:
-                    break
 
-            final_weights_list.append([w.copy() for w in weights])
-            final_functions.append(forward_full(weights, X_test).copy())
-            final_losses.append(compute_loss_full(weights, X_data, W_target_full))
+def muon_step_diag(
+    diags: List[np.ndarray],
+    velocities: List[np.ndarray],
+    grads: List[np.ndarray],
+    lr: float,
+    momentum: float,
+    ns_iters: int,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    for i in range(len(diags)):
+        ortho_grad = newton_schulz_diagonal(grads[i], ns_iters)
+        velocities[i] = momentum * velocities[i] + ortho_grad
+        diags[i] = diags[i] - lr * velocities[i]
+    return diags, velocities
 
-        n = len(final_weights_list)
-        weight_dists = []
-        func_dists = []
-        for i in range(n):
-            for j in range(i + 1, n):
-                d_w = 0.0
-                for k in range(NUM_LAYERS):
-                    d_w += np.linalg.norm(final_weights_list[i][k] - final_weights_list[j][k], 'fro') ** 2
-                weight_dists.append(np.sqrt(d_w))
-                d_f = np.linalg.norm(final_functions[i] - final_functions[j], 'fro')
-                d_f /= np.linalg.norm(X_test, 'fro')
-                func_dists.append(d_f)
 
-        results[opt_name] = {
-            'weight_diversity_mean': np.mean(weight_dists),
-            'weight_diversity_std': np.std(weight_dists),
-            'func_diversity_mean': np.mean(func_dists),
-            'func_diversity_std': np.std(func_dists),
-            'loss_mean': np.mean(final_losses),
-            'loss_std': np.std(final_losses),
-        }
+def sgd_step_full(
+    weights: List[np.ndarray],
+    velocities: List[np.ndarray],
+    grads: List[np.ndarray],
+    lr: float,
+    momentum: float,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    for i in range(len(weights)):
+        velocities[i] = momentum * velocities[i] + grads[i]
+        weights[i] = weights[i] - lr * velocities[i]
+    return weights, velocities
+
+
+def muon_step_full(
+    weights: List[np.ndarray],
+    velocities: List[np.ndarray],
+    grads: List[np.ndarray],
+    lr: float,
+    momentum: float,
+    ns_iters: int,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    for i in range(len(weights)):
+        ortho_grad = newton_schulz_full(grads[i], ns_iters)
+        velocities[i] = momentum * velocities[i] + ortho_grad
+        weights[i] = weights[i] - lr * velocities[i]
+    return weights, velocities
+
+
+# =============================================================================
+# LEARNING-RATE SEARCH
+# =============================================================================
+
+
+def find_stable_lr_diag(optimizer_name: str, candidates: Iterable[float], config: Dict, problem: Dict) -> Dict:
+    """Find the first stable diagonal learning rate and record trial diagnostics."""
+    dim = config["dim"]
+    num_layers = config["num_layers"]
+    momentum = config["momentum"]
+    ns_iters = config["ns_iters"]
+    warmup_steps = config["warmup_steps"]
+    divergence_multiplier = config["divergence_multiplier"]
+    target_diag = problem["d_target"]
+    X_data = problem["X_data"]
+
+    trials = []
+    selected_lr = None
+
+    for lr in candidates:
+        diags = init_diag(num_layers, dim, seed=config["global_seed"])
+        velocities = [np.zeros(dim) for _ in range(num_layers)]
+        initial_loss = compute_loss_diag(diags, X_data, target_diag)
+        stable = True
+        steps_completed = 0
+        loss = initial_loss
+
+        for step in range(1, warmup_steps + 1):
+            grads = compute_gradients_diag(diags, X_data, target_diag)
+            if optimizer_name == "SGD":
+                diags, velocities = sgd_step_diag(diags, velocities, grads, lr, momentum)
+            else:
+                diags, velocities = muon_step_diag(diags, velocities, grads, lr, momentum, ns_iters)
+            loss = compute_loss_diag(diags, X_data, target_diag)
+            steps_completed = step
+            if np.isnan(loss) or loss > initial_loss * divergence_multiplier:
+                stable = False
+                break
+
+        trials.append(
+            {
+                "lr": float(lr),
+                "stable": bool(stable),
+                "initial_loss": float(initial_loss),
+                "final_loss": float(loss),
+                "steps_completed": int(steps_completed),
+            }
+        )
+
+        if stable:
+            selected_lr = float(lr)
+            break
+
+    if selected_lr is None:
+        selected_lr = float(list(candidates)[-1])
+
+    return {
+        "optimizer": optimizer_name,
+        "candidates": list(candidates),
+        "trials": trials,
+        "selected_lr": selected_lr,
+    }
+
+
+def find_stable_lr_full(optimizer_name: str, candidates: Iterable[float], config: Dict, problem: Dict) -> Dict:
+    """Find the first stable full-matrix learning rate and record trial diagnostics."""
+    dim = config["dim"]
+    num_layers = config["num_layers"]
+    momentum = config["momentum"]
+    ns_iters = config["ns_iters"]
+    warmup_steps = config["warmup_steps"]
+    divergence_multiplier = config["divergence_multiplier"]
+    W_target_full = problem["W_target_full"]
+    X_data = problem["X_data"]
+
+    trials = []
+    selected_lr = None
+
+    for lr in candidates:
+        weights = init_weights_full(num_layers, dim, seed=config["global_seed"])
+        velocities = [np.zeros((dim, dim)) for _ in range(num_layers)]
+        initial_loss = compute_loss_full(weights, X_data, W_target_full)
+        stable = True
+        steps_completed = 0
+        loss = initial_loss
+
+        for step in range(1, warmup_steps + 1):
+            grads = compute_gradients_full(weights, X_data, W_target_full)
+            if optimizer_name == "SGD":
+                weights, velocities = sgd_step_full(weights, velocities, grads, lr, momentum)
+            else:
+                weights, velocities = muon_step_full(weights, velocities, grads, lr, momentum, ns_iters)
+            loss = compute_loss_full(weights, X_data, W_target_full)
+            steps_completed = step
+            if np.isnan(loss) or loss > initial_loss * divergence_multiplier:
+                stable = False
+                break
+
+        trials.append(
+            {
+                "lr": float(lr),
+                "stable": bool(stable),
+                "initial_loss": float(initial_loss),
+                "final_loss": float(loss),
+                "steps_completed": int(steps_completed),
+            }
+        )
+
+        if stable:
+            selected_lr = float(lr)
+            break
+
+    if selected_lr is None:
+        selected_lr = float(list(candidates)[-1])
+
+    return {
+        "optimizer": optimizer_name,
+        "candidates": list(candidates),
+        "trials": trials,
+        "selected_lr": selected_lr,
+    }
+
+
+# =============================================================================
+# TRAINING LOOPS + RAW RESULT COLLECTION
+# =============================================================================
+
+
+def compute_pairwise_distances(objects: List[np.ndarray], distance_fn) -> Tuple[np.ndarray, np.ndarray]:
+    """Return pair indices and pairwise distances for a list of objects."""
+    pair_indices = []
+    distances = []
+    for i in range(len(objects)):
+        for j in range(i + 1, len(objects)):
+            pair_indices.append((i, j))
+            distances.append(distance_fn(objects[i], objects[j]))
+    return np.asarray(pair_indices, dtype=int), np.asarray(distances, dtype=float)
+
+
+def summarize_metric(values: np.ndarray) -> Tuple[float, float]:
+    """Mean/std summary for a 1D metric array."""
+    return float(np.mean(values)), float(np.std(values))
+
+
+def run_optimizer_diag(optimizer_name: str, lr: float, config: Dict, problem: Dict) -> Dict:
+    """Run many independent diagonal-network trainings for one optimizer."""
+    dim = config["dim"]
+    num_layers = config["num_layers"]
+    num_runs = config["num_independent_runs"]
+    num_steps = config["num_steps"]
+    momentum = config["momentum"]
+    ns_iters = config["ns_iters"]
+    init_seed_base = config["init_seed_base"]
+    divergence_loss_cap = config["divergence_loss_cap"]
+
+    d_target = problem["d_target"]
+    X_data = problem["X_data"]
+    X_test = problem["X_test"]
+    X_test_norm = np.linalg.norm(X_test, ord="fro")
+
+    final_parameters = []
+    sampled_outputs = []
+    effective_operators = []
+    final_losses = []
+    run_seeds = []
+    steps_completed = []
+    diverged = []
+    loss_histories = np.full((num_runs, num_steps + 1), np.nan, dtype=float)
+
+    for run_idx in range(num_runs):
+        seed = init_seed_base + run_idx
+        run_seeds.append(seed)
+
+        diags = init_diag(num_layers, dim, seed=seed)
+        velocities = [np.zeros(dim) for _ in range(num_layers)]
+
+        initial_loss = compute_loss_diag(diags, X_data, d_target)
+        loss_histories[run_idx, 0] = initial_loss
+        run_diverged = False
+        last_completed_step = 0
+
+        for step in range(1, num_steps + 1):
+            grads = compute_gradients_diag(diags, X_data, d_target)
+            if optimizer_name == "SGD":
+                diags, velocities = sgd_step_diag(diags, velocities, grads, lr, momentum)
+            else:
+                diags, velocities = muon_step_diag(diags, velocities, grads, lr, momentum, ns_iters)
+
+            loss = compute_loss_diag(diags, X_data, d_target)
+            loss_histories[run_idx, step] = loss
+            last_completed_step = step
+
+            if np.isnan(loss) or loss > divergence_loss_cap:
+                run_diverged = True
+                break
+
+        final_loss = compute_loss_diag(diags, X_data, d_target)
+        final_parameters.append(np.stack([d.copy() for d in diags], axis=0))
+        sampled_outputs.append(forward_diag(diags, X_test).copy())
+        effective_operators.append(effective_operator_diag(diags).copy())
+        final_losses.append(final_loss)
+        steps_completed.append(last_completed_step)
+        diverged.append(run_diverged)
+
+    pair_indices, weight_dists = compute_pairwise_distances(
+        final_parameters,
+        lambda a, b: np.linalg.norm(a - b),
+    )
+    _, sampled_output_dists = compute_pairwise_distances(
+        sampled_outputs,
+        lambda a, b: np.linalg.norm(a - b, ord="fro") / X_test_norm,
+    )
+    _, operator_dists = compute_pairwise_distances(
+        effective_operators,
+        lambda a, b: np.linalg.norm(a - b),
+    )
+
+    weight_mean, weight_std = summarize_metric(weight_dists)
+    output_mean, output_std = summarize_metric(sampled_output_dists)
+    operator_mean, operator_std = summarize_metric(operator_dists)
+    loss_mean, loss_std = summarize_metric(np.asarray(final_losses, dtype=float))
+
+    return {
+        "optimizer": optimizer_name,
+        "lr": float(lr),
+        "run_seeds": np.asarray(run_seeds, dtype=int),
+        "final_parameters": np.asarray(final_parameters, dtype=float),
+        "sampled_outputs": np.asarray(sampled_outputs, dtype=float),
+        "effective_operators": np.asarray(effective_operators, dtype=float),
+        "final_losses": np.asarray(final_losses, dtype=float),
+        "losses": np.asarray(final_losses, dtype=float),
+        "loss_histories": loss_histories,
+        "steps_completed": np.asarray(steps_completed, dtype=int),
+        "diverged": np.asarray(diverged, dtype=bool),
+        "pair_indices": pair_indices,
+        "pairwise_weight_distances": weight_dists,
+        "pairwise_sampled_output_distances": sampled_output_dists,
+        "pairwise_function_distances": sampled_output_dists,
+        "pairwise_operator_distances": operator_dists,
+        "weight_diversity_mean": weight_mean,
+        "weight_diversity_std": weight_std,
+        "sampled_output_diversity_mean": output_mean,
+        "sampled_output_diversity_std": output_std,
+        "func_diversity_mean": output_mean,
+        "func_diversity_std": output_std,
+        "operator_diversity_mean": operator_mean,
+        "operator_diversity_std": operator_std,
+        "loss_mean": loss_mean,
+        "loss_std": loss_std,
+    }
+
+
+def run_optimizer_full(optimizer_name: str, lr: float, config: Dict, problem: Dict) -> Dict:
+    """Run many independent full-matrix trainings for one optimizer."""
+    dim = config["dim"]
+    num_layers = config["num_layers"]
+    num_runs = config["num_independent_runs"]
+    num_steps = config["num_steps"]
+    momentum = config["momentum"]
+    ns_iters = config["ns_iters"]
+    init_seed_base = config["init_seed_base"]
+    divergence_loss_cap = config["divergence_loss_cap"]
+
+    W_target_full = problem["W_target_full"]
+    X_data = problem["X_data"]
+    X_test = problem["X_test"]
+    X_test_norm = np.linalg.norm(X_test, ord="fro")
+
+    final_parameters = []
+    sampled_outputs = []
+    effective_operators = []
+    final_losses = []
+    run_seeds = []
+    steps_completed = []
+    diverged = []
+    loss_histories = np.full((num_runs, num_steps + 1), np.nan, dtype=float)
+
+    for run_idx in range(num_runs):
+        seed = init_seed_base + run_idx
+        run_seeds.append(seed)
+
+        weights = init_weights_full(num_layers, dim, seed=seed)
+        velocities = [np.zeros((dim, dim)) for _ in range(num_layers)]
+
+        initial_loss = compute_loss_full(weights, X_data, W_target_full)
+        loss_histories[run_idx, 0] = initial_loss
+        run_diverged = False
+        last_completed_step = 0
+
+        for step in range(1, num_steps + 1):
+            grads = compute_gradients_full(weights, X_data, W_target_full)
+            if optimizer_name == "SGD":
+                weights, velocities = sgd_step_full(weights, velocities, grads, lr, momentum)
+            else:
+                weights, velocities = muon_step_full(weights, velocities, grads, lr, momentum, ns_iters)
+
+            loss = compute_loss_full(weights, X_data, W_target_full)
+            loss_histories[run_idx, step] = loss
+            last_completed_step = step
+
+            if np.isnan(loss) or loss > divergence_loss_cap:
+                run_diverged = True
+                break
+
+        final_loss = compute_loss_full(weights, X_data, W_target_full)
+        final_parameters.append(np.stack([w.copy() for w in weights], axis=0))
+        sampled_outputs.append(forward_full(weights, X_test).copy())
+        effective_operators.append(effective_operator_full(weights).copy())
+        final_losses.append(final_loss)
+        steps_completed.append(last_completed_step)
+        diverged.append(run_diverged)
+
+    pair_indices, weight_dists = compute_pairwise_distances(
+        final_parameters,
+        lambda a, b: np.linalg.norm(a - b),
+    )
+    _, sampled_output_dists = compute_pairwise_distances(
+        sampled_outputs,
+        lambda a, b: np.linalg.norm(a - b, ord="fro") / X_test_norm,
+    )
+    _, operator_dists = compute_pairwise_distances(
+        effective_operators,
+        lambda a, b: np.linalg.norm(a - b, ord="fro"),
+    )
+
+    weight_mean, weight_std = summarize_metric(weight_dists)
+    output_mean, output_std = summarize_metric(sampled_output_dists)
+    operator_mean, operator_std = summarize_metric(operator_dists)
+    loss_mean, loss_std = summarize_metric(np.asarray(final_losses, dtype=float))
+
+    return {
+        "optimizer": optimizer_name,
+        "lr": float(lr),
+        "run_seeds": np.asarray(run_seeds, dtype=int),
+        "final_parameters": np.asarray(final_parameters, dtype=float),
+        "sampled_outputs": np.asarray(sampled_outputs, dtype=float),
+        "effective_operators": np.asarray(effective_operators, dtype=float),
+        "final_losses": np.asarray(final_losses, dtype=float),
+        "losses": np.asarray(final_losses, dtype=float),
+        "loss_histories": loss_histories,
+        "steps_completed": np.asarray(steps_completed, dtype=int),
+        "diverged": np.asarray(diverged, dtype=bool),
+        "pair_indices": pair_indices,
+        "pairwise_weight_distances": weight_dists,
+        "pairwise_sampled_output_distances": sampled_output_dists,
+        "pairwise_function_distances": sampled_output_dists,
+        "pairwise_operator_distances": operator_dists,
+        "weight_diversity_mean": weight_mean,
+        "weight_diversity_std": weight_std,
+        "sampled_output_diversity_mean": output_mean,
+        "sampled_output_diversity_std": output_std,
+        "func_diversity_mean": output_mean,
+        "func_diversity_std": output_std,
+        "operator_diversity_mean": operator_mean,
+        "operator_diversity_std": operator_std,
+        "loss_mean": loss_mean,
+        "loss_std": loss_std,
+    }
+
+
+# =============================================================================
+# SUMMARY + HEURISTICS
+# =============================================================================
+
+
+def safe_ratio(numerator: float, denominator: float) -> float:
+    """Numerically safe ratio."""
+    return float(numerator / (denominator + 1e-30))
+
+
+def summarize_architecture(optimizer_results: Dict[str, Dict]) -> Dict:
+    """Compute ratio summaries for one architecture."""
+    sgd = optimizer_results["SGD"]
+    muon = optimizer_results["Muon"]
+
+    sampled_ratio_sgd = safe_ratio(sgd["sampled_output_diversity_mean"], sgd["weight_diversity_mean"])
+    sampled_ratio_muon = safe_ratio(muon["sampled_output_diversity_mean"], muon["weight_diversity_mean"])
+    operator_ratio_sgd = safe_ratio(sgd["operator_diversity_mean"], sgd["weight_diversity_mean"])
+    operator_ratio_muon = safe_ratio(muon["operator_diversity_mean"], muon["weight_diversity_mean"])
+
+    return {
+        "sampled_output_ratio_sgd": sampled_ratio_sgd,
+        "sampled_output_ratio_muon": sampled_ratio_muon,
+        "sampled_output_paradox_strength": safe_ratio(sampled_ratio_sgd, sampled_ratio_muon),
+        "operator_ratio_sgd": operator_ratio_sgd,
+        "operator_ratio_muon": operator_ratio_muon,
+        "operator_paradox_strength": safe_ratio(operator_ratio_sgd, operator_ratio_muon),
+    }
+
+
+def evaluate_heuristics(diagonal_results: Dict[str, Dict], full_results: Dict[str, Dict]) -> Dict:
+    """Retain the original heuristic benchmark checks with narrower wording."""
+    diagonal_summary = summarize_architecture(diagonal_results)
+    full_summary = summarize_architecture(full_results)
+
+    full_ratio_sgd = full_summary["sampled_output_ratio_sgd"]
+    full_ratio_muon = full_summary["sampled_output_ratio_muon"]
+    diag_ratio_sgd = diagonal_summary["sampled_output_ratio_sgd"]
+    diag_ratio_muon = diagonal_summary["sampled_output_ratio_muon"]
+    full_paradox = full_summary["sampled_output_paradox_strength"]
+    diag_paradox = diagonal_summary["sampled_output_paradox_strength"]
+
+    diag_muon_higher_wd = (
+        diagonal_results["Muon"]["weight_diversity_mean"] > diagonal_results["SGD"]["weight_diversity_mean"]
+    )
+    diag_muon_lower_output = (
+        diagonal_results["Muon"]["sampled_output_diversity_mean"]
+        < diagonal_results["SGD"]["sampled_output_diversity_mean"]
+    )
+    diag_full_paradox_pattern = diag_muon_higher_wd and diag_muon_lower_output
+
+    tests = {
+        "T1_full_matrix_shows_sampled_output_paradox": {
+            "description": "Full-matrix reference shows the paradox pattern (Muon sampled-output ratio < SGD).",
+            "passed": bool(full_ratio_muon < full_ratio_sgd),
+            "observed": {
+                "Muon_ratio": full_ratio_muon,
+                "SGD_ratio": full_ratio_sgd,
+            },
+        },
+        "T2_diagonal_strength_near_one": {
+            "description": "Diagonal-factorized control does not strongly differ between optimizers (strength near 1.0).",
+            "passed": bool(abs(diag_paradox - 1.0) < 1.0),
+            "observed": {
+                "diagonal_paradox_strength": diag_paradox,
+            },
+        },
+        "T3_full_stronger_than_diagonal": {
+            "description": "Full-matrix reference has stronger paradox signature than the diagonal-factorized control.",
+            "passed": bool(full_paradox > diag_paradox),
+            "observed": {
+                "full_paradox_strength": full_paradox,
+                "diagonal_paradox_strength": diag_paradox,
+            },
+        },
+        "T4_diagonal_avoids_full_paradox_pattern": {
+            "description": "Diagonal-factorized control does not exhibit Muon higher weight diversity together with lower sampled-output diversity.",
+            "passed": bool(not diag_full_paradox_pattern),
+            "observed": {
+                "muon_higher_weight_diversity": bool(diag_muon_higher_wd),
+                "muon_lower_sampled_output_diversity": bool(diag_muon_lower_output),
+                "full_paradox_pattern_in_diagonal": bool(diag_full_paradox_pattern),
+            },
+        },
+    }
+
+    total_pass = int(sum(test["passed"] for test in tests.values()))
+
+    if total_pass >= 3:
+        verdict_label = "HEURISTIC SUPPORT"
+        verdict_message = (
+            "Within this benchmark, the full-matrix reference shows a stronger paradox signature than the "
+            "diagonal-factorized control. This is suggestive, not conclusive, about gauge-related mechanisms."
+        )
+    elif total_pass >= 2:
+        verdict_label = "MIXED / INCONCLUSIVE"
+        verdict_message = (
+            "The benchmark gives mixed heuristic evidence. The diagonal-factorized control does not cleanly "
+            "eliminate the paradox signal, so interpretation should remain cautious."
+        )
+    else:
+        verdict_label = "HEURISTIC REJECTION"
+        verdict_message = (
+            "In this benchmark, paradox-like behavior persists in the diagonal-factorized control, so this "
+            "probe does not support the claim that the observed paradox requires orthogonal gauge freedom."
+        )
+
+    return {
+        "tests": tests,
+        "total_pass": total_pass,
+        "diagonal_sampled_output_paradox_strength": diag_paradox,
+        "full_sampled_output_paradox_strength": full_paradox,
+        "diagonal_sampled_output_ratio_sgd": diag_ratio_sgd,
+        "diagonal_sampled_output_ratio_muon": diag_ratio_muon,
+        "full_sampled_output_ratio_sgd": full_ratio_sgd,
+        "full_sampled_output_ratio_muon": full_ratio_muon,
+        "verdict_label": verdict_label,
+        "verdict_message": verdict_message,
+    }
+
+
+def build_summary_rows(results: Dict) -> List[Dict[str, float]]:
+    """Create a flat table of the main summary rows for printing or notebook use."""
+    rows = []
+    for architecture_key, architecture_label in [
+        ("diagonal", "Diagonal factorized"),
+        ("full_matrix", "Full matrix"),
+    ]:
+        ratios = results[architecture_key]["summary"]
+        for optimizer_name in ["SGD", "Muon"]:
+            r = results[architecture_key]["optimizers"][optimizer_name]
+            rows.append(
+                {
+                    "architecture": architecture_label,
+                    "optimizer": optimizer_name,
+                    "lr": r["lr"],
+                    "loss_mean": r["loss_mean"],
+                    "loss_std": r["loss_std"],
+                    "weight_diversity_mean": r["weight_diversity_mean"],
+                    "sampled_output_diversity_mean": r["sampled_output_diversity_mean"],
+                    "operator_diversity_mean": r["operator_diversity_mean"],
+                    "sampled_output_over_weight": (
+                        ratios["sampled_output_ratio_sgd"] if optimizer_name == "SGD" else ratios["sampled_output_ratio_muon"]
+                    ),
+                    "operator_over_weight": (
+                        ratios["operator_ratio_sgd"] if optimizer_name == "SGD" else ratios["operator_ratio_muon"]
+                    ),
+                    "num_diverged_runs": int(np.sum(r["diverged"])),
+                }
+            )
+    return rows
+
+
+def print_summary(results: Dict) -> None:
+    """Print a compact but honest CLI summary."""
+    config = results["config"]
+    heuristics = results["heuristics"]
+
+    print("=" * 100)
+    print("Experiment 3.18: Paradox on Diagonal Factorized Nets")
+    print("=" * 100)
+    print(
+        "Scope: diagonal-factorized control vs full-matrix reference for the original paradox benchmark."
+    )
+    print(
+        "Caveat: diagonal factorization removes inter-layer orthogonal gauge freedom but retains"
+    )
+    print(
+        "        factorization/reparameterization symmetries; this is a control probe, not a proof of gauge removal."
+    )
+    print(
+        "Muon variant: finite-iteration Newton-Schulz gradient transform (sign-like on diagonals, not exact sign)."
+    )
+    print()
+    print(
+        f"Config: dim={config['dim']}, layers={config['num_layers']}, runs={config['num_independent_runs']}, "
+        f"steps={config['num_steps']}, batch={config['batch_size']}, ns_iters={config['ns_iters']}"
+    )
+    print(
+        f"Seeds: global={config['global_seed']}, per-run={config['init_seed_base']}.."
+        f"{config['init_seed_base'] + config['num_independent_runs'] - 1}"
+    )
+    print()
+    print("Learning-rate selection:")
+    print(
+        f"  Diagonal factorized: SGD={results['learning_rates']['diagonal']['SGD']['selected_lr']}, "
+        f"Muon={results['learning_rates']['diagonal']['Muon']['selected_lr']}"
+    )
+    print(
+        f"  Full matrix:         SGD={results['learning_rates']['full_matrix']['SGD']['selected_lr']}, "
+        f"Muon={results['learning_rates']['full_matrix']['Muon']['selected_lr']}"
+    )
+    print()
+    print("Main summary metrics:")
+    print(
+        f"{'Architecture':<22} {'Opt':<8} {'Loss mean':>12} {'Loss std':>12} {'Weight div':>12} "
+        f"{'Sampled out div':>16} {'Operator div':>14} {'Out/W':>10} {'Op/W':>10}"
+    )
+    print("-" * 128)
+    for row in build_summary_rows(results):
+        print(
+            f"{row['architecture']:<22} {row['optimizer']:<8} {row['loss_mean']:>12.6e} "
+            f"{row['loss_std']:>12.6e} {row['weight_diversity_mean']:>12.6f} "
+            f"{row['sampled_output_diversity_mean']:>16.6f} {row['operator_diversity_mean']:>14.6f} "
+            f"{row['sampled_output_over_weight']:>10.6f} {row['operator_over_weight']:>10.6f}"
+        )
+
+    print()
+    print("Sampled-output paradox strengths (SGD ratio / Muon ratio):")
+    print(
+        f"  Diagonal factorized: {results['diagonal']['summary']['sampled_output_paradox_strength']:.4f}"
+    )
+    print(f"  Full matrix:         {results['full_matrix']['summary']['sampled_output_paradox_strength']:.4f}")
+    print("Operator paradox strengths (SGD ratio / Muon ratio):")
+    print(
+        f"  Diagonal factorized: {results['diagonal']['summary']['operator_paradox_strength']:.4f}"
+    )
+    print(f"  Full matrix:         {results['full_matrix']['summary']['operator_paradox_strength']:.4f}")
+
+    print()
+    print("Heuristic benchmark checks (not formal statistical tests):")
+    for key, test in heuristics["tests"].items():
+        print(f"  {key}: {'PASS' if test['passed'] else 'FAIL'}")
+        print(f"    {test['description']}")
+        observed_parts = [f"{name}={value}" for name, value in test["observed"].items()]
+        print(f"    observed: {', '.join(observed_parts)}")
+
+    print()
+    print(f"Heuristic tally: {heuristics['total_pass']}/4")
+    print(f"Verdict: {heuristics['verdict_label']}")
+    print(f"{heuristics['verdict_message']}")
+    print(f"Runtime: {results['runtime_seconds']:.2f}s")
+    print("=" * 100)
+
+
+# =============================================================================
+# TOP-LEVEL RUNNER
+# =============================================================================
+
+
+def run_experiment(config: Dict | None = None, emit_summary: bool = False) -> Dict:
+    """Run the full benchmark and return structured raw results."""
+    config = build_config(config)
+    problem = generate_problem(config)
+
+    start_time = time.time()
+
+    diagonal_lr_search = {
+        "SGD": find_stable_lr_diag("SGD", config["diag_lr_candidates"], config, problem),
+        "Muon": find_stable_lr_diag("Muon", config["diag_lr_candidates"], config, problem),
+    }
+    diagonal_results = {
+        "SGD": run_optimizer_diag("SGD", diagonal_lr_search["SGD"]["selected_lr"], config, problem),
+        "Muon": run_optimizer_diag("Muon", diagonal_lr_search["Muon"]["selected_lr"], config, problem),
+    }
+
+    full_lr_search = {
+        "SGD": find_stable_lr_full("SGD", config["full_lr_candidates"], config, problem),
+        "Muon": find_stable_lr_full("Muon", config["full_lr_candidates"], config, problem),
+    }
+    full_results = {
+        "SGD": run_optimizer_full("SGD", full_lr_search["SGD"]["selected_lr"], config, problem),
+        "Muon": run_optimizer_full("Muon", full_lr_search["Muon"]["selected_lr"], config, problem),
+    }
+
+    results = {
+        "config": config,
+        "problem": problem,
+        "learning_rates": {
+            "diagonal": diagonal_lr_search,
+            "full_matrix": full_lr_search,
+        },
+        "selected_lrs": {
+            "diagonal": {opt: diagonal_lr_search[opt]["selected_lr"] for opt in ["SGD", "Muon"]},
+            "full_matrix": {opt: full_lr_search[opt]["selected_lr"] for opt in ["SGD", "Muon"]},
+        },
+        "diagonal": {
+            "name": "Diagonal factorized",
+            "optimizers": diagonal_results,
+            "summary": summarize_architecture(diagonal_results),
+        },
+        "full_matrix": {
+            "name": "Full matrix",
+            "optimizers": full_results,
+            "summary": summarize_architecture(full_results),
+        },
+    }
+    results["summary_rows"] = build_summary_rows(results)
+    results["heuristics"] = evaluate_heuristics(diagonal_results, full_results)
+    results["runtime_seconds"] = float(time.time() - start_time)
+
+    if emit_summary:
+        print_summary(results)
 
     return results
 
 
-# =============================================================================
-# MAIN EXPERIMENT
-# =============================================================================
-
-print("=" * 90)
-print("Experiment 3.18: Paradox on Diagonal Nets (dim(gauge) = 0)")
-print("=" * 90)
-print(f"Setup: {NUM_LAYERS}-layer diagonal net (n={DIM}), {NUM_INDEPENDENT_RUNS} runs, {NUM_STEPS} steps")
-print(f"Prediction: NO paradox (diversity ratios similar for Muon and SGD)")
-print("=" * 90)
-
-# Find stable learning rates
-print("\nFinding stable learning rates...")
-lr_sgd = find_stable_lr(sgd_step_diag, [0.05, 0.03, 0.02, 0.01, 0.005, 0.003, 0.001])
-lr_muon = find_stable_lr(muon_step_diag, [0.05, 0.03, 0.02, 0.01, 0.005, 0.003, 0.001])
-print(f"  Diagonal SGD lr: {lr_sgd}")
-print(f"  Diagonal Muon lr: {lr_muon}")
-
-# Run diagonal net basin analysis
-print("\n--- DIAGONAL NET (dim(gauge) = 0) ---")
-diag_results = measure_convergence_basin(lr_sgd, lr_muon, NUM_INDEPENDENT_RUNS, NUM_STEPS)
-
-for opt_name in ['SGD', 'Muon']:
-    r = diag_results[opt_name]
-    print(f"  {opt_name}: loss={r['loss_mean']:.6e} +/- {r['loss_std']:.6e}, "
-          f"d_weight={r['weight_diversity_mean']:.6f}, d_func={r['func_diversity_mean']:.6f}")
-
-# Run full-matrix reference
-print("\n--- FULL MATRIX NET (dim(gauge) > 0) ---")
-print("Finding full-matrix LRs...")
-
-# Quick LR search for full-matrix
-def find_lr_full(opt_name, candidates):
-    W_target_full = np.diag(d_target)
-    for lr in candidates:
-        np.random.seed(42)
-        weights = init_weights_full(NUM_LAYERS)
-        velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
-        initial_loss = compute_loss_full(weights, X_data, W_target_full)
-        stable = True
-        for step in range(100):
-            grads = compute_gradients_full(weights, X_data, W_target_full)
-            if opt_name == 'SGD':
-                for i in range(NUM_LAYERS):
-                    velocities[i] = MOMENTUM * velocities[i] + grads[i]
-                    weights[i] = weights[i] - lr * velocities[i]
-            else:
-                for i in range(NUM_LAYERS):
-                    ortho_grad = newton_schulz_full(grads[i])
-                    velocities[i] = MOMENTUM * velocities[i] + ortho_grad
-                    weights[i] = weights[i] - lr * velocities[i]
-            loss = compute_loss_full(weights, X_data, W_target_full)
-            if np.isnan(loss) or loss > initial_loss * 50:
-                stable = False
-                break
-        if stable:
-            return lr
-    return candidates[-1]
-
-lr_sgd_full = find_lr_full('SGD', [0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001])
-lr_muon_full = find_lr_full('Muon', [0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001])
-print(f"  Full SGD lr: {lr_sgd_full}")
-print(f"  Full Muon lr: {lr_muon_full}")
-
-full_results = measure_convergence_basin_full(lr_sgd_full, lr_muon_full,
-                                                NUM_INDEPENDENT_RUNS, NUM_STEPS)
-
-for opt_name in ['SGD', 'Muon']:
-    r = full_results[opt_name]
-    print(f"  {opt_name}: loss={r['loss_mean']:.6e} +/- {r['loss_std']:.6e}, "
-          f"d_weight={r['weight_diversity_mean']:.6f}, d_func={r['func_diversity_mean']:.6f}")
+def main() -> Dict:
+    """CLI entrypoint preserving script-style behavior."""
+    return run_experiment(emit_summary=True)
 
 
-# =============================================================================
-# RESULTS TABLE
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("RESULTS: PARADOX RATIO = func_diversity / weight_diversity")
-print(f"{'=' * 90}")
-print(f"  (Lower ratio for Muon vs SGD = paradox present = gauge exploration)")
-print()
-
-print(f"{'Network':<20} {'Optimizer':<10} {'Weight Div':>12} {'Func Div':>12} {'Ratio':>10} {'Loss Std':>14}")
-print("-" * 80)
-
-# Diagonal
-for opt_name in ['SGD', 'Muon']:
-    r = diag_results[opt_name]
-    wd = r['weight_diversity_mean']
-    fd = r['func_diversity_mean']
-    ratio = fd / wd if wd > 1e-15 else float('nan')
-    print(f"{'Diagonal':<20} {opt_name:<10} {wd:>12.6f} {fd:>12.6f} {ratio:>10.6f} {r['loss_std']:>14.6e}")
-
-# Full matrix
-for opt_name in ['SGD', 'Muon']:
-    r = full_results[opt_name]
-    wd = r['weight_diversity_mean']
-    fd = r['func_diversity_mean']
-    ratio = fd / wd if wd > 1e-15 else float('nan')
-    print(f"{'Full Matrix':<20} {opt_name:<10} {wd:>12.6f} {fd:>12.6f} {ratio:>10.6f} {r['loss_std']:>14.6e}")
-
-# Compute the paradox strength = ratio_SGD / ratio_Muon (>1 means paradox present)
-diag_ratio_sgd = diag_results['SGD']['func_diversity_mean'] / (diag_results['SGD']['weight_diversity_mean'] + 1e-30)
-diag_ratio_muon = diag_results['Muon']['func_diversity_mean'] / (diag_results['Muon']['weight_diversity_mean'] + 1e-30)
-full_ratio_sgd = full_results['SGD']['func_diversity_mean'] / (full_results['SGD']['weight_diversity_mean'] + 1e-30)
-full_ratio_muon = full_results['Muon']['func_diversity_mean'] / (full_results['Muon']['weight_diversity_mean'] + 1e-30)
-
-diag_paradox = diag_ratio_sgd / (diag_ratio_muon + 1e-30)
-full_paradox = full_ratio_sgd / (full_ratio_muon + 1e-30)
-
-print()
-print(f"  Diagonal:    SGD ratio = {diag_ratio_sgd:.6f}, Muon ratio = {diag_ratio_muon:.6f}")
-print(f"               Paradox strength (SGD/Muon) = {diag_paradox:.4f}")
-print(f"  Full matrix: SGD ratio = {full_ratio_sgd:.6f}, Muon ratio = {full_ratio_muon:.6f}")
-print(f"               Paradox strength (SGD/Muon) = {full_paradox:.4f}")
-
-
-# =============================================================================
-# HYPOTHESIS TESTS
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("HYPOTHESIS TESTS")
-print(f"{'=' * 90}")
-
-# T1: Full matrix should show paradox (Muon ratio < SGD ratio)
-t1 = full_ratio_muon < full_ratio_sgd
-print(f"\nT1: Full matrix shows paradox (Muon ratio < SGD ratio)?")
-print(f"    Muon={full_ratio_muon:.6f} vs SGD={full_ratio_sgd:.6f}")
-print(f"    --> {'PASS' if t1 else 'FAIL'}")
-
-# T2: Diagonal net should NOT show paradox (ratios similar)
-# "Similar" means the paradox strength is close to 1.0 (within 2x)
-t2 = abs(diag_paradox - 1.0) < 1.0  # paradox strength between 0 and 2
-print(f"\nT2: Diagonal net does NOT show paradox (strength near 1.0)?")
-print(f"    Paradox strength = {diag_paradox:.4f} (expect near 1.0)")
-print(f"    --> {'PASS' if t2 else 'FAIL'}")
-
-# T3: Full matrix paradox should be STRONGER than diagonal
-t3 = full_paradox > diag_paradox
-print(f"\nT3: Full matrix paradox stronger than diagonal?")
-print(f"    Full={full_paradox:.4f} vs Diagonal={diag_paradox:.4f}")
-print(f"    --> {'PASS' if t3 else 'FAIL'}")
-
-# T4: In diagonal net, Muon should NOT have higher weight diversity than SGD
-# (or if it does, it should also have proportionally higher func diversity)
-diag_muon_higher_wd = diag_results['Muon']['weight_diversity_mean'] > diag_results['SGD']['weight_diversity_mean']
-diag_muon_lower_fd = diag_results['Muon']['func_diversity_mean'] < diag_results['SGD']['func_diversity_mean']
-t4_paradox_in_diag = diag_muon_higher_wd and diag_muon_lower_fd
-print(f"\nT4: Diagonal net does NOT have the full paradox pattern?")
-print(f"    (Muon higher weight div AND lower func div = paradox)")
-print(f"    Muon higher weight div: {diag_muon_higher_wd}")
-print(f"    Muon lower func div:    {diag_muon_lower_fd}")
-print(f"    Full paradox pattern:   {t4_paradox_in_diag}")
-print(f"    --> {'PASS (no paradox in diagonal)' if not t4_paradox_in_diag else 'FAIL (paradox found in diagonal!)'}")
-
-total_pass = sum([t1, t2, t3, not t4_paradox_in_diag])
-
-# =============================================================================
-# FINAL VERDICT
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("FINAL VERDICT")
-print(f"{'=' * 90}")
-
-print(f"""
-  HYPOTHESIS: The Muon Paradox requires gauge symmetry (dim(gauge) > 0).
-  It vanishes for diagonal networks where every parameter is physical.
-
-  Tests passed: {total_pass}/4
-
-  Diagonal net paradox strength: {diag_paradox:.4f} (expect ~1.0)
-  Full matrix paradox strength:  {full_paradox:.4f} (expect >1.0)
-""")
-
-if total_pass >= 3:
-    print("  VERDICT: CONFIRMED -- Paradox requires gauge symmetry.")
-    print("  The diagonal net (no gauge group) shows no paradox,")
-    print("  while the full matrix net (O(n) gauge group) does.")
-elif total_pass >= 2:
-    print("  VERDICT: PARTIALLY CONFIRMED -- Some evidence for gauge requirement.")
-else:
-    print("  VERDICT: REJECTED -- Paradox appears even without gauge symmetry.")
-    print("  This would mean the paradox mechanism is NOT purely gauge-theoretic.")
-
-print("=" * 90)
+if __name__ == "__main__":
+    main()

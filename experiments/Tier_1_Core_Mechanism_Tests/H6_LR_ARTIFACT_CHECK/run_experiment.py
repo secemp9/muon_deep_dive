@@ -1,40 +1,31 @@
 #!/usr/bin/env python3
 """
 Experiment H6: LR Artifact Check
-=================================
+================================
 
-CRITICAL QUESTION:
-  Experiment 3.4 showed curvature rescaling gives ~130x improvement over vanilla
-  Muon k=5. But the rescale factor hit the min-clamp (0.1) 96.5% of the time.
-  This means the rescaler is effectively just multiplying by 0.1 = reducing the
-  effective LR by 10x.
+Scope
+-----
+This is a toy final-training-loss benchmark on the same 2-layer deep-linear
+regression problem used in Experiment 3.4. It does not directly measure
+curvature, generalization, or a universal optimizer advantage.
 
-  Is the 130x improvement entirely explained by Muon's default LR (0.02) being
-  10x too high? If lr=0.002 vanilla Muon matches rescaled Muon at lr=0.02, the
-  answer is YES -- the "curvature rescaling" is just LR reduction.
-
-SETUP:
-  Same as 3.4: 2-layer 4x4 deep linear net, 500 steps, 10 seeds.
-
-SWEEP:
-  - Vanilla Muon at LR = {0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1}
-  - Curvature-rescaled Muon k=5 at lr=0.02 (the 3.4 reference)
-  - Curvature-rescaled Muon k=5 at the best vanilla LR
-  - SGD at several LRs for context
-
-KEY TESTS:
-  T1: Is the best vanilla Muon LR near 0.002 (= 0.02 * 0.1)?
-      If yes => rescaler is just LR reduction.
-  T2: Does best-LR vanilla Muon match rescaled Muon within 5%?
-      If yes => the 130x is an artifact of bad default LR.
-  T3: Does rescaled Muon at the best vanilla LR FURTHER improve?
-      If yes => rescaling has genuine value beyond LR tuning.
+The narrower question addressed here is whether the large final-loss gap
+between vanilla Muon at lr=0.02 and curvature-rescaled Muon at lr=0.02 can be
+largely explained by learning-rate choice in this setup.
 """
 
-import numpy as np
-import os
+from pathlib import Path
+from time import perf_counter
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+import numpy as np
+
+
+EXPERIMENT_RELATIVE_PATH = (
+    'experiments/Tier_1_Core_Mechanism_Tests/H6_LR_ARTIFACT_CHECK/run_experiment.py'
+)
+SCRIPT_PATH = Path(__file__).resolve()
+SCRIPT_DIR = SCRIPT_PATH.parent
+NOTEBOOK_PATH = SCRIPT_DIR / 'run_experiment.ipynb'
 
 # =============================================================================
 # CONFIGURATION
@@ -43,6 +34,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DIM = 4
 NUM_LAYERS = 2
 NUM_STEPS = 500
+NS_ITERS = 5
 MOMENTUM = 0.9
 GAMMA = 1.0
 SCALE_MIN = 0.1
@@ -53,12 +45,25 @@ DATA_POINTS = 32
 # LR sweep values
 VANILLA_LRS = [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1]
 SGD_LRS = [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
-ORIGINAL_LR = 0.02  # the 3.4 default
+ORIGINAL_LR = 0.02  # the 3.4 default reference point
+
+SCOPE_NOTE = (
+    'Reports final training loss after a fixed 500-step budget on a toy '
+    'deep-linear regression problem. This benchmark does not directly measure '
+    'curvature or establish a general optimizer advantage.'
+)
 
 
 # =============================================================================
-# NETWORK UTILITIES (identical to 3.4)
+# NETWORK UTILITIES (same mathematical setup as 3.4)
 # =============================================================================
+
+
+def clone_weights(weights):
+    """Return a defensive copy of a list of weight matrices."""
+    return [W.copy() for W in weights]
+
+
 
 def init_weights(dim, num_layers, seed):
     """Initialize layers near identity."""
@@ -70,6 +75,7 @@ def init_weights(dim, num_layers, seed):
     return weights
 
 
+
 def forward_linear(weights, X):
     """Forward pass through deep linear net."""
     out = X.copy()
@@ -78,15 +84,17 @@ def forward_linear(weights, X):
     return out
 
 
+
 def compute_loss(weights, X, Y_target):
-    """MSE loss."""
+    """Mean-squared error loss."""
     Y_pred = forward_linear(weights, X)
     diff = Y_pred - Y_target
     return 0.5 * np.mean(diff ** 2)
 
 
+
 def compute_gradients(weights, X, Y_target):
-    """Backprop through deep linear net."""
+    """Backpropagation through the deep linear net."""
     num_layers = len(weights)
     batch_size = X.shape[1]
 
@@ -106,11 +114,12 @@ def compute_gradients(weights, X, Y_target):
 
 
 # =============================================================================
-# NEWTON-SCHULZ ITERATION (identical to 3.4)
+# NEWTON-SCHULZ ITERATION (same polynomial as 3.4)
 # =============================================================================
 
-def newton_schulz_orthogonalize(G, num_iters=5):
-    """Newton-Schulz iteration: Muon's quintic polynomial."""
+
+def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
+    """Muon's quintic Newton-Schulz iteration."""
     a, b, c = 3.4445, -4.7750, 2.0315
     norm = np.linalg.norm(G, 'fro')
     if norm < 1e-12:
@@ -128,28 +137,46 @@ def newton_schulz_orthogonalize(G, num_iters=5):
 # OPTIMIZERS
 # =============================================================================
 
-def train_muon(weights, X, Y_target, lr, num_steps, ns_iters=5,
-               rescale_mode='none', gamma=1.0, scale_min=0.1, scale_max=10.0,
-               momentum=0.9):
+
+def _pad_list(values, target_len, pad_value):
+    values = list(values)
+    if len(values) < target_len:
+        values.extend([pad_value] * (target_len - len(values)))
+    return values
+
+
+
+def train_muon(
+    weights,
+    X,
+    Y_target,
+    lr,
+    num_steps,
+    ns_iters=NS_ITERS,
+    rescale_mode='none',
+    gamma=1.0,
+    scale_min=0.1,
+    scale_max=10.0,
+    momentum=0.9,
+):
     """
     Muon optimizer with optional curvature rescaling.
     Returns (loss_history, scale_history, final_weights).
     """
+    weights = clone_weights(weights)
     num_layers = len(weights)
     velocities = [np.zeros_like(W) for W in weights]
     losses = []
     scales_used = []
 
-    for step in range(num_steps):
-        loss = compute_loss(weights, X, Y_target)
+    for _step in range(num_steps):
+        loss = float(compute_loss(weights, X, Y_target))
         losses.append(loss)
 
-        # Divergence guard
         if not np.isfinite(loss) or loss > 1e10:
-            for remaining in range(num_steps - step):
-                losses.append(float('inf'))
-                scales_used.append(1.0)
-            break
+            losses = _pad_list(losses, num_steps + 1, float('inf'))
+            scales_used = _pad_list(scales_used, num_steps, 1.0)
+            return losses, scales_used, weights
 
         grads = compute_gradients(weights, X, Y_target)
 
@@ -170,33 +197,32 @@ def train_muon(weights, X, Y_target, lr, num_steps, ns_iters=5,
             else:
                 scale = 1.0
 
-            step_scales.append(scale)
-
+            step_scales.append(float(scale))
             velocities[i] = momentum * velocities[i] + G_orth
             weights[i] = weights[i] - lr * velocities[i]
 
-        scales_used.append(np.mean(step_scales))
+        scales_used.append(float(np.mean(step_scales)))
 
-    final_loss = compute_loss(weights, X, Y_target)
+    final_loss = float(compute_loss(weights, X, Y_target))
     losses.append(final_loss)
-
     return losses, scales_used, weights
+
 
 
 def train_sgd(weights, X, Y_target, lr, num_steps, momentum=0.9):
     """SGD with momentum."""
+    weights = clone_weights(weights)
     num_layers = len(weights)
     velocities = [np.zeros_like(W) for W in weights]
     losses = []
 
-    for step in range(num_steps):
-        loss = compute_loss(weights, X, Y_target)
+    for _step in range(num_steps):
+        loss = float(compute_loss(weights, X, Y_target))
         losses.append(loss)
 
         if not np.isfinite(loss) or loss > 1e10:
-            for remaining in range(num_steps - step):
-                losses.append(float('inf'))
-            break
+            losses = _pad_list(losses, num_steps + 1, float('inf'))
+            return losses, weights
 
         grads = compute_gradients(weights, X, Y_target)
 
@@ -204,15 +230,15 @@ def train_sgd(weights, X, Y_target, lr, num_steps, momentum=0.9):
             velocities[i] = momentum * velocities[i] + grads[i]
             weights[i] = weights[i] - lr * velocities[i]
 
-    final_loss = compute_loss(weights, X, Y_target)
+    final_loss = float(compute_loss(weights, X, Y_target))
     losses.append(final_loss)
-
     return losses, weights
 
 
 # =============================================================================
-# DATA GENERATION (identical seed scheme to 3.4)
+# DATA GENERATION (same seed scheme as 3.4)
 # =============================================================================
+
 
 def make_problem(seed):
     """Generate target and data for a single seed."""
@@ -226,415 +252,717 @@ def make_problem(seed):
 
 
 # =============================================================================
-# MAIN EXPERIMENT
+# SUMMARIES AND STRUCTURED RESULTS
 # =============================================================================
 
-def main():
+
+def summarize_losses(final_losses):
+    """Summary statistics for a vector of final losses."""
+    arr = np.asarray(final_losses, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {
+            'count': int(arr.size),
+            'finite_count': 0,
+            'finite_fraction': 0.0,
+            'mean': float('inf'),
+            'median': float('inf'),
+            'std': float('nan'),
+            'min': float('inf'),
+            'max': float('inf'),
+        }
+
+    return {
+        'count': int(arr.size),
+        'finite_count': int(finite.size),
+        'finite_fraction': float(finite.size / arr.size),
+        'mean': float(np.mean(finite)),
+        'median': float(np.median(finite)),
+        'std': float(np.std(finite)),
+        'min': float(np.min(finite)),
+        'max': float(np.max(finite)),
+    }
+
+
+
+def summarize_scales(scales, scale_min=SCALE_MIN, scale_max=SCALE_MAX):
+    """Summary statistics for flattened scale histories."""
+    arr = np.asarray(scales, dtype=float)
+    if arr.size == 0:
+        return {
+            'count': 0,
+            'mean': float('nan'),
+            'median': float('nan'),
+            'std': float('nan'),
+            'min': float('nan'),
+            'max': float('nan'),
+            'min_clamp_fraction': float('nan'),
+            'max_clamp_fraction': float('nan'),
+        }
+
+    return {
+        'count': int(arr.size),
+        'mean': float(np.mean(arr)),
+        'median': float(np.median(arr)),
+        'std': float(np.std(arr)),
+        'min': float(np.min(arr)),
+        'max': float(np.max(arr)),
+        'min_clamp_fraction': float(np.mean(arr <= scale_min + 1e-8)),
+        'max_clamp_fraction': float(np.mean(arr >= scale_max - 1e-8)),
+    }
+
+
+
+def stable_ratio(numerator, denominator):
+    """Return numerator/denominator when that ratio is numerically meaningful."""
+    numerator = float(numerator)
+    denominator = float(denominator)
+    if not np.isfinite(numerator) or not np.isfinite(denominator):
+        return float('nan')
+    if abs(denominator) < 1e-300:
+        return float('inf') if numerator > 0 else float('nan')
+    return float(numerator / denominator)
+
+
+
+def stable_log10_ratio(numerator, denominator):
+    """Return log10(numerator/denominator) for positive finite ratios."""
+    ratio = stable_ratio(numerator, denominator)
+    if np.isfinite(ratio) and ratio > 0:
+        return float(np.log10(ratio))
+    return float('nan')
+
+
+
+def add_display_name(condition, display_name):
+    """Shallow-copy a condition dictionary and attach a display name."""
+    enriched = dict(condition)
+    enriched['display_name'] = display_name
+    return enriched
+
+
+
+def select_best_tested_lr(results_by_lr, lr_grid):
+    """Choose the best tested LR by mean finite final loss."""
+    best_lr = None
+    best_mean = float('inf')
+
+    for lr in lr_grid:
+        lr = float(lr)
+        summary = results_by_lr[lr]['summary']
+        mean_loss = summary['mean']
+        if np.isfinite(mean_loss) and mean_loss < best_mean:
+            best_mean = mean_loss
+            best_lr = lr
+
+    if best_lr is None:
+        raise RuntimeError('No finite losses found in LR sweep.')
+
+    min_lr = float(min(lr_grid))
+    max_lr = float(max(lr_grid))
+    return {
+        'lr': float(best_lr),
+        'mean': float(best_mean),
+        'on_lower_boundary': bool(np.isclose(best_lr, min_lr)),
+        'on_upper_boundary': bool(np.isclose(best_lr, max_lr)),
+    }
+
+
+
+def run_muon_condition(seeds, lr, rescale_mode='none'):
+    """Run a Muon condition across seeds and retain histories."""
+    final_losses = []
+    loss_histories = []
+    scale_histories = []
+
+    for seed in seeds:
+        X, Y_target = make_problem(seed)
+        w_init = init_weights(DIM, NUM_LAYERS, seed + 1000)
+        losses, scales, _ = train_muon(
+            w_init,
+            X,
+            Y_target,
+            lr=lr,
+            num_steps=NUM_STEPS,
+            ns_iters=NS_ITERS,
+            rescale_mode=rescale_mode,
+            gamma=GAMMA,
+            scale_min=SCALE_MIN,
+            scale_max=SCALE_MAX,
+            momentum=MOMENTUM,
+        )
+        final_losses.append(float(losses[-1]))
+        loss_histories.append(np.asarray(losses, dtype=float))
+        if rescale_mode == 'curvature':
+            scale_histories.append(np.asarray(scales, dtype=float))
+
+    condition = {
+        'method': 'Muon',
+        'rescale_mode': rescale_mode,
+        'lr': float(lr),
+        'final_losses': np.asarray(final_losses, dtype=float),
+        'loss_histories': np.asarray(loss_histories, dtype=float),
+        'summary': summarize_losses(final_losses),
+    }
+
+    if rescale_mode == 'curvature':
+        scales = np.asarray(scale_histories, dtype=float)
+        flat_scales = scales.reshape(-1) if scales.size else np.asarray([], dtype=float)
+        condition['scale_histories'] = scales
+        condition['flattened_scales'] = flat_scales
+        condition['scale_summary'] = summarize_scales(flat_scales)
+
+    return condition
+
+
+
+def run_sgd_condition(seeds, lr):
+    """Run an SGD condition across seeds and retain histories."""
+    final_losses = []
+    loss_histories = []
+
+    for seed in seeds:
+        X, Y_target = make_problem(seed)
+        w_init = init_weights(DIM, NUM_LAYERS, seed + 1000)
+        losses, _ = train_sgd(
+            w_init,
+            X,
+            Y_target,
+            lr=lr,
+            num_steps=NUM_STEPS,
+            momentum=MOMENTUM,
+        )
+        final_losses.append(float(losses[-1]))
+        loss_histories.append(np.asarray(losses, dtype=float))
+
+    return {
+        'method': 'SGD',
+        'lr': float(lr),
+        'final_losses': np.asarray(final_losses, dtype=float),
+        'loss_histories': np.asarray(loss_histories, dtype=float),
+        'summary': summarize_losses(final_losses),
+    }
+
+
+
+def build_tests(best_vanilla_lr, vanilla_best, vanilla_original, rescaled_original, rescaled_best):
+    """Compute the current T1/T2/T3 operational checks."""
+    expected_lr = ORIGINAL_LR * SCALE_MIN
+    vanilla_best_mean = vanilla_best['summary']['mean']
+    vanilla_orig_mean = vanilla_original['summary']['mean']
+    rescaled_orig_mean = rescaled_original['summary']['mean']
+    rescaled_best_mean = rescaled_best['summary']['mean']
+
+    t1_ratio = stable_ratio(best_vanilla_lr, expected_lr)
+    t1_pass = bool(np.isfinite(t1_ratio) and 0.5 <= t1_ratio <= 2.0)
+    t1_exact = bool(abs(best_vanilla_lr - expected_lr) < 1e-12)
+
+    t2_ratio = stable_ratio(vanilla_best_mean, rescaled_orig_mean)
+    t2_log10_ratio = stable_log10_ratio(vanilla_best_mean, rescaled_orig_mean)
+    t2_parity_gap_pct = float(abs(t2_ratio - 1.0) * 100.0) if np.isfinite(t2_ratio) else float('inf')
+    t2_pass = bool(np.isfinite(t2_parity_gap_pct) and t2_parity_gap_pct < 5.0)
+
+    t3_ratio = stable_ratio(vanilla_best_mean, rescaled_best_mean)
+    t3_log10_ratio = stable_log10_ratio(vanilla_best_mean, rescaled_best_mean)
+    t3_rescaled_over_vanilla = stable_ratio(rescaled_best_mean, vanilla_best_mean)
+    t3_pass = bool(np.isfinite(rescaled_best_mean) and rescaled_best_mean < 0.95 * vanilla_best_mean)
+
+    return {
+        'T1': {
+            'label': 'T1',
+            'question': 'Is the best tested vanilla Muon LR near 0.02 x 0.1?',
+            'definition': 'Pass if best_tested_lr / expected_lr is within [0.5, 2.0].',
+            'expected_lr': float(expected_lr),
+            'best_tested_lr': float(best_vanilla_lr),
+            'ratio_best_to_expected': float(t1_ratio),
+            'exact_match': bool(t1_exact),
+            'pass': bool(t1_pass),
+        },
+        'T2': {
+            'label': 'T2',
+            'question': 'Does vanilla Muon at the best tested LR match rescaled Muon at lr=0.02 within 5%?',
+            'definition': 'Pass if |vanilla_best / rescaled_original - 1| < 0.05.',
+            'vanilla_best_mean': float(vanilla_best_mean),
+            'rescaled_original_mean': float(rescaled_orig_mean),
+            'vanilla_best_over_rescaled_original_ratio': float(t2_ratio),
+            'log10_vanilla_best_over_rescaled_original_ratio': float(t2_log10_ratio),
+            'parity_gap_percent': float(t2_parity_gap_pct),
+            'pass': bool(t2_pass),
+        },
+        'T3': {
+            'label': 'T3',
+            'question': 'Does rescaled Muon at the vanilla best tested LR improve on vanilla Muon there?',
+            'definition': 'Pass if rescaled_best_mean < 0.95 * vanilla_best_mean.',
+            'vanilla_best_mean': float(vanilla_best_mean),
+            'rescaled_best_mean': float(rescaled_best_mean),
+            'vanilla_best_over_rescaled_best_ratio': float(t3_ratio),
+            'log10_vanilla_best_over_rescaled_best_ratio': float(t3_log10_ratio),
+            'rescaled_best_over_vanilla_best_ratio': float(t3_rescaled_over_vanilla),
+            'pass': bool(t3_pass),
+        },
+        'reference_values': {
+            'vanilla_original_mean': float(vanilla_orig_mean),
+            'vanilla_best_mean': float(vanilla_best_mean),
+            'rescaled_original_mean': float(rescaled_orig_mean),
+            'rescaled_best_mean': float(rescaled_best_mean),
+        },
+    }
+
+
+
+def compute_seedwise_winners(conditions, condition_order, seeds):
+    """Determine per-seed winners across selected conditions."""
+    winner_counts = {key: 0 for key in condition_order}
+    rows = []
+
+    for i, seed in enumerate(seeds):
+        losses = {key: float(conditions[key]['final_losses'][i]) for key in condition_order}
+        winner_key = min(
+            condition_order,
+            key=lambda key: losses[key] if np.isfinite(losses[key]) else float('inf'),
+        )
+        winner_counts[winner_key] += 1
+        rows.append(
+            {
+                'seed': int(seed),
+                'init_seed': int(seed + 1000),
+                'winner_key': winner_key,
+                'winner_display_name': conditions[winner_key]['display_name'],
+                'losses': losses,
+            }
+        )
+
+    return rows, winner_counts
+
+
+
+def classify_verdict(tests, vanilla_selection, sgd_selection, comparisons):
+    """Assign a calibrated overall conclusion for the current benchmark."""
+    t1 = tests['T1']
+    t2 = tests['T2']
+    t3 = tests['T3']
+
+    default_vs_rescaled = comparisons['ratios']['vanilla_original_over_rescaled_original']
+    default_vs_vanilla_best = comparisons['ratios']['vanilla_original_over_vanilla_best']
+    vanilla_best_mean = tests['reference_values']['vanilla_best_mean']
+    rescaled_orig_mean = tests['reference_values']['rescaled_original_mean']
+    rescaled_best_mean = tests['reference_values']['rescaled_best_mean']
+
+    boundary_notes = []
+    if vanilla_selection['on_lower_boundary'] or vanilla_selection['on_upper_boundary']:
+        boundary_notes.append(
+            'Vanilla Muon achieves its best tested LR on the sweep boundary, so this '
+            'run identifies only a best tested LR, not a localized optimum.'
+        )
+    if sgd_selection['on_lower_boundary'] or sgd_selection['on_upper_boundary']:
+        boundary_notes.append(
+            'SGD also achieves its best tested LR on the sweep boundary, so its '
+            'reported best LR is likewise boundary-limited.'
+        )
+
+    if t1['pass'] and t2['pass'] and not t3['pass']:
+        category = 'default-lr artifact'
+        summary = (
+            'Within the tested grid, the rescaled-vs-vanilla gap at lr=0.02 is '
+            'consistent with a learning-rate artifact, and rescaling does not add '
+            'further value at the vanilla best tested LR.'
+        )
+        bullets = [
+            f"Vanilla Muon improves over its lr=0.02 baseline by {default_vs_vanilla_best:.1f}x when moved to the best tested LR.",
+            f"Vanilla(best tested) / Rescaled(0.02) = {t2['vanilla_best_over_rescaled_original_ratio']:.4f}.",
+            'Applying rescaling at the vanilla best tested LR does not produce a >5% gain.',
+        ]
+    elif (not t3['pass']) and np.isfinite(vanilla_best_mean) and vanilla_best_mean < rescaled_orig_mean:
+        category = 'tuned vanilla beats rescaling'
+        summary = (
+            'A narrower default-lr-artifact story is too weak: tuned vanilla Muon '
+            'already beats rescaled Muon at lr=0.02, and adding rescaling at that '
+            'best tested vanilla LR makes the final loss worse.'
+        )
+        bullets = [
+            f"Vanilla(0.02) / Rescaled(0.02) = {default_vs_rescaled:.1f}x, so the original default-LR comparison is still highly sensitive to LR choice.",
+            f"Vanilla(0.02) / Vanilla(best tested) = {default_vs_vanilla_best:.1f}x.",
+            f"Vanilla(best tested) / Rescaled(best tested LR) = {t3['vanilla_best_over_rescaled_best_ratio']:.4e} (log10 ratio = {t3['log10_vanilla_best_over_rescaled_best_ratio']:.2f}).",
+        ]
+    elif t3['pass']:
+        category = 'rescaling adds value beyond LR tuning'
+        summary = (
+            'In this benchmark, rescaling still improves on vanilla Muon even after '
+            'moving vanilla to its best tested LR.'
+        )
+        bullets = [
+            f"Vanilla(0.02) / Rescaled(0.02) = {default_vs_rescaled:.1f}x.",
+            f"Vanilla(best tested) / Rescaled(best tested LR) = {t3['vanilla_best_over_rescaled_best_ratio']:.4f}.",
+            'The rescaled condition improves final loss by more than 5% at the vanilla best tested LR.',
+        ]
+    else:
+        category = 'mixed / unresolved'
+        summary = (
+            'The discrete sweep does not support a clean single-sentence story. The '
+            'T1/T2/T3 checks should be read together with the boundary caveats.'
+        )
+        bullets = [
+            f"T1={'PASS' if t1['pass'] else 'FAIL'}, T2={'PASS' if t2['pass'] else 'FAIL'}, T3={'PASS' if t3['pass'] else 'FAIL'}.",
+            f"Vanilla(0.02) / Rescaled(0.02) = {default_vs_rescaled:.1f}x.",
+            f"Vanilla(0.02) / Vanilla(best tested) = {default_vs_vanilla_best:.1f}x.",
+        ]
+
+    return {
+        'category': category,
+        'summary': summary,
+        'bullet_points': bullets,
+        'boundary_notes': boundary_notes,
+    }
+
+
+# =============================================================================
+# MAIN REUSABLE EXPERIMENT
+# =============================================================================
+
+
+def run_experiment():
+    """Run the full H6 benchmark and return structured results."""
+    start = perf_counter()
     seeds = [42 + i * 137 for i in range(NUM_SEEDS)]
+    init_seeds = [seed + 1000 for seed in seeds]
+
+    vanilla_by_lr = {
+        float(lr): run_muon_condition(seeds, float(lr), rescale_mode='none')
+        for lr in VANILLA_LRS
+    }
+    vanilla_selection = select_best_tested_lr(vanilla_by_lr, VANILLA_LRS)
+    best_vanilla_lr = vanilla_selection['lr']
+
+    sgd_by_lr = {float(lr): run_sgd_condition(seeds, float(lr)) for lr in SGD_LRS}
+    sgd_selection = select_best_tested_lr(sgd_by_lr, SGD_LRS)
+    best_sgd_lr = sgd_selection['lr']
+
+    rescaled_original = run_muon_condition(seeds, ORIGINAL_LR, rescale_mode='curvature')
+    rescaled_best = run_muon_condition(seeds, best_vanilla_lr, rescale_mode='curvature')
+
+    conditions = {
+        'vanilla_original': add_display_name(
+            vanilla_by_lr[float(ORIGINAL_LR)],
+            f'Vanilla Muon @ lr={ORIGINAL_LR}',
+        ),
+        'vanilla_best': add_display_name(
+            vanilla_by_lr[best_vanilla_lr],
+            f'Vanilla Muon @ best tested lr={best_vanilla_lr}',
+        ),
+        'rescaled_original': add_display_name(
+            rescaled_original,
+            f'Rescaled Muon @ lr={ORIGINAL_LR}',
+        ),
+        'rescaled_best': add_display_name(
+            rescaled_best,
+            f'Rescaled Muon @ vanilla best tested lr={best_vanilla_lr}',
+        ),
+        'sgd_best': add_display_name(
+            sgd_by_lr[best_sgd_lr],
+            f'SGD @ best tested lr={best_sgd_lr}',
+        ),
+    }
+
+    paired_condition_order = ['vanilla_best', 'rescaled_original', 'rescaled_best', 'sgd_best']
+    trajectory_condition_order = [
+        'vanilla_original',
+        'vanilla_best',
+        'rescaled_original',
+        'rescaled_best',
+        'sgd_best',
+    ]
+
+    per_seed_winners, winner_counts = compute_seedwise_winners(
+        conditions,
+        paired_condition_order,
+        seeds,
+    )
+
+    tests = build_tests(
+        best_vanilla_lr,
+        conditions['vanilla_best'],
+        conditions['vanilla_original'],
+        conditions['rescaled_original'],
+        conditions['rescaled_best'],
+    )
+
+    comparisons = {
+        'conditions': conditions,
+        'paired_condition_order': paired_condition_order,
+        'trajectory_condition_order': trajectory_condition_order,
+        'per_seed_key_condition_losses': {
+            key: conditions[key]['final_losses'] for key in paired_condition_order
+        },
+        'per_seed_key_condition_histories': {
+            key: conditions[key]['loss_histories'] for key in paired_condition_order
+        },
+        'per_seed_winners': per_seed_winners,
+        'winner_counts': winner_counts,
+        'winner_counts_display': {
+            conditions[key]['display_name']: int(count) for key, count in winner_counts.items()
+        },
+        'ratios': {
+            'vanilla_original_over_rescaled_original': stable_ratio(
+                conditions['vanilla_original']['summary']['mean'],
+                conditions['rescaled_original']['summary']['mean'],
+            ),
+            'vanilla_original_over_vanilla_best': stable_ratio(
+                conditions['vanilla_original']['summary']['mean'],
+                conditions['vanilla_best']['summary']['mean'],
+            ),
+            'vanilla_best_over_sgd_best': stable_ratio(
+                conditions['vanilla_best']['summary']['mean'],
+                conditions['sgd_best']['summary']['mean'],
+            ),
+        },
+    }
+
+    verdict = classify_verdict(tests, vanilla_selection, sgd_selection, comparisons)
+    runtime_seconds = perf_counter() - start
+
+    return {
+        'experiment_id': 'H6_LR_ARTIFACT_CHECK',
+        'title': 'Experiment H6: learning-rate artifact check for final training loss',
+        'scope': SCOPE_NOTE,
+        'paths': {
+            'script': str(SCRIPT_PATH),
+            'notebook': str(NOTEBOOK_PATH),
+        },
+        'reproducibility': {
+            'script_command': f'python {EXPERIMENT_RELATIVE_PATH}',
+        },
+        'config': {
+            'dim': DIM,
+            'num_layers': NUM_LAYERS,
+            'num_steps': NUM_STEPS,
+            'ns_iters': NS_ITERS,
+            'momentum': MOMENTUM,
+            'gamma': GAMMA,
+            'scale_min': SCALE_MIN,
+            'scale_max': SCALE_MAX,
+            'num_seeds': NUM_SEEDS,
+            'data_points': DATA_POINTS,
+            'vanilla_lrs': [float(lr) for lr in VANILLA_LRS],
+            'sgd_lrs': [float(lr) for lr in SGD_LRS],
+            'original_lr': float(ORIGINAL_LR),
+        },
+        'seeds': seeds,
+        'init_seeds': init_seeds,
+        'selected_lrs': {
+            'original_lr': float(ORIGINAL_LR),
+            'expected_lr_from_min_clamp': float(ORIGINAL_LR * SCALE_MIN),
+            'vanilla_best_tested': float(best_vanilla_lr),
+            'sgd_best_tested': float(best_sgd_lr),
+        },
+        'vanilla': {
+            'lr_grid': [float(lr) for lr in VANILLA_LRS],
+            'by_lr': vanilla_by_lr,
+            'best_tested_lr': float(best_vanilla_lr),
+            'best_tested_summary': vanilla_by_lr[best_vanilla_lr]['summary'],
+            'best_on_lower_boundary': bool(vanilla_selection['on_lower_boundary']),
+            'best_on_upper_boundary': bool(vanilla_selection['on_upper_boundary']),
+        },
+        'sgd': {
+            'lr_grid': [float(lr) for lr in SGD_LRS],
+            'by_lr': sgd_by_lr,
+            'best_tested_lr': float(best_sgd_lr),
+            'best_tested_summary': sgd_by_lr[best_sgd_lr]['summary'],
+            'best_on_lower_boundary': bool(sgd_selection['on_lower_boundary']),
+            'best_on_upper_boundary': bool(sgd_selection['on_upper_boundary']),
+        },
+        'rescaled': {
+            'original': add_display_name(rescaled_original, f'Rescaled Muon @ lr={ORIGINAL_LR}'),
+            'best_vanilla_lr': add_display_name(
+                rescaled_best,
+                f'Rescaled Muon @ vanilla best tested lr={best_vanilla_lr}',
+            ),
+        },
+        'comparisons': comparisons,
+        'tests': tests,
+        'verdict': verdict,
+        'runtime_seconds': float(runtime_seconds),
+    }
+
+
+# =============================================================================
+# CLI REPORTING
+# =============================================================================
+
+
+def _format_float(value, fmt='.6e'):
+    value = float(value)
+    if np.isfinite(value):
+        return format(value, fmt)
+    return 'inf'
+
+
+
+def print_report(results):
+    """Pretty-print the structured results for CLI usage."""
+    config = results['config']
+    tests = results['tests']
+    comparisons = results['comparisons']
 
     print()
-    print("=" * 110)
-    print("  Experiment H6: LR Artifact Check -- Is the 130x from curvature rescaling just LR reduction?")
-    print("=" * 110)
+    print('=' * 110)
+    print(f"  {results['title']}")
+    print('=' * 110)
     print()
-    print(f"  Setup: {NUM_LAYERS}-layer {DIM}x{DIM} deep linear, {NUM_STEPS} steps, {NUM_SEEDS} seeds")
-    print(f"  Original 3.4 used lr={ORIGINAL_LR} with curvature rescale hitting min-clamp (0.1) 96.5% of time")
-    print(f"  Hypothesis: effective LR was ~{ORIGINAL_LR * 0.1} => sweeping vanilla Muon LR to check")
+    print(f"  Scope: {results['scope']}")
+    print(f"  Counterpart notebook: {results['paths']['notebook']}")
+    print(f"  Reproduce with: {results['reproducibility']['script_command']}")
     print()
-
-    # =========================================================================
-    # PHASE 1: Vanilla Muon LR sweep
-    # =========================================================================
-    print("-" * 110)
-    print("  PHASE 1: Vanilla Muon LR sweep")
-    print("-" * 110)
-
-    vanilla_results = {}  # lr -> list of final losses across seeds
-    for lr in VANILLA_LRS:
-        final_losses = []
-        for seed in seeds:
-            X, Y_target = make_problem(seed)
-            w_init = init_weights(DIM, NUM_LAYERS, seed + 1000)
-            losses, _, _ = train_muon(w_init, X, Y_target, lr=lr, num_steps=NUM_STEPS,
-                                       ns_iters=5, rescale_mode='none', momentum=MOMENTUM)
-            final_losses.append(losses[-1])
-        vanilla_results[lr] = final_losses
-        mean_l = np.mean(final_losses)
-        med_l = np.median(final_losses)
-        finite_frac = np.mean(np.isfinite(final_losses)) * 100
-        print(f"    lr={lr:<8.4f}  mean={mean_l:12.6e}  median={med_l:12.6e}  "
-              f"finite={finite_frac:.0f}%")
-
-    # Find best vanilla LR (by mean of finite losses)
-    best_vanilla_lr = None
-    best_vanilla_mean = float('inf')
-    for lr in VANILLA_LRS:
-        fl = np.array(vanilla_results[lr])
-        finite_fl = fl[np.isfinite(fl)]
-        if len(finite_fl) > 0:
-            m = np.mean(finite_fl)
-            if m < best_vanilla_mean:
-                best_vanilla_mean = m
-                best_vanilla_lr = lr
-
-    print(f"\n    >>> Best vanilla Muon LR: {best_vanilla_lr} (mean loss = {best_vanilla_mean:.6e})")
-    print(f"    >>> Expected if rescaler is pure LR reduction: ~{ORIGINAL_LR * 0.1}")
+    print(
+        f"  Setup: {config['num_layers']}-layer {config['dim']}x{config['dim']} deep linear, "
+        f"{config['num_steps']} steps, {config['num_seeds']} seeds"
+    )
+    print(f"  Seeds: {results['seeds']}")
+    print(f"  Original reference LR: {config['original_lr']}")
+    print(f"  Expected pure min-clamp LR reference: {results['selected_lrs']['expected_lr_from_min_clamp']}")
     print()
 
-    # =========================================================================
-    # PHASE 2: SGD LR sweep
-    # =========================================================================
-    print("-" * 110)
-    print("  PHASE 2: SGD LR sweep")
-    print("-" * 110)
-
-    sgd_results = {}
-    for lr in SGD_LRS:
-        final_losses = []
-        for seed in seeds:
-            X, Y_target = make_problem(seed)
-            w_init = init_weights(DIM, NUM_LAYERS, seed + 1000)
-            losses, _ = train_sgd(w_init, X, Y_target, lr=lr, num_steps=NUM_STEPS,
-                                   momentum=MOMENTUM)
-            final_losses.append(losses[-1])
-        sgd_results[lr] = final_losses
-        mean_l = np.mean(final_losses)
-        finite_frac = np.mean(np.isfinite(final_losses)) * 100
-        print(f"    lr={lr:<8.4f}  mean={mean_l:12.6e}  finite={finite_frac:.0f}%")
-
-    best_sgd_lr = None
-    best_sgd_mean = float('inf')
-    for lr in SGD_LRS:
-        fl = np.array(sgd_results[lr])
-        finite_fl = fl[np.isfinite(fl)]
-        if len(finite_fl) > 0:
-            m = np.mean(finite_fl)
-            if m < best_sgd_mean:
-                best_sgd_mean = m
-                best_sgd_lr = lr
-
-    print(f"\n    >>> Best SGD LR: {best_sgd_lr} (mean loss = {best_sgd_mean:.6e})")
+    print('-' * 110)
+    print('  PHASE 1: Vanilla Muon LR sweep (reported as best tested LR, not a claimed optimum)')
+    print('-' * 110)
+    for lr in results['vanilla']['lr_grid']:
+        summary = results['vanilla']['by_lr'][lr]['summary']
+        print(
+            f"    lr={lr:<8.4f}  mean={summary['mean']:12.6e}  median={summary['median']:12.6e}  "
+            f"std={summary['std']:12.2e}  finite={100.0 * summary['finite_fraction']:.0f}%"
+        )
+    print()
+    print(
+        f"    >>> Best tested vanilla Muon LR: {results['vanilla']['best_tested_lr']} "
+        f"(mean final loss = {results['vanilla']['best_tested_summary']['mean']:.6e})"
+    )
+    if results['vanilla']['best_on_lower_boundary'] or results['vanilla']['best_on_upper_boundary']:
+        print('    >>> Boundary caveat: the best tested vanilla LR lies on the sweep edge.')
     print()
 
-    # =========================================================================
-    # PHASE 3: Curvature-rescaled Muon at lr=0.02 (3.4 reference)
-    # =========================================================================
-    print("-" * 110)
-    print("  PHASE 3: Curvature-rescaled Muon")
-    print("-" * 110)
-
-    # 3a: Rescaled at original LR (the 3.4 result)
-    rescaled_orig_losses = []
-    rescaled_orig_scales = []
-    for seed in seeds:
-        X, Y_target = make_problem(seed)
-        w_init = init_weights(DIM, NUM_LAYERS, seed + 1000)
-        losses, scales, _ = train_muon(w_init, X, Y_target, lr=ORIGINAL_LR,
-                                        num_steps=NUM_STEPS, ns_iters=5,
-                                        rescale_mode='curvature', gamma=GAMMA,
-                                        scale_min=SCALE_MIN, scale_max=SCALE_MAX,
-                                        momentum=MOMENTUM)
-        rescaled_orig_losses.append(losses[-1])
-        rescaled_orig_scales.extend(scales)
-
-    rescaled_orig_mean = np.mean(rescaled_orig_losses)
-    scales_arr = np.array(rescaled_orig_scales)
-    hit_min_pct = np.mean(scales_arr <= SCALE_MIN + 1e-8) * 100
-
-    print(f"    Rescaled Muon at lr={ORIGINAL_LR}:  mean loss = {rescaled_orig_mean:.6e}")
-    print(f"    Scale factor stats: mean={np.mean(scales_arr):.4f}, "
-          f"median={np.median(scales_arr):.4f}, "
-          f"min={np.min(scales_arr):.4f}, max={np.max(scales_arr):.4f}")
-    print(f"    Fraction hitting min clamp ({SCALE_MIN}): {hit_min_pct:.1f}%")
+    print('-' * 110)
+    print('  PHASE 2: SGD LR sweep (reported as best tested LR, not a claimed optimum)')
+    print('-' * 110)
+    for lr in results['sgd']['lr_grid']:
+        summary = results['sgd']['by_lr'][lr]['summary']
+        print(
+            f"    lr={lr:<8.4f}  mean={summary['mean']:12.6e}  median={summary['median']:12.6e}  "
+            f"std={summary['std']:12.2e}  finite={100.0 * summary['finite_fraction']:.0f}%"
+        )
+    print()
+    print(
+        f"    >>> Best tested SGD LR: {results['sgd']['best_tested_lr']} "
+        f"(mean final loss = {results['sgd']['best_tested_summary']['mean']:.6e})"
+    )
+    if results['sgd']['best_on_lower_boundary'] or results['sgd']['best_on_upper_boundary']:
+        print('    >>> Boundary caveat: the best tested SGD LR lies on the sweep edge.')
     print()
 
-    # 3b: Rescaled at best vanilla LR
-    rescaled_best_losses = []
-    rescaled_best_scales = []
-    for seed in seeds:
-        X, Y_target = make_problem(seed)
-        w_init = init_weights(DIM, NUM_LAYERS, seed + 1000)
-        losses, scales, _ = train_muon(w_init, X, Y_target, lr=best_vanilla_lr,
-                                        num_steps=NUM_STEPS, ns_iters=5,
-                                        rescale_mode='curvature', gamma=GAMMA,
-                                        scale_min=SCALE_MIN, scale_max=SCALE_MAX,
-                                        momentum=MOMENTUM)
-        rescaled_best_losses.append(losses[-1])
-        rescaled_best_scales.extend(scales)
-
-    rescaled_best_mean = np.mean(rescaled_best_losses)
-    scales_best_arr = np.array(rescaled_best_scales)
-    hit_min_best_pct = np.mean(scales_best_arr <= SCALE_MIN + 1e-8) * 100
-
-    print(f"    Rescaled Muon at lr={best_vanilla_lr} (best vanilla LR):  mean loss = {rescaled_best_mean:.6e}")
-    print(f"    Scale factor stats: mean={np.mean(scales_best_arr):.4f}, "
-          f"median={np.median(scales_best_arr):.4f}, "
-          f"min={np.min(scales_best_arr):.4f}, max={np.max(scales_best_arr):.4f}")
-    print(f"    Fraction hitting min clamp ({SCALE_MIN}): {hit_min_best_pct:.1f}%")
-    print()
-
-    # =========================================================================
-    # PHASE 4: COMPREHENSIVE TABLE
-    # =========================================================================
-    print("=" * 110)
-    print("  COMPREHENSIVE RESULTS TABLE")
-    print("=" * 110)
-    print()
-
-    # Collect all Muon results into table rows
-    print(f"  {'LR':>8}  |  {'Vanilla Muon':>16}  {'(std)':>12}  |  "
-          f"{'Rescaled Muon':>16}  {'(std)':>12}  |  {'SGD':>16}  {'(std)':>12}")
-    print(f"  {'':->8}--+--{'':->16}--{'':->12}--+--"
-          f"{'':->16}--{'':->12}--+--{'':->16}--{'':->12}")
-
-    for lr in VANILLA_LRS:
-        # Vanilla Muon
-        vm = np.array(vanilla_results[lr])
-        vm_finite = vm[np.isfinite(vm)]
-        vm_str = f"{np.mean(vm_finite):16.6e}" if len(vm_finite) > 0 else f"{'DIVERGED':>16}"
-        vm_std = f"{np.std(vm_finite):12.2e}" if len(vm_finite) > 0 else f"{'---':>12}"
-
-        # Rescaled Muon (only computed for original and best)
-        if abs(lr - ORIGINAL_LR) < 1e-10:
-            rm = np.array(rescaled_orig_losses)
-            rm_str = f"{np.mean(rm):16.6e}"
-            rm_std = f"{np.std(rm):12.2e}"
-        elif abs(lr - best_vanilla_lr) < 1e-10 and abs(best_vanilla_lr - ORIGINAL_LR) > 1e-10:
-            rm = np.array(rescaled_best_losses)
-            rm_str = f"{np.mean(rm):16.6e}"
-            rm_std = f"{np.std(rm):12.2e}"
-        else:
-            rm_str = f"{'---':>16}"
-            rm_std = f"{'---':>12}"
-
-        # SGD
-        if lr in sgd_results:
-            sg = np.array(sgd_results[lr])
-            sg_finite = sg[np.isfinite(sg)]
-            sg_str = f"{np.mean(sg_finite):16.6e}" if len(sg_finite) > 0 else f"{'DIVERGED':>16}"
-            sg_std = f"{np.std(sg_finite):12.2e}" if len(sg_finite) > 0 else f"{'---':>12}"
-        else:
-            sg_str = f"{'---':>16}"
-            sg_std = f"{'---':>12}"
-
-        marker = ""
-        if abs(lr - ORIGINAL_LR) < 1e-10:
-            marker = "  <-- 3.4 default"
-        if abs(lr - best_vanilla_lr) < 1e-10:
-            marker += "  <-- BEST vanilla"
-
-        print(f"  {lr:>8.4f}  |  {vm_str}  {vm_std}  |  "
-              f"{rm_str}  {rm_std}  |  {sg_str}  {sg_std}{marker}")
-
-    print()
-
-    # Also print the rescaled result at best vanilla LR if not already in table
-    if best_vanilla_lr not in VANILLA_LRS:
-        print(f"  NOTE: best_vanilla_lr={best_vanilla_lr} not in sweep -- this should not happen.")
-
-    # =========================================================================
-    # PHASE 5: KEY HYPOTHESIS TESTS
-    # =========================================================================
-    print("=" * 110)
-    print("  KEY HYPOTHESIS TESTS")
-    print("=" * 110)
-    print()
-
-    # Reference values
-    vanilla_orig = np.array(vanilla_results[ORIGINAL_LR])
-    vanilla_orig_mean = np.mean(vanilla_orig[np.isfinite(vanilla_orig)]) if np.any(np.isfinite(vanilla_orig)) else float('inf')
-    vanilla_best = np.array(vanilla_results[best_vanilla_lr])
-    vanilla_best_mean = np.mean(vanilla_best[np.isfinite(vanilla_best)])
-
-    print(f"  Reference values:")
-    print(f"    Vanilla Muon at lr={ORIGINAL_LR} (3.4 default):    mean = {vanilla_orig_mean:.6e}")
-    print(f"    Vanilla Muon at lr={best_vanilla_lr} (best):         mean = {vanilla_best_mean:.6e}")
-    print(f"    Rescaled Muon at lr={ORIGINAL_LR} (3.4 result):    mean = {rescaled_orig_mean:.6e}")
-    print(f"    Rescaled Muon at lr={best_vanilla_lr} (best+resc):   mean = {rescaled_best_mean:.6e}")
-    print(f"    Best SGD at lr={best_sgd_lr}:                       mean = {best_sgd_mean:.6e}")
-    print()
-
-    # Improvement ratios
-    if rescaled_orig_mean > 1e-15:
-        ratio_orig_vs_rescaled = vanilla_orig_mean / rescaled_orig_mean
-        print(f"  Ratio: vanilla(0.02) / rescaled(0.02) = {ratio_orig_vs_rescaled:.1f}x")
-        print(f"    (This is the '130x' improvement from 3.4)")
-    print()
-
-    if vanilla_best_mean > 1e-15:
-        ratio_best_vs_orig = vanilla_orig_mean / vanilla_best_mean
-        print(f"  Ratio: vanilla(0.02) / vanilla(best={best_vanilla_lr}) = {ratio_best_vs_orig:.1f}x")
-        print(f"    (How much of the improvement is from LR alone)")
-    print()
-
-    # --- T1: Is the best vanilla LR near 0.002? ---
-    print("  " + "-" * 106)
-    expected_lr = ORIGINAL_LR * SCALE_MIN  # 0.02 * 0.1 = 0.002
-    t1_ratio = best_vanilla_lr / expected_lr
-    t1_pass = 0.5 <= t1_ratio <= 2.0  # within factor of 2
-    t1_exact = abs(best_vanilla_lr - expected_lr) < 1e-10
-
-    print(f"  T1: Is the best vanilla Muon LR near {expected_lr} (= {ORIGINAL_LR} x {SCALE_MIN})?")
-    print(f"      Best vanilla LR = {best_vanilla_lr}")
-    print(f"      Expected LR     = {expected_lr}")
-    print(f"      Ratio best/expected = {t1_ratio:.2f}")
-    if t1_exact:
-        print(f"      RESULT: EXACT MATCH -- best vanilla LR IS exactly the clamped LR")
-    elif t1_pass:
-        print(f"      RESULT: APPROXIMATE MATCH -- within factor of 2")
-    else:
-        print(f"      RESULT: NO MATCH -- best vanilla LR is far from expected")
-
-    if t1_pass:
-        print(f"      INTERPRETATION: The rescaler IS primarily acting as LR reduction.")
-    else:
-        print(f"      INTERPRETATION: The rescaler does something beyond simple LR reduction.")
-    print()
-
-    # --- T2: Does best-LR vanilla Muon match rescaled Muon within 5%? ---
-    print("  " + "-" * 106)
-    if rescaled_orig_mean > 1e-15:
-        t2_ratio = vanilla_best_mean / rescaled_orig_mean
-        t2_pct_diff = abs(t2_ratio - 1.0) * 100
-        t2_pass = t2_pct_diff < 5.0
-    else:
-        t2_ratio = float('inf')
-        t2_pct_diff = float('inf')
-        t2_pass = False
-
-    print(f"  T2: Does best-LR vanilla Muon match rescaled Muon at lr=0.02 within 5%?")
-    print(f"      Vanilla best (lr={best_vanilla_lr}):  {vanilla_best_mean:.6e}")
-    print(f"      Rescaled (lr={ORIGINAL_LR}):          {rescaled_orig_mean:.6e}")
-    print(f"      Ratio = {t2_ratio:.4f}  (diff = {t2_pct_diff:.1f}%)")
-    if t2_pass:
-        print(f"      RESULT: MATCH within 5% -- the 130x IS an artifact of bad default LR")
-    else:
-        if vanilla_best_mean < rescaled_orig_mean:
-            print(f"      RESULT: NO MATCH -- vanilla at optimal LR is BETTER than rescaled.")
-            print(f"      The rescaling provides NO value; proper LR tuning is sufficient.")
-        else:
-            print(f"      RESULT: NO MATCH -- rescaled Muon is still better than best vanilla.")
-            print(f"      The rescaling provides genuine value beyond LR reduction.")
-    print()
-
-    # --- T3: Does rescaled Muon at best vanilla LR further improve? ---
-    print("  " + "-" * 106)
-    if vanilla_best_mean > 1e-15:
-        t3_ratio = vanilla_best_mean / rescaled_best_mean
-        t3_pct_improvement = (1.0 - rescaled_best_mean / vanilla_best_mean) * 100
-    else:
-        t3_ratio = float('nan')
-        t3_pct_improvement = float('nan')
-    t3_pass = rescaled_best_mean < vanilla_best_mean * 0.95  # >5% improvement
-
-    print(f"  T3: Does rescaled Muon at the best vanilla LR further improve?")
-    print(f"      Vanilla at lr={best_vanilla_lr}:            {vanilla_best_mean:.6e}")
-    print(f"      Rescaled at lr={best_vanilla_lr}:           {rescaled_best_mean:.6e}")
-    print(f"      Improvement from rescaling: {t3_pct_improvement:.1f}%  (ratio = {t3_ratio:.2f}x)")
-    if t3_pass:
-        print(f"      RESULT: YES -- rescaling provides >{5}% further improvement")
-        print(f"      Curvature rescaling has genuine value beyond LR tuning.")
-    else:
-        if rescaled_best_mean > vanilla_best_mean:
-            print(f"      RESULT: NO -- rescaling actually HURTS at optimal LR")
-            print(f"      Curvature rescaling is purely an LR artifact.")
-        else:
-            print(f"      RESULT: MARGINAL -- rescaling helps <5%, essentially just LR effect")
-    print()
-
-    # =========================================================================
-    # PER-SEED COMPARISON: best vanilla vs rescaled
-    # =========================================================================
-    print("=" * 110)
-    print("  PER-SEED COMPARISON: Vanilla(best LR) vs Rescaled(original LR) vs Rescaled(best LR)")
-    print("=" * 110)
-    print()
-
-    vanilla_best_arr = np.array(vanilla_results[best_vanilla_lr])
-    rescaled_orig_arr = np.array(rescaled_orig_losses)
-    rescaled_best_arr = np.array(rescaled_best_losses)
-
-    print(f"  {'Seed':>6}  {'Vanilla(best)':>16}  {'Rescaled(0.02)':>16}  "
-          f"{'Rescaled(best)':>16}  {'Winner':>20}")
-    print(f"  {'':->6}  {'':->16}  {'':->16}  {'':->16}  {'':->20}")
-
-    wins_vanilla = 0
-    wins_resc_orig = 0
-    wins_resc_best = 0
-    for i in range(NUM_SEEDS):
-        vb = vanilla_best_arr[i]
-        ro = rescaled_orig_arr[i]
-        rb = rescaled_best_arr[i]
-
-        candidates = {'Vanilla(best)': vb, 'Resc(0.02)': ro, 'Resc(best)': rb}
-        winner = min(candidates, key=lambda k: candidates[k] if np.isfinite(candidates[k]) else float('inf'))
-        if winner == 'Vanilla(best)':
-            wins_vanilla += 1
-        elif winner == 'Resc(0.02)':
-            wins_resc_orig += 1
-        else:
-            wins_resc_best += 1
-
-        print(f"  {i+1:>6}  {vb:16.6e}  {ro:16.6e}  {rb:16.6e}  {winner:>20}")
-
-    print()
-    print(f"  Win counts: Vanilla(best)={wins_vanilla}, "
-          f"Resc(0.02)={wins_resc_orig}, Resc(best)={wins_resc_best}")
-    print()
-
-    # =========================================================================
-    # OVERALL VERDICT
-    # =========================================================================
-    print("=" * 110)
-    print("  OVERALL VERDICT")
-    print("=" * 110)
-    print()
-
-    # Determine the story
-    if t1_pass and t2_pass and not t3_pass:
-        print("  VERDICT: THE 130x IS AN LR ARTIFACT.")
+    print('-' * 110)
+    print('  PHASE 3: Curvature-rescaled Muon reference conditions')
+    print('-' * 110)
+    for key in ['original', 'best_vanilla_lr']:
+        condition = results['rescaled'][key]
+        summary = condition['summary']
+        scale_summary = condition['scale_summary']
+        print(f"    {condition['display_name']}")
+        print(
+            f"      mean final loss={summary['mean']:.6e}  median={summary['median']:.6e}  "
+            f"std={summary['std']:.2e}"
+        )
+        print(
+            f"      scale mean={scale_summary['mean']:.4f}  median={scale_summary['median']:.4f}  "
+            f"min={scale_summary['min']:.4f}  max={scale_summary['max']:.4f}"
+        )
+        print(
+            f"      min-clamp fraction={100.0 * scale_summary['min_clamp_fraction']:.1f}%  "
+            f"max-clamp fraction={100.0 * scale_summary['max_clamp_fraction']:.1f}%"
+        )
         print()
-        print("  Evidence:")
-        print(f"    1. Best vanilla LR ({best_vanilla_lr}) matches predicted LR "
-              f"({expected_lr}) from clamp analysis.")
-        print(f"    2. Vanilla at optimal LR matches rescaled Muon within {t2_pct_diff:.1f}%.")
-        print(f"    3. Adding rescaling at optimal LR provides only {t3_pct_improvement:.1f}% change.")
-        print()
-        print("  The curvature rescaler in 3.4 accidentally found a better LR by")
-        print("  multiplying by 0.1 (its min clamp) 96.5% of the time. The 'curvature")
-        print("  adaptation' is a 10x LR reduction wearing a lab coat.")
-    elif t3_pass:
-        print("  VERDICT: CURVATURE RESCALING HAS GENUINE VALUE BEYOND LR TUNING.")
-        print()
-        print("  Evidence:")
-        print(f"    1. Best vanilla LR: {best_vanilla_lr} (predicted: {expected_lr})")
-        print(f"    2. Vanilla at optimal LR: {vanilla_best_mean:.6e}")
-        print(f"    3. Rescaled at optimal LR: {rescaled_best_mean:.6e} ({t3_pct_improvement:.1f}% better)")
-        print()
-        print("  Even after correcting the LR, rescaling provides further improvement.")
-        partially = ""
-        if t1_pass:
-            partially = "PARTIALLY an LR artifact (most of the 130x is LR), but "
-        print(f"  The 130x is {partially}rescaling adds genuine per-step adaptation.")
-    else:
-        print("  VERDICT: MIXED / COMPLEX RESULT.")
-        print()
-        print(f"    T1 (best LR near 0.002): {'PASS' if t1_pass else 'FAIL'} -- best LR = {best_vanilla_lr}")
-        print(f"    T2 (vanilla matches rescaled): {'PASS' if t2_pass else 'FAIL'} -- diff = {t2_pct_diff:.1f}%")
-        print(f"    T3 (rescaling adds value at best LR): {'PASS' if t3_pass else 'FAIL'} -- {t3_pct_improvement:.1f}%")
-        print()
-        if not t1_pass and not t2_pass:
-            print("  The rescaler is NOT primarily acting as LR reduction. The mechanism")
-            print("  appears to be something more subtle than a simple constant multiplier.")
-        elif t1_pass and not t2_pass:
-            print("  The LR is in the right ballpark but the match is not within 5%.")
-            print("  The rescaler is mostly LR reduction but with some additional effect.")
 
+    print('=' * 110)
+    print('  KEY CONDITION SUMMARY')
+    print('=' * 110)
     print()
-    print("=" * 110)
-    print("  EXPERIMENT COMPLETE")
-    print("=" * 110)
+    header = f"  {'Condition':<42} {'Mean final loss':>16} {'Median':>16} {'Std':>12} {'Finite':>8}"
+    print(header)
+    print(f"  {'-' * (len(header) - 2)}")
+    for key in comparisons['paired_condition_order']:
+        condition = comparisons['conditions'][key]
+        summary = condition['summary']
+        print(
+            f"  {condition['display_name']:<42} {_format_float(summary['mean']):>16} "
+            f"{_format_float(summary['median']):>16} {summary['std']:12.2e} "
+            f"{100.0 * summary['finite_fraction']:7.0f}%"
+        )
     print()
+
+    print('=' * 110)
+    print('  T1 / T2 / T3 OPERATIONAL CHECKS')
+    print('=' * 110)
+    print()
+    print('  These are decision criteria on final-loss summaries, not formal hypothesis tests.')
+    print()
+    print(
+        f"  T1: best tested vanilla LR / expected min-clamp LR = "
+        f"{tests['T1']['ratio_best_to_expected']:.4f}  --> {'PASS' if tests['T1']['pass'] else 'FAIL'}"
+    )
+    print(f"      best tested vanilla LR = {tests['T1']['best_tested_lr']}")
+    print(f"      expected reference LR  = {tests['T1']['expected_lr']}")
+    print()
+    print(
+        f"  T2: vanilla(best tested) / rescaled(0.02) = "
+        f"{tests['T2']['vanilla_best_over_rescaled_original_ratio']:.4e} "
+        f"(log10 ratio = {tests['T2']['log10_vanilla_best_over_rescaled_original_ratio']:.2f}) "
+        f"--> {'PASS' if tests['T2']['pass'] else 'FAIL'}"
+    )
+    print(f"      parity gap = {tests['T2']['parity_gap_percent']:.1f}%")
+    print()
+    print(
+        f"  T3: vanilla(best tested) / rescaled(best tested LR) = "
+        f"{tests['T3']['vanilla_best_over_rescaled_best_ratio']:.4e} "
+        f"(log10 ratio = {tests['T3']['log10_vanilla_best_over_rescaled_best_ratio']:.2f}) "
+        f"--> {'PASS' if tests['T3']['pass'] else 'FAIL'}"
+    )
+    print(
+        f"      rescaled(best tested LR) / vanilla(best tested) = "
+        f"{tests['T3']['rescaled_best_over_vanilla_best_ratio']:.4e}"
+    )
+    print()
+
+    print('=' * 110)
+    print('  PER-SEED WIN COUNTS ACROSS THE PAIRED COMPARISON SET')
+    print('=' * 110)
+    print()
+    for key in comparisons['paired_condition_order']:
+        display_name = comparisons['conditions'][key]['display_name']
+        print(f"  {display_name:<42} : {comparisons['winner_counts'][key]}")
+    print()
+
+    print('=' * 110)
+    print('  OVERALL VERDICT')
+    print('=' * 110)
+    print()
+    print(f"  Category: {results['verdict']['category']}")
+    print(f"  Summary: {results['verdict']['summary']}")
+    print()
+    for bullet in results['verdict']['bullet_points']:
+        print(f"  - {bullet}")
+    if results['verdict']['boundary_notes']:
+        print()
+        print('  Boundary notes:')
+        for note in results['verdict']['boundary_notes']:
+            print(f"  - {note}")
+    print()
+    print(f"  Runtime: {results['runtime_seconds']:.2f}s")
+    print()
+
+
+
+def main():
+    """CLI entrypoint."""
+    results = run_experiment()
+    print_report(results)
+    return results
 
 
 if __name__ == '__main__':

@@ -1,915 +1,1438 @@
 #!/usr/bin/env python3
 """
-1.2b-i: Lyapunov Exponent of Gauge Direction Under Each Optimizer
-=================================================================
-PREDICTION (from dynamical systems / RG gauge-fixing model):
-  Start from W_0, perturb to W_0' = W_0 @ (I + eps*S/||S||_F) where S is
-  random symmetric (gauge/PSD direction), eps=0.001.
+1.2b-i: Finite-Time Sensitivity to Gauge-Preserving vs. Non-Gauge Perturbations
+=============================================================================
 
-  Run N=200 steps of each optimizer from both starting points.
-  Compute: lambda = (1/N) * log(d(N) / d(0))
-  where d(t) = ||W_t' - W_t||_F.
+This second-pass strengthening keeps the original toy deep-linear training study but fixes the
+largest remaining conceptual flaw from the first pass: the primary "gauge" condition is now a
+true coupled gauge-preserving reparameterization of the deep linear product at t=0.
 
-  This is the Lyapunov exponent along the gauge (PSD) direction.
-    lambda < 0  =>  gauge perturbation DECAYS (stable)
-    lambda > 0  =>  gauge perturbation GROWS (unstable)
-    lambda = 0  =>  neutral
+What this script computes
+-------------------------
+A 4-layer deep linear network is trained on a fixed quadratic objective under:
+  - SGD with classical momentum
+  - a Muon-style variant that orthogonalizes each gradient via Newton-Schulz
 
-  HYPOTHESIS:
-    Muon:  lambda << 0  (strongly negative -- perturbations decay exponentially)
-    SGD:   lambda ~ 0   (neutral -- random walk)
-    Adam:  lambda slightly negative
+For each optimizer, the script compares a base trajectory against trajectories started from small
+nearby perturbations and reports finite-time growth rates in three metrics:
+  - lambda_W: raw stacked-weight distance growth
+  - lambda_F: effective end-to-end map distance growth
+  - lambda_L: mean per-layer distance growth
 
-  CRITICAL CONTEXT:
-    - D-TEST confirmed SGD advantage compounds exponentially with depth
-      (per-layer Lyapunov ~0.095)
-    - P17 perspective predicted: SGD trajectories diverge (lambda>0),
-      Muon converges (lambda<0)
-    - This experiment directly measures the Lyapunov exponent predicted
-      by the dynamical systems model
+Implemented perturbation families
+---------------------------------
+  - "gauge"              : coupled gauge-preserving reparameterization
+                            W_1' = G_1 W_1
+                            W_i' = G_i W_i G_{i-1}^{-1}   for 1 < i < L
+                            W_L' = W_L G_{L-1}^{-1}
+                            with G_i = I + eps * S_i / ||S_i||_F
+                            so W_eff' = W_eff exactly up to numerical roundoff.
 
-  Also compare with PHYSICAL (skew-symmetric/tangent) perturbation direction:
-    W_0' = W_0 @ expm(eps*A/||A||_F) where A is skew-symmetric.
-    Both optimizers should be ~neutral in the physical direction, since that
-    direction changes the actual function computed by the network.
+  - "physical"           : independent skew right-multiplicative control perturbation
+                            W_i' = W_i @ exp(eps * A_i / ||A_i||_F)
 
-Setup: 4-layer deep linear net, 32x32, quadratic loss.
+  - "symmetric_legacy"   : independent symmetric right-multiplicative perturbation retained as a
+                            non-gauge legacy comparison
+                            W_i' = W_i @ (I + eps * S_i / ||S_i||_F)
+
+Important scope caveats
+-----------------------
+- This remains a finite-time perturbation sensitivity study, not an asymptotic maximal Lyapunov
+  exponent estimator.
+- The new primary "gauge" condition is function-preserving at t=0 by construction.
+- The skew and independent symmetric conditions remain controls/comparators rather than quotient-
+  space physical tangent constructions.
+- For the true gauge-preserving condition, lambda_F is often undefined because d_F(0) is
+  essentially zero; this is expected and is reported honestly rather than hidden.
 """
 
+from __future__ import annotations
+
+import copy
+import math
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-import os
-
-np.random.seed(42)
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-DIM = 32
-NUM_LAYERS = 4
-NUM_STEPS = 200
-BATCH_SIZE = 64
-LR_MUON = 0.005
-MOMENTUM = 0.9
-NS_ITERS = 5
-EPSILON = 0.001
-NUM_PERTURBATIONS = 20
-
-# Random target matrix (fixed)
-W_target = np.random.randn(DIM, DIM) * 0.5
-
-# Random input data (fixed batch)
-X_data = np.random.randn(DIM, BATCH_SIZE) * 0.3
-
-# Output directory
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-# =============================================================================
-# CORE FUNCTIONS
-# =============================================================================
+MAP_PRESERVATION_ABS_TOL = 1e-10
+MAP_PRESERVATION_REL_TOL = 1e-12
 
-def init_weights(num_layers, seed=42):
-    """Initialize layers near identity for stability."""
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "dim": 32,
+    "num_layers": 4,
+    "num_steps": 200,
+    "batch_size": 64,
+    "lr_muon": 0.005,
+    "momentum": 0.9,
+    "ns_iters": 5,
+    "epsilon": 0.001,
+    "num_perturbations": 20,
+    "seed_global": 42,
+    "seed_init": 42,
+    "seed_perturb_base": 100,
+    "sgd_lr_candidates": [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001],
+    "lr_stability_steps": 80,
+    "lr_stability_multiplier": 50.0,
+    "divergence_loss_threshold": 1e10,
+}
+
+PERTURBATION_METADATA: Dict[str, Dict[str, Any]] = {
+    "gauge": {
+        "short_label": "coupled gauge",
+        "display_label": "coupled gauge-preserving reparameterization (primary)",
+        "is_true_gauge": True,
+        "construction": (
+            "Sample hidden symmetric generators S_k, set G_k = I + eps * S_k / ||S_k||_F, and "
+            "apply W_1' = G_1 W_1, W_i' = G_i W_i G_{i-1}^{-1}, W_L' = W_L G_{L-1}^{-1}."
+        ),
+        "honesty_note": (
+            "True internal reparameterization of the deep linear product at t=0. Any later "
+            "effective-map drift reflects optimizer dynamics, not an initial function mismatch."
+        ),
+    },
+    "physical": {
+        "short_label": "skew control",
+        "display_label": "independent skew right-multiplicative control",
+        "is_true_gauge": False,
+        "construction": "Apply W_i' = W_i @ exp(eps * A_i / ||A_i||_F) with random skew A_i independently.",
+        "honesty_note": (
+            "Skew right-multiplicative control perturbation. This is a control direction, not a "
+            "quotient-space physical tangent construction."
+        ),
+    },
+    "symmetric_legacy": {
+        "short_label": "legacy symmetric",
+        "display_label": "independent symmetric right-multiplicative (legacy non-gauge)",
+        "is_true_gauge": False,
+        "construction": "Apply W_i' = W_i @ (I + eps * S_i / ||S_i||_F) with random symmetric S_i independently.",
+        "honesty_note": (
+            "Retained legacy comparison. This changes the effective map at t=0, so it should not "
+            "be interpreted as a literal gauge-orbit perturbation."
+        ),
+    },
+}
+
+OPTIMIZER_METADATA: Dict[str, Dict[str, str]] = {
+    "sgd": {"display_name": "SGD", "label": "SGD with classical momentum"},
+    "muon": {"display_name": "Muon", "label": "Muon-style momentum + Newton-Schulz orthogonalization"},
+}
+
+
+def get_default_config() -> Dict[str, Any]:
+    """Return a fresh copy of the default configuration."""
+    return copy.deepcopy(DEFAULT_CONFIG)
+
+
+def get_perturbation_catalog() -> Dict[str, Dict[str, Any]]:
+    """Return a fresh copy of the perturbation metadata catalog."""
+    return copy.deepcopy(PERTURBATION_METADATA)
+
+
+def merge_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Merge configuration overrides into the defaults."""
+    config = get_default_config()
+    if overrides:
+        config.update(overrides)
+    return config
+
+
+def build_problem(config: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    """Construct the fixed target matrix and data batch using the legacy seed order."""
+    rng = np.random.RandomState(config["seed_global"])
+    dim = config["dim"]
+    batch_size = config["batch_size"]
+    w_target = rng.randn(dim, dim) * 0.5
+    x_data = rng.randn(dim, batch_size) * 0.3
+    return {"W_target": w_target, "X_data": x_data}
+
+
+def init_weights(num_layers: int, dim: int, seed: int = 42) -> List[np.ndarray]:
+    """Initialize each layer near identity for stability."""
     rng = np.random.RandomState(seed)
-    weights = []
+    weights: List[np.ndarray] = []
     for _ in range(num_layers):
-        W = np.eye(DIM) + rng.randn(DIM, DIM) * 0.1
-        weights.append(W.copy())
+        weights.append(np.eye(dim) + rng.randn(dim, dim) * 0.1)
     return weights
 
 
-def forward(weights, X):
-    """Forward pass: W_L @ ... @ W_1 @ X."""
-    out = X.copy()
-    for W in weights:
-        out = W @ out
+def forward(weights: List[np.ndarray], x_data: np.ndarray) -> np.ndarray:
+    """Forward pass: W_L @ ... @ W_1 @ X for the stored layer order."""
+    out = x_data.copy()
+    for weight in weights:
+        out = weight @ out
     return out
 
 
-def compute_loss(weights, X, target):
-    """Loss = 0.5 * ||W_product @ X - T @ X||^2 / N."""
-    pred = forward(weights, X)
-    target_out = target @ X
+def effective_weight(weights: List[np.ndarray]) -> np.ndarray:
+    """Compute the end-to-end effective matrix W_eff = W_L ... W_1."""
+    dim = weights[0].shape[0]
+    w_eff = np.eye(dim)
+    for weight in weights:
+        w_eff = weight @ w_eff
+    return w_eff
+
+
+def compute_loss(weights: List[np.ndarray], x_data: np.ndarray, target: np.ndarray) -> float:
+    """Quadratic loss on the fixed batch."""
+    pred = forward(weights, x_data)
+    target_out = target @ x_data
     diff = pred - target_out
-    return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
+    return float(0.5 * np.mean(np.sum(diff ** 2, axis=0)))
 
 
-def compute_gradients(weights, X, target):
-    """Backprop through deep linear net."""
+def compute_gradients(weights: List[np.ndarray], x_data: np.ndarray, target: np.ndarray) -> List[np.ndarray]:
+    """Backpropagate through the deep linear network."""
     num_layers = len(weights)
-    N = X.shape[1]
+    batch_size = x_data.shape[1]
 
-    # Forward pass storing activations
-    activations = [X.copy()]
-    out = X.copy()
-    for W in weights:
-        out = W @ out
+    activations = [x_data.copy()]
+    out = x_data.copy()
+    for weight in weights:
+        out = weight @ out
         activations.append(out.copy())
 
-    # Backward pass
-    target_out = target @ X
-    delta = (activations[-1] - target_out) / N
+    target_out = target @ x_data
+    delta = (activations[-1] - target_out) / batch_size
 
-    grads = []
-    for i in range(num_layers - 1, -1, -1):
-        G = delta @ activations[i].T
-        grads.insert(0, G)
-        if i > 0:
-            delta = weights[i].T @ delta
-
+    grads: List[np.ndarray] = []
+    for idx in range(num_layers - 1, -1, -1):
+        grad = delta @ activations[idx].T
+        grads.insert(0, grad)
+        if idx > 0:
+            delta = weights[idx].T @ delta
     return grads
 
 
-def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
-    """
-    Newton-Schulz iteration to approximate the orthogonal polar factor.
-    Returns closest orthogonal matrix to G (i.e., U @ V^T from SVD).
-    """
-    norm = np.linalg.norm(G, ord='fro')
+def newton_schulz_orthogonalize(grad: np.ndarray, num_iters: int = 5) -> np.ndarray:
+    """Approximate the orthogonal polar factor of grad via Newton-Schulz iteration."""
+    norm = np.linalg.norm(grad, ord="fro")
     if norm < 1e-12:
-        return G
-    X = G / norm
+        return grad.copy()
 
+    x_mat = grad / norm
     for _ in range(num_iters):
-        A = X.T @ X
-        X = 1.5 * X - 0.5 * X @ A
-
-    return X
-
-
-def find_stable_lr_sgd():
-    """Find maximum stable SGD learning rate."""
-    candidates = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001]
-    for lr in candidates:
-        np.random.seed(42)
-        weights = init_weights(NUM_LAYERS)
-        velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
-        initial_loss = compute_loss(weights, X_data, W_target)
-        stable = True
-        for step in range(80):
-            grads = compute_gradients(weights, X_data, W_target)
-            for i in range(NUM_LAYERS):
-                velocities[i] = MOMENTUM * velocities[i] + grads[i]
-                weights[i] -= lr * velocities[i]
-            loss = compute_loss(weights, X_data, W_target)
-            if np.isnan(loss) or loss > initial_loss * 50:
-                stable = False
-                break
-        if stable:
-            return lr
-    return 0.001
+        a_mat = x_mat.T @ x_mat
+        x_mat = 1.5 * x_mat - 0.5 * x_mat @ a_mat
+    return x_mat
 
 
-def random_symmetric(dim, rng):
+def random_symmetric(dim: int, rng: np.random.RandomState) -> np.ndarray:
     """Generate a random symmetric matrix."""
-    A = rng.randn(dim, dim)
-    return (A + A.T) / 2.0
+    mat = rng.randn(dim, dim)
+    return 0.5 * (mat + mat.T)
 
 
-def random_skew_symmetric(dim, rng):
+def random_skew_symmetric(dim: int, rng: np.random.RandomState) -> np.ndarray:
     """Generate a random skew-symmetric matrix."""
-    A = rng.randn(dim, dim)
-    return (A - A.T) / 2.0
+    mat = rng.randn(dim, dim)
+    return 0.5 * (mat - mat.T)
 
 
-def matrix_exponential_pade(A, order=6):
-    """
-    Compute matrix exponential via scaling-and-squaring with Pade approximation.
-    For small ||A||, direct Pade is accurate. For larger ||A||, we scale down first.
-    """
-    norm_A = np.linalg.norm(A, ord='fro')
-    if norm_A < 1e-15:
-        return np.eye(A.shape[0])
+def matrix_exponential_pade(mat: np.ndarray, order: int = 6) -> np.ndarray:
+    """Matrix exponential by scaling-and-squaring with a [order/order] Pade approximant."""
+    norm_mat = np.linalg.norm(mat, ord="fro")
+    if norm_mat < 1e-15:
+        return np.eye(mat.shape[0])
 
-    # Scaling: find s such that ||A/2^s|| < 1
-    s = max(0, int(np.ceil(np.log2(norm_A + 1e-15))))
-    A_scaled = A / (2 ** s)
+    scale = max(0, int(np.ceil(np.log2(norm_mat + 1e-15))))
+    mat_scaled = mat / (2 ** scale)
 
-    # Pade [order/order] approximant
-    I = np.eye(A.shape[0])
-    N_pade = I.copy()
-    D_pade = I.copy()
-    A_power = I.copy()
-    c = 1.0
+    ident = np.eye(mat.shape[0])
+    numer = ident.copy()
+    denom = ident.copy()
+    mat_power = ident.copy()
+    coeff = 1.0
 
-    for k in range(1, order + 1):
-        c *= (order - k + 1) / (k * (2 * order - k + 1))
-        A_power = A_power @ A_scaled
-        N_pade += c * A_power
-        D_pade += ((-1) ** k) * c * A_power
+    for k_idx in range(1, order + 1):
+        coeff *= (order - k_idx + 1) / (k_idx * (2 * order - k_idx + 1))
+        mat_power = mat_power @ mat_scaled
+        numer += coeff * mat_power
+        denom += ((-1) ** k_idx) * coeff * mat_power
 
-    # expm(A_scaled) ~ D^{-1} N
-    result = np.linalg.solve(D_pade, N_pade)
-
-    # Squaring phase
-    for _ in range(s):
+    result = np.linalg.solve(denom, numer)
+    for _ in range(scale):
         result = result @ result
-
     return result
 
 
-# =============================================================================
-# OPTIMIZER STEP FUNCTIONS
-# =============================================================================
-
-def sgd_step(weights, velocities, lr):
-    """One step of SGD with momentum."""
-    grads = compute_gradients(weights, X_data, W_target)
-    for i in range(len(weights)):
-        velocities[i] = MOMENTUM * velocities[i] + grads[i]
-        weights[i] = weights[i] - lr * velocities[i]
+def sgd_step(
+    weights: List[np.ndarray],
+    velocities: List[np.ndarray],
+    lr: float,
+    x_data: np.ndarray,
+    target: np.ndarray,
+    momentum: float,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """One step of SGD with classical momentum."""
+    grads = compute_gradients(weights, x_data, target)
+    for idx in range(len(weights)):
+        velocities[idx] = momentum * velocities[idx] + grads[idx]
+        weights[idx] = weights[idx] - lr * velocities[idx]
     return weights, velocities
 
 
-def muon_step(weights, velocities, lr):
-    """One step of Muon with momentum."""
-    grads = compute_gradients(weights, X_data, W_target)
-    for i in range(len(weights)):
-        ortho_grad = newton_schulz_orthogonalize(grads[i])
-        velocities[i] = MOMENTUM * velocities[i] + ortho_grad
-        weights[i] = weights[i] - lr * velocities[i]
+def muon_step(
+    weights: List[np.ndarray],
+    velocities: List[np.ndarray],
+    lr: float,
+    x_data: np.ndarray,
+    target: np.ndarray,
+    momentum: float,
+    ns_iters: int,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """One step of the Muon-style update."""
+    grads = compute_gradients(weights, x_data, target)
+    for idx in range(len(weights)):
+        ortho_grad = newton_schulz_orthogonalize(grads[idx], num_iters=ns_iters)
+        velocities[idx] = momentum * velocities[idx] + ortho_grad
+        weights[idx] = weights[idx] - lr * velocities[idx]
     return weights, velocities
 
 
-# =============================================================================
-# LYAPUNOV MEASUREMENT ENGINE
-# =============================================================================
+def run_trajectory(
+    weights_init: List[np.ndarray],
+    optimizer: str,
+    lr: float,
+    num_steps: int,
+    x_data: np.ndarray,
+    target: np.ndarray,
+    momentum: float,
+    ns_iters: int,
+    divergence_loss_threshold: float,
+) -> Dict[str, Any]:
+    """Run an optimizer trajectory and retain all weight snapshots and losses."""
+    weights = [weight.copy() for weight in weights_init]
+    velocities = [np.zeros_like(weight) for weight in weights]
 
-def run_trajectory(weights_init, optimizer, lr, num_steps):
-    """
-    Run optimizer for num_steps from weights_init.
-    Returns list of weight snapshots at each step (including step 0).
-    """
-    weights = [w.copy() for w in weights_init]
-    velocities = [np.zeros_like(w) for w in weights]
-
-    trajectory = [[w.copy() for w in weights]]
+    trajectory: List[List[np.ndarray]] = [[weight.copy() for weight in weights]]
+    losses: List[float] = [compute_loss(weights, x_data, target)]
+    diverged = False
 
     for step in range(num_steps):
-        if optimizer == 'sgd':
-            weights, velocities = sgd_step(weights, velocities, lr)
-        elif optimizer == 'muon':
-            weights, velocities = muon_step(weights, velocities, lr)
+        if optimizer == "sgd":
+            weights, velocities = sgd_step(weights, velocities, lr, x_data, target, momentum)
+        elif optimizer == "muon":
+            weights, velocities = muon_step(weights, velocities, lr, x_data, target, momentum, ns_iters)
         else:
             raise ValueError(f"Unknown optimizer: {optimizer}")
 
-        trajectory.append([w.copy() for w in weights])
+        loss = compute_loss(weights, x_data, target)
+        losses.append(loss)
+        trajectory.append([weight.copy() for weight in weights])
 
-        # Check for divergence
-        loss = compute_loss(weights, X_data, W_target)
-        if np.isnan(loss) or loss > 1e10:
-            # Pad remaining with last valid state
+        if np.isnan(loss) or loss > divergence_loss_threshold:
+            diverged = True
             for _ in range(num_steps - step - 1):
-                trajectory.append([w.copy() for w in weights])
+                losses.append(loss)
+                trajectory.append([weight.copy() for weight in weights])
             break
 
-    return trajectory
+    return {
+        "trajectory": trajectory,
+        "losses": np.asarray(losses, dtype=float),
+        "diverged": diverged,
+    }
 
 
-def compute_trajectory_distance(traj_a, traj_b):
-    """
-    Compute d(t) = ||W_t^a - W_t^b||_F (summed over all layers) at each timestep.
-    """
-    num_steps = min(len(traj_a), len(traj_b))
-    distances = []
-    for t in range(num_steps):
-        d = 0.0
-        for i in range(len(traj_a[t])):
-            d += np.linalg.norm(traj_a[t][i] - traj_b[t][i], 'fro') ** 2
-        distances.append(np.sqrt(d))
-    return np.array(distances)
+def compute_weight_distance(traj_a: List[List[np.ndarray]], traj_b: List[List[np.ndarray]]) -> np.ndarray:
+    """Compute stacked-weight Frobenius distance d_W(t)."""
+    num_times = min(len(traj_a), len(traj_b))
+    distances: List[float] = []
+    for time_idx in range(num_times):
+        accum = 0.0
+        for layer_idx in range(len(traj_a[time_idx])):
+            accum += np.linalg.norm(traj_a[time_idx][layer_idx] - traj_b[time_idx][layer_idx], ord="fro") ** 2
+        distances.append(math.sqrt(accum))
+    return np.asarray(distances, dtype=float)
 
 
-def compute_per_layer_distances(traj_a, traj_b):
-    """Compute per-layer distances over time."""
-    num_steps = min(len(traj_a), len(traj_b))
+def compute_effective_distance(traj_a: List[List[np.ndarray]], traj_b: List[List[np.ndarray]]) -> np.ndarray:
+    """Compute effective-map Frobenius distance d_F(t) = ||W_eff' - W_eff||_F."""
+    num_times = min(len(traj_a), len(traj_b))
+    distances: List[float] = []
+    for time_idx in range(num_times):
+        w_eff_a = effective_weight(traj_a[time_idx])
+        w_eff_b = effective_weight(traj_b[time_idx])
+        distances.append(float(np.linalg.norm(w_eff_a - w_eff_b, ord="fro")))
+    return np.asarray(distances, dtype=float)
+
+
+def compute_per_layer_distances(traj_a: List[List[np.ndarray]], traj_b: List[List[np.ndarray]]) -> np.ndarray:
+    """Compute per-layer Frobenius distances over time."""
+    num_times = min(len(traj_a), len(traj_b))
     num_layers = len(traj_a[0])
-    per_layer = np.zeros((num_layers, num_steps))
-    for t in range(num_steps):
-        for i in range(num_layers):
-            per_layer[i, t] = np.linalg.norm(traj_a[t][i] - traj_b[t][i], 'fro')
+    per_layer = np.zeros((num_layers, num_times), dtype=float)
+    for time_idx in range(num_times):
+        for layer_idx in range(num_layers):
+            per_layer[layer_idx, time_idx] = np.linalg.norm(
+                traj_a[time_idx][layer_idx] - traj_b[time_idx][layer_idx], ord="fro"
+            )
     return per_layer
 
 
-def measure_lyapunov(optimizer, lr, perturbation_type, num_perturbations, seed_base=100):
-    """
-    Measure Lyapunov exponent for a given optimizer and perturbation type.
-
-    perturbation_type: 'gauge' (symmetric/PSD) or 'physical' (skew-symmetric/tangent)
-
-    Returns:
-      lyapunov_exponents: array of shape (num_perturbations,)
-      all_distances: list of distance arrays for plotting
-      d0_values: initial distances
-      dN_values: final distances
-    """
-    # Initialize base weights
-    np.random.seed(42)
-    weights_base = init_weights(NUM_LAYERS)
-
-    # Run base trajectory once
-    traj_base = run_trajectory(weights_base, optimizer, lr, NUM_STEPS)
-
-    lyapunov_exponents = []
-    all_distances = []
-    d0_values = []
-    dN_values = []
-
-    for p in range(num_perturbations):
-        rng_pert = np.random.RandomState(seed_base + p)
-
-        # Create perturbed initial weights
-        weights_perturbed = []
-        for layer_idx in range(NUM_LAYERS):
-            W0 = weights_base[layer_idx].copy()
-
-            if perturbation_type == 'gauge':
-                # Gauge direction: W' = W @ (I + eps * S / ||S||_F)
-                # S is symmetric => (I + eps*S) is approximately PSD for small eps
-                S = random_symmetric(DIM, rng_pert)
-                S = S / np.linalg.norm(S, 'fro')
-                W_pert = W0 @ (np.eye(DIM) + EPSILON * S)
-            elif perturbation_type == 'physical':
-                # Physical/tangent direction: W' = W @ expm(eps * A / ||A||_F)
-                # A is skew-symmetric => expm(A) is orthogonal
-                A = random_skew_symmetric(DIM, rng_pert)
-                A = A / np.linalg.norm(A, 'fro')
-                R = matrix_exponential_pade(EPSILON * A)
-                W_pert = W0 @ R
-            else:
-                raise ValueError(f"Unknown perturbation type: {perturbation_type}")
-
-            weights_perturbed.append(W_pert)
-
-        # Run perturbed trajectory
-        traj_perturbed = run_trajectory(weights_perturbed, optimizer, lr, NUM_STEPS)
-
-        # Compute distances
-        distances = compute_trajectory_distance(traj_base, traj_perturbed)
-        all_distances.append(distances)
-
-        d0 = distances[0]
-        dN = distances[-1]
-        d0_values.append(d0)
-        dN_values.append(dN)
-
-        # Lyapunov exponent: lambda = (1/N) * log(d(N) / d(0))
-        if d0 > 1e-15 and dN > 1e-15:
-            lyap = (1.0 / NUM_STEPS) * np.log(dN / d0)
-        elif dN < 1e-15:
-            lyap = -np.inf  # Perturbation collapsed
-        else:
-            lyap = np.nan
-
-        lyapunov_exponents.append(lyap)
-
-    return (np.array(lyapunov_exponents), all_distances,
-            np.array(d0_values), np.array(dN_values))
+def finite_time_growth(
+    distances: np.ndarray,
+    num_steps: int,
+    d0_floor: float = 1e-15,
+    dN_floor: float = 1e-15,
+) -> float:
+    """Compute the finite-time log growth rate (1/N) log(d_N / d_0) when the endpoints are meaningful."""
+    d0 = float(distances[0])
+    dN = float(distances[-1])
+    if d0 > d0_floor and dN > dN_floor:
+        return float((1.0 / num_steps) * np.log(dN / d0))
+    if dN <= dN_floor:
+        return float(-np.inf)
+    return float(np.nan)
 
 
-# =============================================================================
-# MAIN EXPERIMENT
-# =============================================================================
+def summarize_samples(samples: np.ndarray) -> Dict[str, Any]:
+    """Summarize a vector of samples, ignoring non-finite entries in moment estimates."""
+    sample_array = np.asarray(samples, dtype=float)
+    finite = sample_array[np.isfinite(sample_array)]
+    summary: Dict[str, Any] = {
+        "n_total": int(sample_array.size),
+        "n_valid": int(finite.size),
+        "n_invalid": int(sample_array.size - finite.size),
+    }
+    if finite.size == 0:
+        summary.update(
+            {
+                "mean": float("nan"),
+                "median": float("nan"),
+                "std": float("nan"),
+                "ci95": float("nan"),
+                "min": float("nan"),
+                "max": float("nan"),
+            }
+        )
+        return summary
 
-print("=" * 100)
-print("1.2b-i: LYAPUNOV EXPONENT OF GAUGE DIRECTION UNDER EACH OPTIMIZER")
-print("=" * 100)
-print(f"Setup: {NUM_LAYERS}-layer deep linear net (dim={DIM}), quadratic loss, {NUM_STEPS} steps")
-print(f"Perturbation: eps={EPSILON}, {NUM_PERTURBATIONS} random directions")
-print(f"LR_Muon={LR_MUON}, Momentum={MOMENTUM}")
-print("=" * 100)
-
-# Find stable SGD learning rate
-lr_sgd = find_stable_lr_sgd()
-print(f"\nSGD learning rate (max stable): {lr_sgd}")
-print(f"Muon learning rate (fixed):     {LR_MUON}")
-
-# Verify both optimizers train properly
-np.random.seed(42)
-w_test = init_weights(NUM_LAYERS)
-loss_init = compute_loss(w_test, X_data, W_target)
-print(f"\nInitial loss: {loss_init:.6e}")
-
-# Quick check: run both optimizers
-for opt_name, opt_type, lr in [('SGD', 'sgd', lr_sgd), ('Muon', 'muon', LR_MUON)]:
-    np.random.seed(42)
-    w_check = init_weights(NUM_LAYERS)
-    traj_check = run_trajectory(w_check, opt_type, lr, NUM_STEPS)
-    loss_final = compute_loss(traj_check[-1], X_data, W_target)
-    print(f"  {opt_name} final loss after {NUM_STEPS} steps: {loss_final:.6e}")
+    std = float(np.std(finite, ddof=1)) if finite.size > 1 else 0.0
+    ci95 = float(1.96 * std / math.sqrt(finite.size)) if finite.size > 1 else 0.0
+    summary.update(
+        {
+            "mean": float(np.mean(finite)),
+            "median": float(np.median(finite)),
+            "std": std,
+            "ci95": ci95,
+            "min": float(np.min(finite)),
+            "max": float(np.max(finite)),
+        }
+    )
+    return summary
 
 
-# =============================================================================
-# MEASURE LYAPUNOV EXPONENTS
-# =============================================================================
+def classify_growth(value: float, tol: float = 1e-3) -> str:
+    """Qualitative sign label for a finite-time exponent estimate."""
+    if not np.isfinite(value):
+        return "INVALID"
+    if value < -tol:
+        return "DECAY"
+    if value > tol:
+        return "GROW"
+    return "NEUTRAL"
 
-print(f"\n{'=' * 100}")
-print("MEASURING LYAPUNOV EXPONENTS")
-print("=" * 100)
 
-results = {}
+def _normalize_fro(mat: np.ndarray) -> np.ndarray:
+    """Return mat scaled to unit Frobenius norm when possible."""
+    return mat / max(np.linalg.norm(mat, ord="fro"), 1e-12)
 
-for opt_name, opt_type, lr in [('SGD', 'sgd', lr_sgd), ('Muon', 'muon', LR_MUON)]:
-    for pert_name, pert_type in [('gauge', 'gauge'), ('physical', 'physical')]:
-        key = f"{opt_name}_{pert_name}"
-        print(f"\n  Running {opt_name} with {pert_name} perturbation "
-              f"({NUM_PERTURBATIONS} trials)...", flush=True)
 
-        lyaps, dists, d0s, dNs = measure_lyapunov(
-            opt_type, lr, pert_type, NUM_PERTURBATIONS
+def coupled_gauge_preserving_perturbation(
+    weights_base: List[np.ndarray],
+    epsilon: float,
+    rng: np.random.RandomState,
+) -> Tuple[List[np.ndarray], Dict[str, Any]]:
+    """Apply an exact hidden-basis reparameterization that preserves the deep linear product."""
+    dim = weights_base[0].shape[0]
+    num_layers = len(weights_base)
+    ident = np.eye(dim)
+
+    transforms: List[np.ndarray] = []
+    inverses: List[np.ndarray] = []
+    condition_numbers: List[float] = []
+    generator_norms: List[float] = []
+
+    for _ in range(num_layers - 1):
+        sym = _normalize_fro(random_symmetric(dim, rng))
+        gauge_transform = ident + epsilon * sym
+        gauge_inverse = np.linalg.inv(gauge_transform)
+        transforms.append(gauge_transform)
+        inverses.append(gauge_inverse)
+        condition_numbers.append(float(np.linalg.cond(gauge_transform)))
+        generator_norms.append(float(np.linalg.norm(sym, ord="fro")))
+
+    perturbed: List[np.ndarray] = []
+    for idx, weight in enumerate(weights_base):
+        left = transforms[idx] if idx < num_layers - 1 else ident
+        right = inverses[idx - 1] if idx > 0 else ident
+        perturbed.append(left @ weight @ right)
+
+    return perturbed, {
+        "family": "coupled_hidden_basis_change",
+        "num_hidden_transforms": int(num_layers - 1),
+        "transform_condition_numbers": condition_numbers,
+        "generator_fro_norms": generator_norms,
+    }
+
+
+def independent_symmetric_legacy_perturbation(
+    weights_base: List[np.ndarray],
+    epsilon: float,
+    rng: np.random.RandomState,
+) -> Tuple[List[np.ndarray], Dict[str, Any]]:
+    """Apply the original non-gauge independent symmetric right-multiplicative perturbation."""
+    dim = weights_base[0].shape[0]
+    perturbed: List[np.ndarray] = []
+    generator_norms: List[float] = []
+    for weight in weights_base:
+        sym = _normalize_fro(random_symmetric(dim, rng))
+        perturbed_weight = weight @ (np.eye(dim) + epsilon * sym)
+        perturbed.append(perturbed_weight)
+        generator_norms.append(float(np.linalg.norm(sym, ord="fro")))
+    return perturbed, {
+        "family": "independent_right_multiplicative_symmetric",
+        "generator_fro_norms": generator_norms,
+    }
+
+
+def independent_skew_control_perturbation(
+    weights_base: List[np.ndarray],
+    epsilon: float,
+    rng: np.random.RandomState,
+) -> Tuple[List[np.ndarray], Dict[str, Any]]:
+    """Apply the independent skew right-multiplicative control perturbation."""
+    dim = weights_base[0].shape[0]
+    perturbed: List[np.ndarray] = []
+    generator_norms: List[float] = []
+    orthogonality_errors: List[float] = []
+    for weight in weights_base:
+        skew = _normalize_fro(random_skew_symmetric(dim, rng))
+        rotation = matrix_exponential_pade(epsilon * skew)
+        perturbed_weight = weight @ rotation
+        perturbed.append(perturbed_weight)
+        generator_norms.append(float(np.linalg.norm(skew, ord="fro")))
+        orthogonality_errors.append(float(np.linalg.norm(rotation.T @ rotation - np.eye(dim), ord="fro")))
+    return perturbed, {
+        "family": "independent_right_multiplicative_skew",
+        "generator_fro_norms": generator_norms,
+        "rotation_orthogonality_errors": orthogonality_errors,
+    }
+
+
+def perturb_weights(
+    weights_base: List[np.ndarray],
+    perturbation_type: str,
+    epsilon: float,
+    rng: np.random.RandomState,
+) -> Tuple[List[np.ndarray], Dict[str, Any]]:
+    """Construct a perturbed copy of the base weights and lightweight construction diagnostics."""
+    if perturbation_type == "gauge":
+        return coupled_gauge_preserving_perturbation(weights_base, epsilon, rng)
+    if perturbation_type == "physical":
+        return independent_skew_control_perturbation(weights_base, epsilon, rng)
+    if perturbation_type == "symmetric_legacy":
+        return independent_symmetric_legacy_perturbation(weights_base, epsilon, rng)
+    raise ValueError(f"Unknown perturbation type: {perturbation_type}")
+
+
+def find_stable_lr_sgd(config: Dict[str, Any], problem: Dict[str, np.ndarray]) -> Tuple[float, List[Dict[str, Any]]]:
+    """Reproduce the legacy search for the largest empirically stable SGD learning rate."""
+    diagnostics: List[Dict[str, Any]] = []
+    dim = config["dim"]
+    num_layers = config["num_layers"]
+    momentum = config["momentum"]
+    x_data = problem["X_data"]
+    target = problem["W_target"]
+
+    for lr in config["sgd_lr_candidates"]:
+        weights = init_weights(num_layers, dim, seed=config["seed_init"])
+        velocities = [np.zeros((dim, dim)) for _ in range(num_layers)]
+        initial_loss = compute_loss(weights, x_data, target)
+        stable = True
+        final_loss = initial_loss
+
+        for _ in range(config["lr_stability_steps"]):
+            weights, velocities = sgd_step(weights, velocities, lr, x_data, target, momentum)
+            final_loss = compute_loss(weights, x_data, target)
+            if np.isnan(final_loss) or final_loss > initial_loss * config["lr_stability_multiplier"]:
+                stable = False
+                break
+
+        diagnostics.append(
+            {
+                "lr": float(lr),
+                "stable": bool(stable),
+                "initial_loss": float(initial_loss),
+                "final_loss": float(final_loss),
+            }
+        )
+        if stable:
+            return float(lr), diagnostics
+
+    fallback = float(config["sgd_lr_candidates"][-1])
+    return fallback, diagnostics
+
+
+def run_training_checks(config: Dict[str, Any], problem: Dict[str, np.ndarray], lr_sgd: float) -> Dict[str, Any]:
+    """Run a training sanity check for each optimizer using the default trajectory length."""
+    checks: Dict[str, Any] = {}
+    dim = config["dim"]
+    num_layers = config["num_layers"]
+    x_data = problem["X_data"]
+    target = problem["W_target"]
+
+    for optimizer_key, lr in [("sgd", lr_sgd), ("muon", config["lr_muon"] )]:
+        weights_init = init_weights(num_layers, dim, seed=config["seed_init"])
+        run = run_trajectory(
+            weights_init=weights_init,
+            optimizer=optimizer_key,
+            lr=lr,
+            num_steps=config["num_steps"],
+            x_data=x_data,
+            target=target,
+            momentum=config["momentum"],
+            ns_iters=config["ns_iters"],
+            divergence_loss_threshold=config["divergence_loss_threshold"],
+        )
+        losses = np.asarray(run["losses"], dtype=float)
+        checks[optimizer_key] = {
+            "optimizer_key": optimizer_key,
+            "optimizer_name": OPTIMIZER_METADATA[optimizer_key]["display_name"],
+            "learning_rate": float(lr),
+            "initial_loss": float(losses[0]),
+            "final_loss": float(losses[-1]),
+            "loss_ratio": float(losses[-1] / losses[0]),
+            "diverged": bool(run["diverged"]),
+            "losses": losses,
+        }
+    return checks
+
+
+def build_base_run(
+    optimizer_key: str,
+    lr: float,
+    config: Dict[str, Any],
+    problem: Dict[str, np.ndarray],
+) -> Dict[str, Any]:
+    """Run and cache the unperturbed baseline trajectory for one optimizer."""
+    weights_base = init_weights(config["num_layers"], config["dim"], seed=config["seed_init"])
+    base_run = run_trajectory(
+        weights_init=weights_base,
+        optimizer=optimizer_key,
+        lr=lr,
+        num_steps=config["num_steps"],
+        x_data=problem["X_data"],
+        target=problem["W_target"],
+        momentum=config["momentum"],
+        ns_iters=config["ns_iters"],
+        divergence_loss_threshold=config["divergence_loss_threshold"],
+    )
+    return {"weights_base": weights_base, "base_run": base_run}
+
+
+def measure_condition(
+    optimizer_key: str,
+    lr: float,
+    perturbation_type: str,
+    config: Dict[str, Any],
+    problem: Dict[str, np.ndarray],
+    weights_base: List[np.ndarray],
+    base_run: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Measure finite-time perturbation sensitivity for one optimizer/perturbation pair."""
+    num_layers = config["num_layers"]
+    num_steps = config["num_steps"]
+    num_perturbations = config["num_perturbations"]
+    epsilon = config["epsilon"]
+    x_data = problem["X_data"]
+    target = problem["W_target"]
+
+    traj_base = base_run["trajectory"]
+    base_losses = np.asarray(base_run["losses"], dtype=float)
+    base_initial_loss = float(base_losses[0])
+    base_effective = effective_weight(weights_base)
+    base_effective_norm = float(np.linalg.norm(base_effective, ord="fro"))
+    base_output = base_effective @ x_data
+    base_output_norm = float(np.linalg.norm(base_output, ord="fro"))
+
+    lambda_w_all: List[float] = []
+    lambda_f_all: List[float] = []
+    lambda_l_all: List[float] = []
+    layer_lambda_all: List[np.ndarray] = []
+    distances_w_all: List[np.ndarray] = []
+    distances_f_all: List[np.ndarray] = []
+    d0_w: List[float] = []
+    dN_w: List[float] = []
+    d0_f: List[float] = []
+    dN_f: List[float] = []
+    init_eff_abs_all: List[float] = []
+    init_eff_rel_all: List[float] = []
+    init_output_rel_all: List[float] = []
+    init_loss_gap_all: List[float] = []
+    trial_records: List[Dict[str, Any]] = []
+    representative_trial: Optional[Dict[str, Any]] = None
+
+    for trial_idx in range(num_perturbations):
+        trial_seed = int(config["seed_perturb_base"] + trial_idx)
+        rng = np.random.RandomState(trial_seed)
+        weights_perturbed, construction_diagnostics = perturb_weights(weights_base, perturbation_type, epsilon, rng)
+
+        perturbed_effective = effective_weight(weights_perturbed)
+        init_eff_abs = float(np.linalg.norm(perturbed_effective - base_effective, ord="fro"))
+        init_eff_rel = float(init_eff_abs / max(base_effective_norm, 1e-12))
+        init_output_rel = float(
+            np.linalg.norm((perturbed_effective - base_effective) @ x_data, ord="fro") / max(base_output_norm, 1e-12)
+        )
+        perturbed_initial_loss = compute_loss(weights_perturbed, x_data, target)
+        init_loss_gap = float(abs(perturbed_initial_loss - base_initial_loss))
+
+        perturbed_run = run_trajectory(
+            weights_init=weights_perturbed,
+            optimizer=optimizer_key,
+            lr=lr,
+            num_steps=num_steps,
+            x_data=x_data,
+            target=target,
+            momentum=config["momentum"],
+            ns_iters=config["ns_iters"],
+            divergence_loss_threshold=config["divergence_loss_threshold"],
+        )
+        traj_perturbed = perturbed_run["trajectory"]
+
+        dist_w = compute_weight_distance(traj_base, traj_perturbed)
+        dist_f = compute_effective_distance(traj_base, traj_perturbed)
+        per_layer_dist = compute_per_layer_distances(traj_base, traj_perturbed)
+        layer_lambdas = np.asarray(
+            [finite_time_growth(per_layer_dist[layer_idx], num_steps) for layer_idx in range(num_layers)],
+            dtype=float,
+        )
+        finite_layers = layer_lambdas[np.isfinite(layer_lambdas)]
+        lambda_l = float(np.mean(finite_layers)) if finite_layers.size > 0 else float("nan")
+
+        lambda_w = finite_time_growth(dist_w, num_steps)
+        lambda_f = finite_time_growth(
+            dist_f,
+            num_steps,
+            d0_floor=MAP_PRESERVATION_ABS_TOL if PERTURBATION_METADATA[perturbation_type]["is_true_gauge"] else 1e-15,
         )
 
-        # Filter out any inf/nan
-        valid_mask = np.isfinite(lyaps)
-        lyaps_valid = lyaps[valid_mask]
+        lambda_w_all.append(lambda_w)
+        lambda_f_all.append(lambda_f)
+        lambda_l_all.append(lambda_l)
+        layer_lambda_all.append(layer_lambdas)
+        distances_w_all.append(dist_w)
+        distances_f_all.append(dist_f)
+        d0_w.append(float(dist_w[0]))
+        dN_w.append(float(dist_w[-1]))
+        d0_f.append(float(dist_f[0]))
+        dN_f.append(float(dist_f[-1]))
+        init_eff_abs_all.append(init_eff_abs)
+        init_eff_rel_all.append(init_eff_rel)
+        init_output_rel_all.append(init_output_rel)
+        init_loss_gap_all.append(init_loss_gap)
 
-        results[key] = {
-            'lyapunov_all': lyaps,
-            'lyapunov_valid': lyaps_valid,
-            'distances': dists,
-            'd0': d0s,
-            'dN': dNs,
-            'mean_lyap': np.mean(lyaps_valid) if len(lyaps_valid) > 0 else np.nan,
-            'std_lyap': np.std(lyaps_valid) if len(lyaps_valid) > 0 else np.nan,
-            'median_lyap': np.median(lyaps_valid) if len(lyaps_valid) > 0 else np.nan,
-        }
+        trial_records.append(
+            {
+                "trial_index": int(trial_idx),
+                "seed": trial_seed,
+                "lambda_W": float(lambda_w),
+                "lambda_F": float(lambda_f),
+                "lambda_L": float(lambda_l),
+                "lambda_L_per_layer": layer_lambdas.copy(),
+                "d0_W": float(dist_w[0]),
+                "dN_W": float(dist_w[-1]),
+                "d0_F": float(dist_f[0]),
+                "dN_F": float(dist_f[-1]),
+                "initial_effective_mismatch_abs": init_eff_abs,
+                "initial_effective_mismatch_rel": init_eff_rel,
+                "initial_output_mismatch_rel": init_output_rel,
+                "initial_loss_gap_abs": init_loss_gap,
+                "construction_diagnostics": construction_diagnostics,
+            }
+        )
 
-        print(f"    Valid trials: {len(lyaps_valid)}/{NUM_PERTURBATIONS}")
-        print(f"    Mean lambda:   {results[key]['mean_lyap']:.6f}")
-        print(f"    Median lambda: {results[key]['median_lyap']:.6f}")
-        print(f"    Std lambda:    {results[key]['std_lyap']:.6f}")
-        print(f"    Mean d(0):     {np.mean(d0s):.6e}")
-        print(f"    Mean d(N):     {np.mean(dNs):.6e}")
-        print(f"    Ratio d(N)/d(0): {np.mean(dNs)/np.mean(d0s):.4f}")
+        if representative_trial is None:
+            representative_trial = {
+                "trial_index": int(trial_idx),
+                "seed": trial_seed,
+                "distance_W": dist_w,
+                "distance_F": dist_f,
+                "per_layer_distances": per_layer_dist,
+                "lambda_L_per_layer": layer_lambdas,
+                "initial_effective_mismatch_abs": init_eff_abs,
+                "initial_effective_mismatch_rel": init_eff_rel,
+                "initial_output_mismatch_rel": init_output_rel,
+                "initial_loss_gap_abs": init_loss_gap,
+                "construction_diagnostics": construction_diagnostics,
+            }
+
+    lambda_w_arr = np.asarray(lambda_w_all, dtype=float)
+    lambda_f_arr = np.asarray(lambda_f_all, dtype=float)
+    lambda_l_arr = np.asarray(lambda_l_all, dtype=float)
+    layer_lambda_arr = np.asarray(layer_lambda_all, dtype=float)
+    d0_w_arr = np.asarray(d0_w, dtype=float)
+    dN_w_arr = np.asarray(dN_w, dtype=float)
+    d0_f_arr = np.asarray(d0_f, dtype=float)
+    dN_f_arr = np.asarray(dN_f, dtype=float)
+    init_eff_abs_arr = np.asarray(init_eff_abs_all, dtype=float)
+    init_eff_rel_arr = np.asarray(init_eff_rel_all, dtype=float)
+    init_output_rel_arr = np.asarray(init_output_rel_all, dtype=float)
+    init_loss_gap_arr = np.asarray(init_loss_gap_all, dtype=float)
+
+    summary = {
+        "lambda_W": summarize_samples(lambda_w_arr),
+        "lambda_F": summarize_samples(lambda_f_arr),
+        "lambda_L": summarize_samples(lambda_l_arr),
+        "lambda_W_class": classify_growth(float(np.nanmean(lambda_w_arr[np.isfinite(lambda_w_arr)])))
+        if np.any(np.isfinite(lambda_w_arr))
+        else "INVALID",
+        "lambda_F_class": classify_growth(float(np.nanmean(lambda_f_arr[np.isfinite(lambda_f_arr)])))
+        if np.any(np.isfinite(lambda_f_arr))
+        else "INVALID",
+        "lambda_L_class": classify_growth(float(np.nanmean(lambda_l_arr[np.isfinite(lambda_l_arr)])))
+        if np.any(np.isfinite(lambda_l_arr))
+        else "INVALID",
+        "mean_d0_W": float(np.mean(d0_w_arr)),
+        "mean_dN_W": float(np.mean(dN_w_arr)),
+        "mean_d0_F": float(np.mean(d0_f_arr)),
+        "mean_dN_F": float(np.mean(dN_f_arr)),
+        "mean_ratio_W": float(np.mean(dN_w_arr) / np.mean(d0_w_arr)) if np.mean(d0_w_arr) > 0 else float("nan"),
+        "mean_ratio_F": float(np.mean(dN_f_arr) / np.mean(d0_f_arr)) if np.mean(d0_f_arr) > 0 else float("nan"),
+    }
+
+    initial_diagnostics = {
+        "base_effective_norm": base_effective_norm,
+        "base_output_norm": base_output_norm,
+        "base_initial_loss": base_initial_loss,
+        "initial_effective_mismatch_abs": summarize_samples(init_eff_abs_arr),
+        "initial_effective_mismatch_rel": summarize_samples(init_eff_rel_arr),
+        "initial_output_mismatch_rel": summarize_samples(init_output_rel_arr),
+        "initial_loss_gap_abs": summarize_samples(init_loss_gap_arr),
+        "max_initial_effective_mismatch_abs": float(np.max(init_eff_abs_arr)),
+        "max_initial_effective_mismatch_rel": float(np.max(init_eff_rel_arr)),
+        "map_preservation_abs_tol": MAP_PRESERVATION_ABS_TOL,
+        "map_preservation_rel_tol": MAP_PRESERVATION_REL_TOL,
+        "preserves_effective_map_within_tol": bool(
+            np.max(init_eff_abs_arr) <= MAP_PRESERVATION_ABS_TOL
+            and np.max(init_eff_rel_arr) <= MAP_PRESERVATION_REL_TOL
+        ),
+    }
+
+    return {
+        "optimizer_key": optimizer_key,
+        "optimizer_name": OPTIMIZER_METADATA[optimizer_key]["display_name"],
+        "optimizer_label": OPTIMIZER_METADATA[optimizer_key]["label"],
+        "learning_rate": float(lr),
+        "perturbation_type": perturbation_type,
+        "perturbation_metadata": copy.deepcopy(PERTURBATION_METADATA[perturbation_type]),
+        "lambda_W_all": lambda_w_arr,
+        "lambda_F_all": lambda_f_arr,
+        "lambda_L_all": lambda_l_arr,
+        "layer_lambda_all": layer_lambda_arr,
+        "distances_W": distances_w_all,
+        "distances_F": distances_f_all,
+        "d0_W": d0_w_arr,
+        "dN_W": dN_w_arr,
+        "d0_F": d0_f_arr,
+        "dN_F": dN_f_arr,
+        "initial_effective_mismatch_abs_all": init_eff_abs_arr,
+        "initial_effective_mismatch_rel_all": init_eff_rel_arr,
+        "initial_output_mismatch_rel_all": init_output_rel_arr,
+        "initial_loss_gap_abs_all": init_loss_gap_arr,
+        "initial_diagnostics": initial_diagnostics,
+        "summary": summary,
+        "trial_records": trial_records,
+        "base_losses": base_losses,
+        "representative_trial": representative_trial,
+    }
 
 
-# =============================================================================
-# DETAILED RESULTS TABLE
-# =============================================================================
+def welch_t_test(sample_a: np.ndarray, sample_b: np.ndarray) -> Dict[str, Any]:
+    """Compute a Welch-style t-statistic without requiring SciPy."""
+    a = np.asarray(sample_a, dtype=float)
+    b = np.asarray(sample_b, dtype=float)
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
 
-print(f"\n\n{'=' * 100}")
-print("DETAILED LYAPUNOV EXPONENT RESULTS")
-print("=" * 100)
+    result: Dict[str, Any] = {
+        "n_a": int(a.size),
+        "n_b": int(b.size),
+        "mean_a": float(np.mean(a)) if a.size else float("nan"),
+        "mean_b": float(np.mean(b)) if b.size else float("nan"),
+    }
+    if a.size > 1:
+        result["std_a"] = float(np.std(a, ddof=1))
+    else:
+        result["std_a"] = float("nan")
+    if b.size > 1:
+        result["std_b"] = float(np.std(b, ddof=1))
+    else:
+        result["std_b"] = float("nan")
 
-print(f"\n{'Optimizer':<10} | {'Perturbation':<12} | {'Mean lambda':>12} | {'Median lambda':>14} | "
-      f"{'Std':>8} | {'d(N)/d(0)':>10} | {'Sign':>8}")
-print("-" * 90)
+    if a.size <= 1 or b.size <= 1:
+        result.update(
+            {
+                "difference": float("nan"),
+                "t_stat": float("nan"),
+                "degrees_freedom": float("nan"),
+                "heuristic_one_tailed_significant": False,
+            }
+        )
+        return result
 
-for opt_name in ['SGD', 'Muon']:
-    for pert_name in ['gauge', 'physical']:
-        key = f"{opt_name}_{pert_name}"
-        r = results[key]
-        ratio = np.mean(r['dN']) / np.mean(r['d0']) if np.mean(r['d0']) > 0 else np.nan
+    mean_a = float(np.mean(a))
+    mean_b = float(np.mean(b))
+    var_a = float(np.var(a, ddof=1))
+    var_b = float(np.var(b, ddof=1))
+    se = math.sqrt(var_a / a.size + var_b / b.size)
 
-        if r['mean_lyap'] < -0.001:
-            sign_str = "DECAY"
-        elif r['mean_lyap'] > 0.001:
-            sign_str = "GROW"
-        else:
-            sign_str = "NEUTRAL"
-
-        print(f"{opt_name:<10} | {pert_name:<12} | {r['mean_lyap']:12.6f} | "
-              f"{r['median_lyap']:14.6f} | {r['std_lyap']:8.6f} | {ratio:10.4f} | {sign_str:>8}")
-
-
-# =============================================================================
-# PER-TRIAL BREAKDOWN
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("PER-TRIAL LYAPUNOV EXPONENTS (GAUGE DIRECTION)")
-print("=" * 100)
-
-print(f"\n{'Trial':>6} | {'SGD lambda':>12} | {'Muon lambda':>12} | {'SGD d(N)/d(0)':>14} | "
-      f"{'Muon d(N)/d(0)':>14}")
-print("-" * 75)
-
-sgd_g = results['SGD_gauge']
-muon_g = results['Muon_gauge']
-
-for p in range(NUM_PERTURBATIONS):
-    sgd_ratio = sgd_g['dN'][p] / sgd_g['d0'][p] if sgd_g['d0'][p] > 0 else np.nan
-    muon_ratio = muon_g['dN'][p] / muon_g['d0'][p] if muon_g['d0'][p] > 0 else np.nan
-    print(f"{p:6d} | {sgd_g['lyapunov_all'][p]:12.6f} | {muon_g['lyapunov_all'][p]:12.6f} | "
-          f"{sgd_ratio:14.6f} | {muon_ratio:14.6f}")
-
-
-# =============================================================================
-# PER-LAYER ANALYSIS (representative trial)
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("PER-LAYER DISTANCE EVOLUTION (Trial 0, Gauge Perturbation)")
-print("=" * 100)
-
-# Re-run trial 0 with per-layer tracking
-np.random.seed(42)
-weights_base = init_weights(NUM_LAYERS)
-rng_layer = np.random.RandomState(100)
-
-# Create gauge-perturbed weights for trial 0
-weights_pert_gauge = []
-for layer_idx in range(NUM_LAYERS):
-    S = random_symmetric(DIM, rng_layer)
-    S = S / np.linalg.norm(S, 'fro')
-    W_pert = weights_base[layer_idx] @ (np.eye(DIM) + EPSILON * S)
-    weights_pert_gauge.append(W_pert)
-
-for opt_name, opt_type, lr in [('SGD', 'sgd', lr_sgd), ('Muon', 'muon', LR_MUON)]:
-    traj_base = run_trajectory(weights_base, opt_type, lr, NUM_STEPS)
-    traj_pert = run_trajectory(weights_pert_gauge, opt_type, lr, NUM_STEPS)
-    per_layer = compute_per_layer_distances(traj_base, traj_pert)
-
-    print(f"\n  {opt_name}:")
-    print(f"  {'Layer':>6} | {'d(0)':>10} | {'d(50)':>10} | {'d(100)':>10} | "
-          f"{'d(150)':>10} | {'d(200)':>10} | {'lambda_layer':>12}")
-    print("  " + "-" * 80)
-
-    for layer_idx in range(NUM_LAYERS):
-        d0_l = per_layer[layer_idx, 0]
-        dN_l = per_layer[layer_idx, -1]
-        lyap_l = (1.0 / NUM_STEPS) * np.log(dN_l / d0_l) if d0_l > 1e-15 and dN_l > 1e-15 else np.nan
-        print(f"  {layer_idx:6d} | {per_layer[layer_idx, 0]:10.6f} | "
-              f"{per_layer[layer_idx, 50]:10.6f} | {per_layer[layer_idx, 100]:10.6f} | "
-              f"{per_layer[layer_idx, 150]:10.6f} | {per_layer[layer_idx, -1]:10.6f} | "
-              f"{lyap_l:12.6f}")
-
-
-# =============================================================================
-# STATISTICAL SIGNIFICANCE
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("STATISTICAL SIGNIFICANCE TEST")
-print("=" * 100)
-
-sgd_gauge_lyaps = results['SGD_gauge']['lyapunov_valid']
-muon_gauge_lyaps = results['Muon_gauge']['lyapunov_valid']
-
-# Two-sample t-test (manual, no scipy)
-n1, n2 = len(sgd_gauge_lyaps), len(muon_gauge_lyaps)
-mean1, mean2 = np.mean(sgd_gauge_lyaps), np.mean(muon_gauge_lyaps)
-var1, var2 = np.var(sgd_gauge_lyaps, ddof=1), np.var(muon_gauge_lyaps, ddof=1)
-
-if n1 > 1 and n2 > 1:
-    se = np.sqrt(var1 / n1 + var2 / n2)
     if se > 1e-15:
-        t_stat = (mean1 - mean2) / se
-        # Welch's degrees of freedom
-        df_num = (var1 / n1 + var2 / n2) ** 2
-        df_den = (var1 / n1) ** 2 / (n1 - 1) + (var2 / n2) ** 2 / (n2 - 1)
-        df = df_num / (df_den + 1e-15)
+        t_stat = (mean_a - mean_b) / se
+        df_num = (var_a / a.size + var_b / b.size) ** 2
+        df_den = ((var_a / a.size) ** 2) / (a.size - 1) + ((var_b / b.size) ** 2) / (b.size - 1)
+        degrees_freedom = df_num / (df_den + 1e-15)
     else:
-        t_stat = np.inf if mean1 != mean2 else 0.0
-        df = min(n1, n2) - 1
-else:
-    t_stat = np.nan
-    df = np.nan
+        t_stat = float("inf") if mean_a != mean_b else 0.0
+        degrees_freedom = float(min(a.size, b.size) - 1)
 
-print(f"\n  H0: lambda_gauge_SGD = lambda_gauge_Muon")
-print(f"  H1: lambda_gauge_SGD > lambda_gauge_Muon (Muon more stable)")
-print(f"\n  SGD gauge Lyapunov:  mean={mean1:.6f}, std={np.sqrt(var1):.6f}, n={n1}")
-print(f"  Muon gauge Lyapunov: mean={mean2:.6f}, std={np.sqrt(var2):.6f}, n={n2}")
-print(f"  Difference (SGD - Muon): {mean1 - mean2:.6f}")
-print(f"  t-statistic: {t_stat:.4f}")
-print(f"  Degrees of freedom: {df:.1f}")
-print(f"  (t > 2.0 indicates statistical significance at p < 0.05, one-tailed)")
-
-is_significant = t_stat > 2.0 if np.isfinite(t_stat) else False
-print(f"  Statistically significant: {'YES' if is_significant else 'NO'}")
-
-
-# =============================================================================
-# GAUGE vs PHYSICAL COMPARISON
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("GAUGE vs PHYSICAL PERTURBATION COMPARISON")
-print("=" * 100)
-
-for opt_name in ['SGD', 'Muon']:
-    gauge_key = f"{opt_name}_gauge"
-    phys_key = f"{opt_name}_physical"
-    print(f"\n  {opt_name}:")
-    print(f"    Gauge lambda:    {results[gauge_key]['mean_lyap']:.6f} +/- {results[gauge_key]['std_lyap']:.6f}")
-    print(f"    Physical lambda: {results[phys_key]['mean_lyap']:.6f} +/- {results[phys_key]['std_lyap']:.6f}")
-    diff = results[gauge_key]['mean_lyap'] - results[phys_key]['mean_lyap']
-    print(f"    Difference (gauge - physical): {diff:.6f}")
-    if abs(diff) > 0.001:
-        if diff < 0:
-            print(f"    -> Gauge direction is MORE STABLE than physical (confirms gauge fixing)")
-        else:
-            print(f"    -> Physical direction is MORE STABLE than gauge (unexpected)")
-    else:
-        print(f"    -> Similar stability in both directions")
-
-
-# =============================================================================
-# PLOT: d(t) OVER TIME
-# =============================================================================
-
-print(f"\n\n{'=' * 100}")
-print("GENERATING PLOTS")
-print("=" * 100)
-
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('1.2b-i: Lyapunov Exponent of Gauge Direction\n'
-                 f'{NUM_LAYERS}-layer linear net, dim={DIM}, eps={EPSILON}, '
-                 f'{NUM_PERTURBATIONS} perturbations',
-                 fontsize=14, fontweight='bold')
-
-    t_axis = np.arange(NUM_STEPS + 1)
-
-    # --- Panel (a): d(t) for gauge perturbation, both optimizers ---
-    ax = axes[0, 0]
-    ax.set_title('(a) Gauge Perturbation: d(t) over time')
-
-    # Plot individual trials (faint) and mean (bold)
-    for p in range(NUM_PERTURBATIONS):
-        dists_sgd = results['SGD_gauge']['distances'][p]
-        dists_muon = results['Muon_gauge']['distances'][p]
-        ax.semilogy(t_axis[:len(dists_sgd)], dists_sgd, 'b-', alpha=0.1, linewidth=0.5)
-        ax.semilogy(t_axis[:len(dists_muon)], dists_muon, 'r-', alpha=0.1, linewidth=0.5)
-
-    # Mean distance
-    sgd_mean_dist = np.mean([d for d in results['SGD_gauge']['distances']], axis=0)
-    muon_mean_dist = np.mean([d for d in results['Muon_gauge']['distances']], axis=0)
-    ax.semilogy(t_axis[:len(sgd_mean_dist)], sgd_mean_dist, 'b-', linewidth=2.5,
-                label=f'SGD (lambda={results["SGD_gauge"]["mean_lyap"]:.4f})')
-    ax.semilogy(t_axis[:len(muon_mean_dist)], muon_mean_dist, 'r-', linewidth=2.5,
-                label=f'Muon (lambda={results["Muon_gauge"]["mean_lyap"]:.4f})')
-
-    # Reference: d(0) line
-    ax.axhline(y=np.mean(results['SGD_gauge']['d0']), color='gray', linestyle='--',
-               alpha=0.5, label='d(0)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('d(t) = ||W_t\' - W_t||_F')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    # --- Panel (b): d(t) for physical perturbation, both optimizers ---
-    ax = axes[0, 1]
-    ax.set_title('(b) Physical Perturbation: d(t) over time')
-
-    for p in range(NUM_PERTURBATIONS):
-        dists_sgd = results['SGD_physical']['distances'][p]
-        dists_muon = results['Muon_physical']['distances'][p]
-        ax.semilogy(t_axis[:len(dists_sgd)], dists_sgd, 'b-', alpha=0.1, linewidth=0.5)
-        ax.semilogy(t_axis[:len(dists_muon)], dists_muon, 'r-', alpha=0.1, linewidth=0.5)
-
-    sgd_phys_mean = np.mean([d for d in results['SGD_physical']['distances']], axis=0)
-    muon_phys_mean = np.mean([d for d in results['Muon_physical']['distances']], axis=0)
-    ax.semilogy(t_axis[:len(sgd_phys_mean)], sgd_phys_mean, 'b-', linewidth=2.5,
-                label=f'SGD (lambda={results["SGD_physical"]["mean_lyap"]:.4f})')
-    ax.semilogy(t_axis[:len(muon_phys_mean)], muon_phys_mean, 'r-', linewidth=2.5,
-                label=f'Muon (lambda={results["Muon_physical"]["mean_lyap"]:.4f})')
-    ax.axhline(y=np.mean(results['SGD_physical']['d0']), color='gray', linestyle='--',
-               alpha=0.5, label='d(0)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('d(t) = ||W_t\' - W_t||_F')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    # --- Panel (c): Histogram of Lyapunov exponents ---
-    ax = axes[1, 0]
-    ax.set_title('(c) Distribution of Lyapunov Exponents (Gauge)')
-
-    bins = np.linspace(
-        min(np.min(results['SGD_gauge']['lyapunov_valid']),
-            np.min(results['Muon_gauge']['lyapunov_valid'])) - 0.005,
-        max(np.max(results['SGD_gauge']['lyapunov_valid']),
-            np.max(results['Muon_gauge']['lyapunov_valid'])) + 0.005,
-        25
+    result.update(
+        {
+            "difference": float(mean_a - mean_b),
+            "t_stat": float(t_stat),
+            "degrees_freedom": float(degrees_freedom),
+            "heuristic_one_tailed_significant": bool(np.isfinite(t_stat) and t_stat > 2.0),
+        }
     )
-    ax.hist(results['SGD_gauge']['lyapunov_valid'], bins=bins, alpha=0.6, color='blue',
-            label=f'SGD (mean={results["SGD_gauge"]["mean_lyap"]:.4f})', edgecolor='navy')
-    ax.hist(results['Muon_gauge']['lyapunov_valid'], bins=bins, alpha=0.6, color='red',
-            label=f'Muon (mean={results["Muon_gauge"]["mean_lyap"]:.4f})', edgecolor='darkred')
-    ax.axvline(x=0, color='black', linestyle='--', linewidth=1.5, label='lambda=0 (neutral)')
-    ax.set_xlabel('Lyapunov Exponent (lambda)')
-    ax.set_ylabel('Count')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    return result
 
-    # --- Panel (d): Gauge vs Physical comparison (bar chart) ---
-    ax = axes[1, 1]
-    ax.set_title('(d) Gauge vs Physical Lyapunov Exponents')
 
-    categories = ['SGD\nGauge', 'SGD\nPhysical', 'Muon\nGauge', 'Muon\nPhysical']
-    means = [
-        results['SGD_gauge']['mean_lyap'],
-        results['SGD_physical']['mean_lyap'],
-        results['Muon_gauge']['mean_lyap'],
-        results['Muon_physical']['mean_lyap'],
-    ]
-    stds = [
-        results['SGD_gauge']['std_lyap'],
-        results['SGD_physical']['std_lyap'],
-        results['Muon_gauge']['std_lyap'],
-        results['Muon_physical']['std_lyap'],
-    ]
-    colors = ['#4477AA', '#88CCEE', '#CC3311', '#EE7733']
+def build_verdict(
+    condition_results: Dict[str, Dict[str, Any]],
+    primary_stats: Dict[str, Any],
+    legacy_stats: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Evaluate the primary gauge-preserving story plus legacy comparison context."""
+    lambda_gauge_sgd = condition_results["SGD_gauge"]["summary"]["lambda_W"]["mean"]
+    lambda_gauge_muon = condition_results["Muon_gauge"]["summary"]["lambda_W"]["mean"]
+    lambda_phys_sgd = condition_results["SGD_physical"]["summary"]["lambda_W"]["mean"]
+    lambda_phys_muon = condition_results["Muon_physical"]["summary"]["lambda_W"]["mean"]
+    lambda_legacy_sgd = condition_results["SGD_symmetric_legacy"]["summary"]["lambda_W"]["mean"]
+    lambda_legacy_muon = condition_results["Muon_symmetric_legacy"]["summary"]["lambda_W"]["mean"]
 
-    bars = ax.bar(categories, means, yerr=stds, capsize=5, color=colors,
-                  edgecolor='black', linewidth=0.8)
-    ax.axhline(y=0, color='black', linestyle='--', linewidth=1.5)
-    ax.set_ylabel('Lyapunov Exponent (lambda)')
+    gauge_abs_max = max(
+        condition_results["SGD_gauge"]["initial_diagnostics"]["max_initial_effective_mismatch_abs"],
+        condition_results["Muon_gauge"]["initial_diagnostics"]["max_initial_effective_mismatch_abs"],
+    )
+    gauge_rel_max = max(
+        condition_results["SGD_gauge"]["initial_diagnostics"]["max_initial_effective_mismatch_rel"],
+        condition_results["Muon_gauge"]["initial_diagnostics"]["max_initial_effective_mismatch_rel"],
+    )
+    gauge_construction_pass = bool(
+        condition_results["SGD_gauge"]["initial_diagnostics"]["preserves_effective_map_within_tol"]
+        and condition_results["Muon_gauge"]["initial_diagnostics"]["preserves_effective_map_within_tol"]
+    )
 
-    # Annotate bars
-    for bar, mean in zip(bars, means):
-        ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height(),
-                f'{mean:.4f}', ha='center', va='bottom' if mean >= 0 else 'top',
-                fontsize=9, fontweight='bold')
+    gauge_construction_check = {
+        "description": (
+            "The primary gauge condition should preserve the effective end-to-end map at t=0 up to "
+            "numerical roundoff."
+        ),
+        "pass": gauge_construction_pass,
+        "tolerance_abs": MAP_PRESERVATION_ABS_TOL,
+        "tolerance_rel": MAP_PRESERVATION_REL_TOL,
+        "max_abs_observed": float(gauge_abs_max),
+        "max_rel_observed": float(gauge_rel_max),
+    }
 
-    ax.grid(True, alpha=0.3, axis='y')
+    primary_tests = {
+        "muon_gauge_more_stable_than_sgd": {
+            "description": "Muon has smaller lambda_W than SGD under the true gauge-preserving perturbation.",
+            "metric": "lambda_W",
+            "pass": bool(lambda_gauge_muon < lambda_gauge_sgd),
+            "lhs": float(lambda_gauge_muon),
+            "rhs": float(lambda_gauge_sgd),
+        },
+        "muon_gauge_contracts": {
+            "description": "Muon's gauge-perturbation lambda_W is negative.",
+            "metric": "lambda_W",
+            "pass": bool(lambda_gauge_muon < -0.001),
+            "lhs": float(lambda_gauge_muon),
+            "rhs": -0.001,
+        },
+        "muon_gauge_more_stable_than_muon_skew": {
+            "description": "Muon is more stable under the gauge perturbation than under the skew control.",
+            "metric": "lambda_W",
+            "pass": bool(lambda_gauge_muon < lambda_phys_muon - 0.001),
+            "lhs": float(lambda_gauge_muon),
+            "rhs": float(lambda_phys_muon - 0.001),
+        },
+    }
+
+    legacy_tests = {
+        "muon_legacy_symmetric_more_stable_than_sgd": {
+            "description": "Muon has smaller lambda_W than SGD under the retained legacy symmetric perturbation.",
+            "metric": "lambda_W",
+            "pass": bool(lambda_legacy_muon < lambda_legacy_sgd),
+            "lhs": float(lambda_legacy_muon),
+            "rhs": float(lambda_legacy_sgd),
+        },
+        "muon_legacy_symmetric_contracts": {
+            "description": "Muon's legacy symmetric lambda_W is negative.",
+            "metric": "lambda_W",
+            "pass": bool(lambda_legacy_muon < -0.001),
+            "lhs": float(lambda_legacy_muon),
+            "rhs": -0.001,
+        },
+        "muon_legacy_more_stable_than_muon_skew": {
+            "description": "Muon is more stable under the legacy symmetric perturbation than under the skew control.",
+            "metric": "lambda_W",
+            "pass": bool(lambda_legacy_muon < lambda_phys_muon - 0.001),
+            "lhs": float(lambda_legacy_muon),
+            "rhs": float(lambda_phys_muon - 0.001),
+        },
+    }
+
+    primary_tests_passed = int(sum(test["pass"] for test in primary_tests.values()))
+    legacy_tests_passed = int(sum(test["pass"] for test in legacy_tests.values()))
+
+    if not gauge_construction_pass:
+        overall = "INVALID"
+        interpretation = (
+            "The nominal gauge condition did not preserve the effective map tightly enough at t=0, "
+            "so the intended gauge-direction story would remain compromised."
+        )
+    elif primary_tests_passed == 3:
+        overall = "PASS"
+        interpretation = (
+            "The gauge-preserving construction is numerically validated at t=0 and all three retained "
+            "lambda_W stability checks pass under that primary condition."
+        )
+    elif primary_tests_passed == 2:
+        overall = "PARTIAL PASS"
+        interpretation = (
+            "The pair now tests a true gauge-preserving perturbation at t=0, but only two of three "
+            "primary lambda_W stability checks pass."
+        )
+    elif primary_tests_passed == 1:
+        overall = "WEAK SIGNAL"
+        interpretation = (
+            "The pair now supports a literal gauge-preserving initialization test, but only one of three "
+            "primary lambda_W stability checks passes, so evidence for the stability story is weak."
+        )
+    else:
+        overall = "FAIL"
+        interpretation = (
+            "The pair now supports a literal gauge-preserving initialization test, but under the default "
+            "run Muon does not show lower finite-time weight-space sensitivity than SGD in that gauge "
+            "direction story."
+        )
+
+    return {
+        "overall": overall,
+        "gauge_construction_check": gauge_construction_check,
+        "primary_tests_passed": primary_tests_passed,
+        "primary_tests_total": len(primary_tests),
+        "primary_tests": primary_tests,
+        "legacy_tests_passed": legacy_tests_passed,
+        "legacy_tests_total": len(legacy_tests),
+        "legacy_tests": legacy_tests,
+        "study_scope": (
+            "Finite-time perturbation sensitivity study in raw weight space (lambda_W), with additional "
+            "effective-map (lambda_F) and mean per-layer (lambda_L) diagnostics."
+        ),
+        "scope_caveat": (
+            "Only the primary gauge condition is guaranteed to preserve the effective map at t=0. The "
+            "skew and independent symmetric conditions remain controls/comparators rather than physical "
+            "quotient-space perturbations."
+        ),
+        "primary_shortform": {
+            "lambda_gauge_SGD": float(lambda_gauge_sgd),
+            "lambda_gauge_Muon": float(lambda_gauge_muon),
+            "lambda_phys_SGD": float(lambda_phys_sgd),
+            "lambda_phys_Muon": float(lambda_phys_muon),
+            "welch_t_statistic_sgd_minus_muon": float(primary_stats["t_stat"]),
+            "welch_df": float(primary_stats["degrees_freedom"]),
+            "heuristic_significant": bool(primary_stats["heuristic_one_tailed_significant"]),
+        },
+        "legacy_shortform": {
+            "lambda_legacy_symmetric_SGD": float(lambda_legacy_sgd),
+            "lambda_legacy_symmetric_Muon": float(lambda_legacy_muon),
+            "welch_t_statistic_sgd_minus_muon": float(legacy_stats["t_stat"]),
+            "welch_df": float(legacy_stats["degrees_freedom"]),
+            "heuristic_significant": bool(legacy_stats["heuristic_one_tailed_significant"]),
+        },
+        "interpretation": interpretation,
+    }
+
+
+def _format_scalar(value: float, digits: int = 6) -> str:
+    """Human-readable formatter that handles non-finite values."""
+    if not np.isfinite(value):
+        return "nan"
+    return f"{value:.{digits}f}"
+
+
+def print_summary(results: Dict[str, Any]) -> None:
+    """Pretty-print the main outputs of the experiment."""
+    config = results["config"]
+    condition_results = results["condition_results"]
+    verdict = results["verdict"]
+    stats = results["statistical_comparison"]
+    legacy_stats = results["legacy_statistical_comparison"]
+
+    print("=" * 108)
+    print("1.2b-i: FINITE-TIME SENSITIVITY TO GAUGE-PRESERVING VS. NON-GAUGE PERTURBATIONS")
+    print("=" * 108)
+    print(results["study_title"])
+    print(f"Scope note: {results['scope_note']}")
+    print("-" * 108)
+    print(
+        f"Config: layers={config['num_layers']}, dim={config['dim']}, steps={config['num_steps']}, "
+        f"batch={config['batch_size']}, epsilon={config['epsilon']}, perturbations={config['num_perturbations']}"
+    )
+    print(
+        f"Seeds: global={config['seed_global']}, init={config['seed_init']}, "
+        f"perturb_base={config['seed_perturb_base']}"
+    )
+    print(
+        f"Learning rates: SGD={results['learning_rates']['sgd']}, Muon={results['learning_rates']['muon']}"
+    )
+    print(f"Runtime: {results['runtime_seconds']:.2f}s")
+    print("-" * 108)
+    print("Perturbation constructions:")
+    for key in results["perturbation_order"]:
+        meta = results["perturbation_catalog"][key]
+        print(f"  {key:<18} true_gauge={meta['is_true_gauge']!s:<5} | {meta['display_label']}")
+    print("-" * 108)
+    print("Training sanity check:")
+    for optimizer_key in ["sgd", "muon"]:
+        check = results["training_checks"][optimizer_key]
+        print(
+            f"  {check['optimizer_name']:<5} lr={check['learning_rate']:<7g} "
+            f"initial_loss={check['initial_loss']:.6e} final_loss={check['final_loss']:.6e} "
+            f"diverged={check['diverged']}"
+        )
+
+    print("\nCondition summary (means over perturbation trials):")
+    print(
+        f"{'Condition':<24} | {'lambda_W':>10} | {'lambda_F':>10} | {'lambda_L':>10} | "
+        f"{'mean init dF':>12} | {'map-pres?':>9}"
+    )
+    print("-" * 108)
+    for key in results["condition_order"]:
+        summary = condition_results[key]["summary"]
+        diagnostics = condition_results[key]["initial_diagnostics"]
+        print(
+            f"{key:<24} | {_format_scalar(summary['lambda_W']['mean']):>10} | "
+            f"{_format_scalar(summary['lambda_F']['mean']):>10} | {_format_scalar(summary['lambda_L']['mean']):>10} | "
+            f"{diagnostics['initial_effective_mismatch_abs']['mean']:.3e} | "
+            f"{str(diagnostics['preserves_effective_map_within_tol']):>9}"
+        )
+
+    gauge_check = verdict["gauge_construction_check"]
+    print("\nGauge-preservation verification:")
+    print(
+        f"  pass={gauge_check['pass']} | max_abs={gauge_check['max_abs_observed']:.3e} "
+        f"(tol {gauge_check['tolerance_abs']:.1e}) | max_rel={gauge_check['max_rel_observed']:.3e} "
+        f"(tol {gauge_check['tolerance_rel']:.1e})"
+    )
+
+    print("\nWelch comparison on primary gauge lambda_W samples (SGD minus Muon):")
+    print(
+        f"  t={stats['t_stat']:.4f}, df={stats['degrees_freedom']:.2f}, "
+        f"heuristic_one_tailed_significant={stats['heuristic_one_tailed_significant']}"
+    )
+    print("Welch comparison on retained legacy symmetric lambda_W samples (SGD minus Muon):")
+    print(
+        f"  t={legacy_stats['t_stat']:.4f}, df={legacy_stats['degrees_freedom']:.2f}, "
+        f"heuristic_one_tailed_significant={legacy_stats['heuristic_one_tailed_significant']}"
+    )
+
+    print("\nPrimary verdict tests:")
+    for test_name, test in verdict["primary_tests"].items():
+        print(f"  [{'PASS' if test['pass'] else 'FAIL'}] {test_name}: {test['description']}")
+    print(
+        f"  Overall: {verdict['overall']} "
+        f"({verdict['primary_tests_passed']}/{verdict['primary_tests_total']} primary tests passed)"
+    )
+    print(f"  Interpretation: {verdict['interpretation']}")
+
+    if results["plot_paths"]:
+        print("\nSaved figures:")
+        for name, path in results["plot_paths"].items():
+            print(f"  {name}: {path}")
+    print("=" * 108)
+
+
+def make_plots(results: Dict[str, Any], output_dir: Optional[Path] = None, verbose: bool = True) -> Dict[str, str]:
+    """Generate summary figures for the experiment."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        if verbose:
+            print("matplotlib not available; skipping figure generation.")
+        return {}
+
+    output_path = Path(output_dir or results["paths"]["output_dir"])
+    output_path.mkdir(parents=True, exist_ok=True)
+    config = results["config"]
+    condition_results = results["condition_results"]
+    perturbation_order = results["perturbation_order"]
+    time_axis = np.arange(config["num_steps"] + 1)
+    floor = 1e-18
+
+    def mean_curve(condition_key: str, field: str) -> np.ndarray:
+        curves = [np.asarray(curve, dtype=float) for curve in condition_results[condition_key][field]]
+        return np.mean(np.stack(curves, axis=0), axis=0)
+
+    def positive_curve(curve: np.ndarray) -> np.ndarray:
+        arr = np.asarray(curve, dtype=float)
+        return np.maximum(arr, floor)
+
+    def metric_label(value: float) -> str:
+        return f"{value:.4f}" if np.isfinite(value) else "n/a"
+
+    color_map = {"SGD": "#4477AA", "Muon": "#CC3311"}
+
+    fig, axes = plt.subplots(2, len(perturbation_order), figsize=(6 * len(perturbation_order), 10))
+    fig.suptitle(
+        "1.2b-i finite-time sensitivity study\n"
+        "Primary true gauge-preserving condition plus non-gauge controls/comparators",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    for col_idx, perturbation_type in enumerate(perturbation_order):
+        sgd_key, muon_key = results["condition_groups"][perturbation_type]
+        meta = results["perturbation_catalog"][perturbation_type]
+
+        top_axis = axes[0, col_idx]
+        top_axis.set_title(f"{meta['short_label']}: d_W(t)")
+        for trial_curve in condition_results[sgd_key]["distances_W"]:
+            top_axis.semilogy(time_axis[: len(trial_curve)], positive_curve(trial_curve), color=color_map["SGD"], alpha=0.12, linewidth=0.6)
+        for trial_curve in condition_results[muon_key]["distances_W"]:
+            top_axis.semilogy(time_axis[: len(trial_curve)], positive_curve(trial_curve), color=color_map["Muon"], alpha=0.12, linewidth=0.6)
+        sgd_mean = mean_curve(sgd_key, "distances_W")
+        muon_mean = mean_curve(muon_key, "distances_W")
+        top_axis.semilogy(
+            time_axis[: len(sgd_mean)],
+            positive_curve(sgd_mean),
+            color=color_map["SGD"],
+            linewidth=2.4,
+            label=f"SGD (lambda_W={metric_label(condition_results[sgd_key]['summary']['lambda_W']['mean'])})",
+        )
+        top_axis.semilogy(
+            time_axis[: len(muon_mean)],
+            positive_curve(muon_mean),
+            color=color_map["Muon"],
+            linewidth=2.4,
+            label=f"Muon (lambda_W={metric_label(condition_results[muon_key]['summary']['lambda_W']['mean'])})",
+        )
+        top_axis.set_xlabel("Step")
+        top_axis.set_ylabel("d_W(t)")
+        top_axis.grid(True, alpha=0.3)
+        top_axis.legend(fontsize=9)
+
+        bottom_axis = axes[1, col_idx]
+        bottom_axis.set_title(f"{meta['short_label']}: d_F(t)")
+        for trial_curve in condition_results[sgd_key]["distances_F"]:
+            bottom_axis.semilogy(time_axis[: len(trial_curve)], positive_curve(trial_curve), color=color_map["SGD"], alpha=0.12, linewidth=0.6)
+        for trial_curve in condition_results[muon_key]["distances_F"]:
+            bottom_axis.semilogy(time_axis[: len(trial_curve)], positive_curve(trial_curve), color=color_map["Muon"], alpha=0.12, linewidth=0.6)
+        sgd_mean_f = mean_curve(sgd_key, "distances_F")
+        muon_mean_f = mean_curve(muon_key, "distances_F")
+        bottom_axis.semilogy(
+            time_axis[: len(sgd_mean_f)],
+            positive_curve(sgd_mean_f),
+            color=color_map["SGD"],
+            linewidth=2.4,
+            label=f"SGD (lambda_F={metric_label(condition_results[sgd_key]['summary']['lambda_F']['mean'])})",
+        )
+        bottom_axis.semilogy(
+            time_axis[: len(muon_mean_f)],
+            positive_curve(muon_mean_f),
+            color=color_map["Muon"],
+            linewidth=2.4,
+            label=f"Muon (lambda_F={metric_label(condition_results[muon_key]['summary']['lambda_F']['mean'])})",
+        )
+        if perturbation_type == "gauge":
+            bottom_axis.text(
+                0.04,
+                0.04,
+                "d_F(0) ≈ 0 by construction",
+                transform=bottom_axis.transAxes,
+                fontsize=9,
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+            )
+        bottom_axis.set_xlabel("Step")
+        bottom_axis.set_ylabel("d_F(t)")
+        bottom_axis.grid(True, alpha=0.3)
+        bottom_axis.legend(fontsize=9)
 
     plt.tight_layout()
-    plot_path = os.path.join(SCRIPT_DIR, 'lyapunov_gauge_direction.png')
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\n  Plot saved to: {plot_path}")
+    plot1 = output_path / "lyapunov_gauge_direction.png"
+    fig.savefig(plot1, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
-except ImportError:
-    print("\n  WARNING: matplotlib not available, skipping plots.")
-    plot_path = None
+    fig, axes = plt.subplots(1, len(perturbation_order), figsize=(6 * len(perturbation_order), 5))
+    fig.suptitle(
+        "Finite-time log-ratio view in weight space\n"
+        "Dashed reference slopes correspond to the lambda_W summary metric",
+        fontsize=13,
+        fontweight="bold",
+    )
 
-
-# =============================================================================
-# ADDITIONAL PLOT: log(d(t)/d(0)) vs t (slope = Lyapunov)
-# =============================================================================
-
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle('1.2b-i: log(d(t)/d(0)) vs t -- Slope = Lyapunov Exponent',
-                 fontsize=13, fontweight='bold')
-
-    for idx, (pert_name, pert_label) in enumerate([('gauge', 'Gauge (Symmetric/PSD)'),
-                                                     ('physical', 'Physical (Skew/Tangent)')]):
-        ax = axes[idx]
-        ax.set_title(pert_label)
-
-        for opt_name, color in [('SGD', 'blue'), ('Muon', 'red')]:
-            key = f"{opt_name}_{pert_name}"
-            dists_list = results[key]['distances']
-
-            # Plot individual trials
-            for p in range(NUM_PERTURBATIONS):
-                d = dists_list[p]
-                d0 = d[0]
-                if d0 > 1e-15:
-                    log_ratio = np.log(d / d0)
-                    ax.plot(t_axis[:len(log_ratio)], log_ratio, color=color,
-                            alpha=0.1, linewidth=0.5)
-
-            # Mean
-            mean_dist = np.mean(dists_list, axis=0)
-            d0_mean = mean_dist[0]
-            if d0_mean > 1e-15:
-                log_ratio_mean = np.log(mean_dist / d0_mean)
-                ax.plot(t_axis[:len(log_ratio_mean)], log_ratio_mean, color=color,
-                        linewidth=2.5, label=f'{opt_name} (lambda={results[key]["mean_lyap"]:.4f})')
-
-                # Linear fit line
-                lyap = results[key]['mean_lyap']
-                ax.plot(t_axis, lyap * t_axis, color=color, linestyle='--',
-                        linewidth=1.5, alpha=0.7)
-
-        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        ax.set_xlabel('Step')
-        ax.set_ylabel('log(d(t) / d(0))')
-        ax.legend(fontsize=10)
-        ax.grid(True, alpha=0.3)
+    for axis, perturbation_type in zip(np.atleast_1d(axes), perturbation_order):
+        axis.set_title(results["perturbation_catalog"][perturbation_type]["short_label"])
+        for optimizer_name, color in [("SGD", color_map["SGD"]), ("Muon", color_map["Muon"] )]:
+            key = f"{optimizer_name}_{perturbation_type}"
+            dist_list = condition_results[key]["distances_W"]
+            for dist in dist_list:
+                d0 = max(float(dist[0]), floor)
+                axis.plot(time_axis[: len(dist)], np.log(positive_curve(dist) / d0), color=color, alpha=0.1, linewidth=0.5)
+            mean_dist = mean_curve(key, "distances_W")
+            d0_mean = max(float(mean_dist[0]), floor)
+            axis.plot(
+                time_axis[: len(mean_dist)],
+                np.log(positive_curve(mean_dist) / d0_mean),
+                color=color,
+                linewidth=2.4,
+                label=f"{optimizer_name} (lambda_W={metric_label(condition_results[key]['summary']['lambda_W']['mean'])})",
+            )
+            axis.plot(
+                time_axis,
+                condition_results[key]["summary"]["lambda_W"]["mean"] * time_axis,
+                color=color,
+                linestyle="--",
+                linewidth=1.2,
+                alpha=0.8,
+            )
+        axis.axhline(0.0, color="black", linewidth=0.8)
+        axis.set_xlabel("Step")
+        axis.set_ylabel("log(d_W(t) / d_W(0))")
+        axis.grid(True, alpha=0.3)
+        axis.legend(fontsize=9)
 
     plt.tight_layout()
-    plot_path2 = os.path.join(SCRIPT_DIR, 'lyapunov_log_ratio.png')
-    plt.savefig(plot_path2, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Plot saved to: {plot_path2}")
+    plot2 = output_path / "lyapunov_log_ratio.png"
+    fig.savefig(plot2, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
-except ImportError:
-    pass
+    plot_paths = {
+        "summary_panel": str(plot1),
+        "log_ratio_panel": str(plot2),
+    }
+    if verbose:
+        for name, path in plot_paths.items():
+            print(f"Saved {name}: {path}")
+    return plot_paths
 
 
-# =============================================================================
-# VERDICT
-# =============================================================================
+def run_experiment(
+    config_overrides: Optional[Dict[str, Any]] = None,
+    output_dir: Optional[Path] = None,
+    generate_plots: bool = False,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Run the full experiment and return structured results for scripts or notebooks."""
+    start = time.time()
+    config = merge_config(config_overrides)
+    script_path = Path(__file__).resolve()
+    resolved_output_dir = Path(output_dir) if output_dir is not None else script_path.parent
 
-print(f"\n\n{'=' * 100}")
-print("FINAL VERDICT: LYAPUNOV EXPONENT OF GAUGE DIRECTION")
-print("=" * 100)
+    problem = build_problem(config)
+    lr_sgd, sgd_lr_search = find_stable_lr_sgd(config, problem)
+    training_checks = run_training_checks(config, problem, lr_sgd)
 
-lambda_gauge_sgd = results['SGD_gauge']['mean_lyap']
-lambda_gauge_muon = results['Muon_gauge']['mean_lyap']
-lambda_phys_sgd = results['SGD_physical']['mean_lyap']
-lambda_phys_muon = results['Muon_physical']['mean_lyap']
+    perturbation_order = ["gauge", "physical", "symmetric_legacy"]
+    condition_order = [f"{optimizer_name}_{perturbation_type}" for perturbation_type in perturbation_order for optimizer_name in ("SGD", "Muon")]
+    condition_groups = {
+        perturbation_type: [f"SGD_{perturbation_type}", f"Muon_{perturbation_type}"] for perturbation_type in perturbation_order
+    }
 
-print(f"""
-  MEASURED LYAPUNOV EXPONENTS:
-  ---------------------------------------------------------------
-  lambda_gauge_SGD    = {lambda_gauge_sgd:+.6f}  ({"DECAY" if lambda_gauge_sgd < -0.001 else "GROW" if lambda_gauge_sgd > 0.001 else "NEUTRAL"})
-  lambda_gauge_Muon   = {lambda_gauge_muon:+.6f}  ({"DECAY" if lambda_gauge_muon < -0.001 else "GROW" if lambda_gauge_muon > 0.001 else "NEUTRAL"})
-  lambda_phys_SGD     = {lambda_phys_sgd:+.6f}  ({"DECAY" if lambda_phys_sgd < -0.001 else "GROW" if lambda_phys_sgd > 0.001 else "NEUTRAL"})
-  lambda_phys_Muon    = {lambda_phys_muon:+.6f}  ({"DECAY" if lambda_phys_muon < -0.001 else "GROW" if lambda_phys_muon > 0.001 else "NEUTRAL"})
-  ---------------------------------------------------------------
+    base_runs: Dict[str, Dict[str, Any]] = {}
+    for optimizer_key, lr in [("sgd", lr_sgd), ("muon", config["lr_muon"] )]:
+        base_runs[optimizer_key] = build_base_run(optimizer_key, lr, config, problem)
 
-  HYPOTHESIS CHECK:
-  ---------------------------------------------------------------
-  H1: lambda_gauge_Muon < lambda_gauge_SGD
-      (Muon stabilizes gauge directions more than SGD)
-      Muon: {lambda_gauge_muon:+.6f}  vs  SGD: {lambda_gauge_sgd:+.6f}
-      Difference: {lambda_gauge_sgd - lambda_gauge_muon:.6f}
-      -> {"CONFIRMED" if lambda_gauge_muon < lambda_gauge_sgd else "REJECTED"}
-      {"   (statistically significant)" if is_significant else "   (NOT statistically significant)"}
+    condition_results: Dict[str, Dict[str, Any]] = {}
+    for optimizer_name, optimizer_key, lr in [("SGD", "sgd", lr_sgd), ("Muon", "muon", config["lr_muon"] )]:
+        weights_base = base_runs[optimizer_key]["weights_base"]
+        base_run = base_runs[optimizer_key]["base_run"]
+        for perturbation_type in perturbation_order:
+            condition_key = f"{optimizer_name}_{perturbation_type}"
+            condition_results[condition_key] = measure_condition(
+                optimizer_key=optimizer_key,
+                lr=lr,
+                perturbation_type=perturbation_type,
+                config=config,
+                problem=problem,
+                weights_base=weights_base,
+                base_run=base_run,
+            )
 
-  H2: lambda_gauge_Muon << 0 (strongly negative)
-      -> {"CONFIRMED" if lambda_gauge_muon < -0.01 else "PARTIALLY CONFIRMED" if lambda_gauge_muon < -0.001 else "REJECTED"}
-
-  H3: lambda_gauge_SGD ~ 0 (neutral) or > 0 (unstable)
-      -> {"CONFIRMED (neutral)" if abs(lambda_gauge_sgd) < 0.005 else "CONFIRMED (unstable)" if lambda_gauge_sgd > 0.005 else "REJECTED (SGD also decays gauge)"}
-  ---------------------------------------------------------------
-""")
-
-# Determine overall pass/fail
-tests_passed = 0
-tests_total = 3
-
-# Test 1: lambda_gauge_Muon < lambda_gauge_SGD
-test1_pass = lambda_gauge_muon < lambda_gauge_sgd
-if test1_pass:
-    tests_passed += 1
-
-# Test 2: lambda_gauge_Muon < 0 (Muon decays gauge perturbations)
-test2_pass = lambda_gauge_muon < -0.001
-if test2_pass:
-    tests_passed += 1
-
-# Test 3: Muon's gauge Lyapunov is more negative than its physical Lyapunov
-# (Muon specifically targets gauge directions, not just all directions)
-test3_pass = lambda_gauge_muon < lambda_phys_muon - 0.001
-if test3_pass:
-    tests_passed += 1
-
-if tests_passed == 3:
-    overall = "PASS"
-    detail = (
-        "All three tests pass:\n"
-        "  1. Muon's gauge Lyapunov < SGD's gauge Lyapunov (Muon more stable)\n"
-        "  2. Muon's gauge Lyapunov < 0 (perturbations decay)\n"
-        "  3. Muon's gauge Lyapunov < Muon's physical Lyapunov\n"
-        "     (Muon SPECIFICALLY stabilizes gauge directions)\n"
-        "\n"
-        "  This confirms the dynamical systems prediction: Muon acts as a\n"
-        "  gauge-fixing mechanism that exponentially suppresses PSD perturbations."
+    primary_stats = welch_t_test(
+        condition_results["SGD_gauge"]["lambda_W_all"],
+        condition_results["Muon_gauge"]["lambda_W_all"],
     )
-elif tests_passed >= 2:
-    overall = "PARTIAL PASS"
-    detail = (
-        f"  {tests_passed}/3 tests pass.\n"
-        f"  Test 1 (Muon < SGD):          {'PASS' if test1_pass else 'FAIL'}\n"
-        f"  Test 2 (Muon gauge < 0):      {'PASS' if test2_pass else 'FAIL'}\n"
-        f"  Test 3 (gauge < physical):     {'PASS' if test3_pass else 'FAIL'}\n"
-        "\n"
-        "  The core prediction is partially supported."
+    legacy_stats = welch_t_test(
+        condition_results["SGD_symmetric_legacy"]["lambda_W_all"],
+        condition_results["Muon_symmetric_legacy"]["lambda_W_all"],
     )
-elif tests_passed == 1:
-    overall = "WEAK SIGNAL"
-    detail = (
-        f"  Only {tests_passed}/3 tests pass.\n"
-        f"  Test 1 (Muon < SGD):          {'PASS' if test1_pass else 'FAIL'}\n"
-        f"  Test 2 (Muon gauge < 0):      {'PASS' if test2_pass else 'FAIL'}\n"
-        f"  Test 3 (gauge < physical):     {'PASS' if test3_pass else 'FAIL'}"
-    )
-else:
-    overall = "FAIL"
-    detail = (
-        "  No tests pass. The Lyapunov exponent predictions are not confirmed.\n"
-        f"  Test 1 (Muon < SGD):          {'PASS' if test1_pass else 'FAIL'}\n"
-        f"  Test 2 (Muon gauge < 0):      {'PASS' if test2_pass else 'FAIL'}\n"
-        f"  Test 3 (gauge < physical):     {'PASS' if test3_pass else 'FAIL'}"
-    )
+    verdict = build_verdict(condition_results, primary_stats, legacy_stats)
 
-print(f"""
-  ╔══════════════════════════════════════════════════════════════════════════╗
-  ║  VERDICT: {overall:<63}║
-  ╠══════════════════════════════════════════════════════════════════════════╣
-  ║                                                                        ║""")
-for line in detail.split('\n'):
-    print(f"  ║  {line:<70}║")
-print(f"""  ║                                                                        ║
-  ╚══════════════════════════════════════════════════════════════════════════╝
-""")
+    results: Dict[str, Any] = {
+        "experiment_id": "1.2b-i",
+        "study_title": "Finite-time sensitivity study for a true gauge-preserving perturbation plus non-gauge controls",
+        "scope_note": (
+            "The primary gauge condition now preserves the deep-linear effective map at t=0 by construction. "
+            "The skew and independent symmetric conditions remain control/comparison perturbations rather than "
+            "physical quotient-space directions."
+        ),
+        "config": config,
+        "environment": {
+            "python_version": sys.version.split()[0],
+            "numpy_version": np.__version__,
+        },
+        "paths": {
+            "script_path": str(script_path),
+            "output_dir": str(resolved_output_dir),
+        },
+        "learning_rates": {"sgd": float(lr_sgd), "muon": float(config["lr_muon"])},
+        "sgd_lr_search": sgd_lr_search,
+        "training_checks": training_checks,
+        "perturbation_order": perturbation_order,
+        "perturbation_catalog": get_perturbation_catalog(),
+        "condition_order": condition_order,
+        "condition_groups": condition_groups,
+        "condition_results": condition_results,
+        "statistical_comparison": primary_stats,
+        "legacy_statistical_comparison": legacy_stats,
+        "verdict": verdict,
+        "runtime_seconds": float(time.time() - start),
+        "plot_paths": {},
+    }
 
-print("=" * 100)
-print(f"  Tests passed: {tests_passed}/{tests_total}")
-print(f"  Overall: {overall}")
-print("=" * 100)
+    if generate_plots:
+        results["plot_paths"] = make_plots(results, output_dir=resolved_output_dir, verbose=verbose)
+
+    if verbose:
+        print_summary(results)
+    return results
+
+
+def main() -> Dict[str, Any]:
+    """CLI entrypoint preserving normal script behavior."""
+    return run_experiment(generate_plots=True, verbose=True)
+
+
+if __name__ == "__main__":
+    main()

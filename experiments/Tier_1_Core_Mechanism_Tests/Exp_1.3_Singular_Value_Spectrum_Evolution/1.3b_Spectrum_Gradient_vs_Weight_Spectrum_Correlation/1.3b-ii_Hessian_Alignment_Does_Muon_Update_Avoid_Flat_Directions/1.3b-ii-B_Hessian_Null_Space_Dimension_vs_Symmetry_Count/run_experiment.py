@@ -1,29 +1,57 @@
 #!/usr/bin/env python3
 """
-1.3b-ii-B -- Hessian: Null Space Dimension vs Network Symmetry Count
+Experiment 1.3b-ii-B -- Thresholded Near-Zero Hessian Counts vs Linear Gauge-Dimension Prediction
 
-For L layers of width d, the gauge group GL(d)^{L-1} has d^2*(L-1) dimensions.
-At a MINIMUM of the loss, these gauge symmetries produce exactly-zero Hessian
-eigenvalues, because the loss is constant along gauge orbits.
+This first completion pass preserves the original toy finite-difference Hessian
+experiment while narrowing the claims to what the code actually measures.
 
-Key insight: the gauge null space only manifests at CRITICAL POINTS (minima).
-At random initialization, gauge directions generically have nonzero curvature.
+Primary observable
+------------------
+For each configuration, compute the full Hessian of the loss with respect to all
+weights, diagonalize it, and count Hessian eigenvalues satisfying
 
-Approach:
-  1. Construct an exact minimum for deep linear net by setting
-     W_1 = W_star, W_2 = ... = W_L = I  (trivial factorization)
-  2. Then apply random gauge transformations to get a non-trivial factorization
-     (to avoid any special structure from having identity matrices)
-  3. Compute the full Hessian at this minimum
-  4. Count near-zero eigenvalues and compare to d^2*(L-1)
+    |lambda| < tau * max_abs_eigenvalue
 
-For nonlinear (ReLU) networks:
-  - Train to minimum via gradient descent
-  - ReLU breaks GL(d) to permutation/scaling => fewer null directions
+for relative thresholds tau in {1e-2, 1e-3, 1e-4}.
+
+Primary comparison
+------------------
+For selected deep linear networks at constructed exact minima, compare these
+thresholded near-zero counts against the linear gauge-dimension prediction
+
+    d^2 * (L - 1).
+
+Controls and caveats
+--------------------
+- Randomly initialized linear networks are included as a control.
+- ReLU runs are exploratory only: the code does not compute a nonlinear
+  symmetry dimension and does not prove that every near-zero Hessian mode is a
+  gauge direction.
+- No Muon update analysis is performed here.
 """
 
+from __future__ import annotations
+
+import argparse
 import numpy as np
 import time
+
+DEFAULT_NULL_THRESHOLDS = (1e-2, 1e-3, 1e-4)
+DEFAULT_LINEAR_MIN_CONFIGS = ((4, 2), (4, 3), (4, 4), (6, 3))
+DEFAULT_LINEAR_CONTROL_CONFIGS = ((4, 2), (4, 3))
+DEFAULT_RELU_CONFIGS = ((4, 2), (4, 3))
+DEFAULT_N_SAMPLES = 20
+DEFAULT_MODEL_SEED = 42
+DEFAULT_DATA_SEED_OFFSET = 100
+DEFAULT_GRAD_EPS = 1e-6
+DEFAULT_HESS_EPS = 1e-5
+
+GROUP_TITLES = {
+    "linear_exact_minimum": "Deep linear networks at constructed exact minima",
+    "linear_random_control": "Deep linear networks at random initialization (control)",
+    "relu_trained_exploratory": "ReLU networks trained toward low loss (exploratory)",
+}
+
 
 # ============================================================================
 # Network forward pass and loss
@@ -37,6 +65,7 @@ def forward_linear(weights, x):
     return h
 
 
+
 def forward_relu(weights, x):
     """Forward pass: y = W_L relu(... relu(W_1 x))."""
     h = x.copy()
@@ -45,6 +74,7 @@ def forward_relu(weights, x):
         if i < len(weights) - 1:
             h = np.maximum(0, h)
     return h
+
 
 
 def loss_fn(weights, x, y_target, forward_fn):
@@ -61,6 +91,7 @@ def flatten_weights(weights):
     return np.concatenate([W.ravel() for W in weights])
 
 
+
 def unflatten_weights(flat, shapes):
     weights = []
     idx = 0
@@ -75,7 +106,7 @@ def unflatten_weights(flat, shapes):
 # Gradient via finite differences
 # ============================================================================
 
-def compute_gradient(weights, x, y_target, forward_fn, eps=1e-6):
+def compute_gradient(weights, x, y_target, forward_fn, eps=DEFAULT_GRAD_EPS):
     shapes = [W.shape for W in weights]
     theta = flatten_weights(weights)
     n = len(theta)
@@ -95,7 +126,7 @@ def compute_gradient(weights, x, y_target, forward_fn, eps=1e-6):
 # Full Hessian via finite differences
 # ============================================================================
 
-def compute_hessian(weights, x, y_target, forward_fn, eps=1e-5):
+def compute_hessian(weights, x, y_target, forward_fn, eps=DEFAULT_HESS_EPS):
     shapes = [W.shape for W in weights]
     theta = flatten_weights(weights)
     n = len(theta)
@@ -163,16 +194,12 @@ def construct_linear_minimum(d, L, W_star, scramble=True, seed=99):
     if scramble and L > 1:
         rng = np.random.RandomState(seed)
         for l in range(1, L):
-            # Random invertible matrix (gauge transformation)
             G = rng.randn(d, d) * 0.5
-            G += np.eye(d)  # Make it close to identity to ensure invertibility
+            G += np.eye(d)
             G_inv = np.linalg.inv(G)
-
-            # Apply: W_l -> W_l @ G_inv, W_{l-1} -> G @ W_{l-1}
             weights[l] = weights[l] @ G_inv
             weights[l - 1] = G @ weights[l - 1]
 
-    # Verify the product
     product = np.eye(d)
     for W in weights:
         product = W @ product
@@ -181,152 +208,306 @@ def construct_linear_minimum(d, L, W_star, scramble=True, seed=99):
     return weights, recon_err
 
 
+
 def train_to_minimum_gd(weights, x, y_target, forward_fn, lr=0.01,
-                         n_steps=10000, tol=1e-12, verbose=False):
-    """Train network to minimum using gradient descent."""
+                        n_steps=10000, tol=1e-12, verbose=False,
+                        grad_eps=DEFAULT_GRAD_EPS):
+    """Train network to a low-loss endpoint using finite-difference gradient descent."""
     shapes = [W.shape for W in weights]
     theta = flatten_weights(weights)
+    stop_reason = "max_steps_reached"
+    steps_completed = 0
 
     for step in range(n_steps):
         w = unflatten_weights(theta, shapes)
         current_loss = loss_fn(w, x, y_target, forward_fn)
 
         if current_loss < tol:
+            stop_reason = "loss_below_tol"
             if verbose:
                 print(f"    Converged at step {step}, loss={current_loss:.2e}")
+            steps_completed = step
             break
 
-        grad = compute_gradient(w, x, y_target, forward_fn)
+        grad = compute_gradient(w, x, y_target, forward_fn, eps=grad_eps)
         grad_norm = np.linalg.norm(grad)
 
         if verbose and step % 1000 == 0:
             print(f"    Step {step}: loss={current_loss:.2e}, |grad|={grad_norm:.2e}")
 
         theta -= lr * grad
+        steps_completed = step + 1
+    else:
+        step = n_steps - 1
 
     final_weights = unflatten_weights(theta, shapes)
     final_loss = loss_fn(final_weights, x, y_target, forward_fn)
-    final_grad = compute_gradient(final_weights, x, y_target, forward_fn)
+    final_grad = compute_gradient(final_weights, x, y_target, forward_fn, eps=grad_eps)
 
-    return final_weights, final_loss, np.linalg.norm(final_grad)
-
-
-# ============================================================================
-# Experiment runner
-# ============================================================================
-
-def run_experiment(d, L, forward_fn, net_type, x, y_target, seed=42,
-                   at_minimum=True, label=""):
-    """Run Hessian null space analysis for a single configuration."""
-    np.random.seed(seed)
-
-    total_params = d * d * L
-    predicted_gauge_dim = d * d * (L - 1)
-
-    if net_type == "linear" and at_minimum:
-        # Construct exact minimum analytically
-        W_star = y_target @ x.T @ np.linalg.inv(x @ x.T)
-        weights, recon_err = construct_linear_minimum(d, L, W_star, scramble=True, seed=seed)
-        loss_val = loss_fn(weights, x, y_target, forward_fn)
-        grad = compute_gradient(weights, x, y_target, forward_fn)
-        grad_norm = np.linalg.norm(grad)
-        print(f"    Constructed minimum: recon_err={recon_err:.2e}, "
-              f"loss={loss_val:.2e}, |grad|={grad_norm:.2e}")
-    elif net_type == "relu" and at_minimum:
-        # Train ReLU to minimum
-        weights = []
-        for _ in range(L):
-            W = np.eye(d) * 0.5 + np.random.randn(d, d) * 0.1
-            weights.append(W)
-        print(f"    Training ReLU network...", flush=True)
-        weights, final_loss, grad_norm = train_to_minimum_gd(
-            weights, x, y_target, forward_fn, lr=0.005, n_steps=10000, verbose=True)
-        print(f"    Final: loss={final_loss:.2e}, |grad|={grad_norm:.2e}")
-    else:
-        # Random init
-        weights = []
-        for _ in range(L):
-            W = np.random.randn(d, d) * 0.5 / np.sqrt(d)
-            weights.append(W)
-        loss_val = loss_fn(weights, x, y_target, forward_fn)
-        print(f"    Random init: loss={loss_val:.2e}")
-
-    print(f"    Computing Hessian ({total_params}x{total_params})...", end=" ", flush=True)
-    t0 = time.time()
-    H = compute_hessian(weights, x, y_target, forward_fn, eps=1e-5)
-    elapsed = time.time() - t0
-    print(f"done in {elapsed:.1f}s")
-
-    H = 0.5 * (H + H.T)
-    eigenvalues = np.linalg.eigh(H)[0]
-
-    max_abs_eig = np.max(np.abs(eigenvalues))
-    if max_abs_eig == 0:
-        max_abs_eig = 1.0
-
-    thresholds = [0.01, 0.001, 0.0001]
-    null_counts = {}
-    for thr in thresholds:
-        eps_val = thr * max_abs_eig
-        count = int(np.sum(np.abs(eigenvalues) < eps_val))
-        null_counts[thr] = count
-
-    return {
-        "d": d, "L": L, "net_type": net_type, "label": label,
-        "total_params": total_params,
-        "predicted_gauge_dim": predicted_gauge_dim,
-        "null_counts": null_counts,
-        "eigenvalues": eigenvalues,
-        "max_abs_eig": max_abs_eig,
-        "elapsed": elapsed,
+    return final_weights, {
+        "final_loss": float(final_loss),
+        "final_grad_norm": float(np.linalg.norm(final_grad)),
+        "stop_reason": stop_reason,
+        "steps_completed": int(steps_completed),
+        "last_step_index": int(step),
+        "lr": float(lr),
+        "tol": float(tol),
+        "n_steps": int(n_steps),
+        "grad_eps": float(grad_eps),
     }
 
 
+# ============================================================================
+# Experiment planning helpers
+# ============================================================================
+
+def dataset_seed_for_config(d, L, data_seed_offset=DEFAULT_DATA_SEED_OFFSET):
+    return int(data_seed_offset + d * 10 + L)
+
+
+
+def get_default_experiment_plan(relu_verbose=False):
+    """Return the default experiment plan, matching the original configuration set."""
+    return {
+        "plan_name": "default",
+        "linear_min_configs": [tuple(cfg) for cfg in DEFAULT_LINEAR_MIN_CONFIGS],
+        "linear_control_configs": [tuple(cfg) for cfg in DEFAULT_LINEAR_CONTROL_CONFIGS],
+        "relu_configs": [tuple(cfg) for cfg in DEFAULT_RELU_CONFIGS],
+        "n_samples": int(DEFAULT_N_SAMPLES),
+        "model_seed": int(DEFAULT_MODEL_SEED),
+        "data_seed_offset": int(DEFAULT_DATA_SEED_OFFSET),
+        "grad_eps": float(DEFAULT_GRAD_EPS),
+        "hess_eps": float(DEFAULT_HESS_EPS),
+        "null_thresholds": tuple(float(t) for t in DEFAULT_NULL_THRESHOLDS),
+        "relu_train_kwargs": {
+            "lr": 0.005,
+            "n_steps": 10000,
+            "tol": 1e-12,
+            "verbose": bool(relu_verbose),
+        },
+    }
+
+
+
+def get_smoke_experiment_plan(relu_verbose=False):
+    """A reduced plan for quick verification of script and notebook code paths."""
+    return {
+        "plan_name": "smoke",
+        "linear_min_configs": [(4, 2)],
+        "linear_control_configs": [(4, 2)],
+        "relu_configs": [],
+        "n_samples": int(DEFAULT_N_SAMPLES),
+        "model_seed": int(DEFAULT_MODEL_SEED),
+        "data_seed_offset": int(DEFAULT_DATA_SEED_OFFSET),
+        "grad_eps": float(DEFAULT_GRAD_EPS),
+        "hess_eps": float(DEFAULT_HESS_EPS),
+        "null_thresholds": tuple(float(t) for t in DEFAULT_NULL_THRESHOLDS),
+        "relu_train_kwargs": {
+            "lr": 0.005,
+            "n_steps": 2000,
+            "tol": 1e-12,
+            "verbose": bool(relu_verbose),
+        },
+    }
+
+
+
+def make_dataset(d, L, n_samples, data_seed):
+    """Construct the synthetic linear target dataset used throughout the experiment."""
+    rng = np.random.RandomState(data_seed)
+    x = rng.randn(d, n_samples)
+    W_target = rng.randn(d, d) * 0.5
+    y_target = W_target @ x
+    return {
+        "x": x,
+        "y_target": y_target,
+        "W_target": W_target,
+        "data_seed": int(data_seed),
+        "n_samples": int(n_samples),
+        "config": (int(d), int(L)),
+    }
+
+
+
+def build_experiment_tasks(plan):
+    tasks = []
+    model_seed = int(plan["model_seed"])
+    data_seed_offset = int(plan["data_seed_offset"])
+
+    for d, L in plan["linear_min_configs"]:
+        tasks.append({
+            "group": "linear_exact_minimum",
+            "condition": "exact_minimum",
+            "label": f"LINEAR@exact-min d={d},L={L}",
+            "d": int(d),
+            "L": int(L),
+            "net_type": "linear",
+            "forward_fn": forward_linear,
+            "at_minimum": True,
+            "data_seed": dataset_seed_for_config(d, L, data_seed_offset),
+            "model_seed": model_seed,
+        })
+
+    for d, L in plan["linear_control_configs"]:
+        tasks.append({
+            "group": "linear_random_control",
+            "condition": "random_init",
+            "label": f"LINEAR@rand d={d},L={L}",
+            "d": int(d),
+            "L": int(L),
+            "net_type": "linear",
+            "forward_fn": forward_linear,
+            "at_minimum": False,
+            "data_seed": dataset_seed_for_config(d, L, data_seed_offset),
+            "model_seed": model_seed,
+        })
+
+    for d, L in plan["relu_configs"]:
+        tasks.append({
+            "group": "relu_trained_exploratory",
+            "condition": "trained_endpoint",
+            "label": f"RELU@trained d={d},L={L}",
+            "d": int(d),
+            "L": int(L),
+            "net_type": "relu",
+            "forward_fn": forward_relu,
+            "at_minimum": True,
+            "data_seed": dataset_seed_for_config(d, L, data_seed_offset),
+            "model_seed": model_seed,
+        })
+
+    return tasks
+
+
+# ============================================================================
+# Reporting helpers
+# ============================================================================
+
+def threshold_to_display(threshold):
+    return f"{threshold * 100:g}%"
+
+
+
+def threshold_to_key(threshold):
+    return threshold_to_display(threshold).replace("%", "pct").replace(".", "p")
+
+
+
+def format_float(value, precision=3):
+    if value is None:
+        return "n/a"
+    return f"{value:.{precision}e}"
+
+
+
+def select_results(results, group=None, net_type=None, condition=None):
+    selected = list(results)
+    if group is not None:
+        selected = [r for r in selected if r["group"] == group]
+    if net_type is not None:
+        selected = [r for r in selected if r["net_type"] == net_type]
+    if condition is not None:
+        selected = [r for r in selected if r["condition"] == condition]
+    return selected
+
+
+
+def make_summary_rows(results):
+    rows = []
+    for r in results:
+        row = {
+            "group": r["group"],
+            "label": r["label"],
+            "d": r["d"],
+            "L": r["L"],
+            "net_type": r["net_type"],
+            "condition": r["condition"],
+            "total_params": r["total_params"],
+            "predicted_gauge_dim": r["predicted_gauge_dim"],
+            "loss_value": r["loss_value"],
+            "grad_norm": r["grad_norm"],
+            "reconstruction_error": r["reconstruction_error"],
+            "n_negative": r["n_negative"],
+            "hessian_asymmetry": r["hessian_asymmetry"],
+            "max_abs_eig": r["max_abs_eig"],
+            "elapsed_s": r["elapsed"],
+        }
+        for threshold in r["null_thresholds"]:
+            key = threshold_to_key(threshold)
+            row[f"null_count_{key}"] = r["null_counts"][threshold]
+            row[f"null_ratio_{key}"] = r["null_ratios_to_prediction"][threshold]
+            row[f"abs_eps_{key}"] = r["threshold_epsilons"][threshold]
+        rows.append(row)
+    return rows
+
+
+
 def print_results_table(results, title=""):
+    if not results:
+        return
+
+    thresholds = results[0]["null_thresholds"]
     if title:
-        print(f"\n{'='*130}")
+        print(f"\n{'=' * 150}")
         print(title)
-        print("=" * 130)
-    print(f"{'Label':<30} {'Params':<7} {'Predicted':<10} "
-          f"{'eps=1%':<8} {'ratio':<7} {'eps=0.1%':<8} {'ratio':<7} "
-          f"{'eps=0.01%':<9} {'ratio':<7} {'max|eig|':<12}")
-    print("-" * 130)
+        print("=" * 150)
+
+    header = [
+        f"{'Label':<28}",
+        f"{'Pred':>6}",
+    ]
+    for threshold in thresholds:
+        header.append(f"{threshold_to_display(threshold):>8}")
+    header.extend([
+        f"{'|grad|':>11}",
+        f"{'neg':>5}",
+        f"{'asym':>11}",
+        f"{'elapsed':>10}",
+    ])
+    print(" ".join(header))
+    print("-" * 150)
 
     for r in results:
-        label = r["label"] or f"d={r['d']},L={r['L']},{r['net_type']}"
-        pred = r["predicted_gauge_dim"]
-        nc = r["null_counts"]
-        ratios = {thr: nc[thr] / pred if pred > 0 else 0
-                  for thr in [0.01, 0.001, 0.0001]}
+        row = [
+            f"{r['label']:<28}",
+            f"{r['predicted_gauge_dim']:>6}",
+        ]
+        for threshold in thresholds:
+            row.append(f"{r['null_counts'][threshold]:>8}")
+        row.extend([
+            f"{r['grad_norm']:>11.3e}",
+            f"{r['n_negative']:>5}",
+            f"{r['hessian_asymmetry']:>11.3e}",
+            f"{r['elapsed']:>10.2f}s",
+        ])
+        print(" ".join(row))
 
-        print(f"{label:<30} {r['total_params']:<7} {pred:<10} "
-              f"{nc[0.01]:<8} {ratios[0.01]:<7.2f} {nc[0.001]:<8} {ratios[0.001]:<7.2f} "
-              f"{nc[0.0001]:<9} {ratios[0.0001]:<7.2f} {r['max_abs_eig']:<12.6f}")
 
 
-def print_eigenvalue_details(r):
-    """Print eigenvalue details for a single result."""
-    eigs = np.sort(np.abs(r["eigenvalues"]))
-    max_eig = r["max_abs_eig"]
-    pred = r["predicted_gauge_dim"]
+def print_eigenvalue_details(result):
+    """Print eigenvalue diagnostics for a single result."""
+    eigs = result["eigenvalues_abs_sorted"]
+    max_eig = result["max_abs_eig"]
+    pred = result["predicted_gauge_dim"]
     n = len(eigs)
-    label = r["label"] or f"d={r['d']},L={r['L']},{r['net_type']}"
 
-    print(f"\n  --- {label} ---")
+    print(f"\n  --- {result['label']} ---")
     print(f"  Max |eigenvalue|: {max_eig:.8f}")
     print(f"  Min |eigenvalue|: {eigs[0]:.2e}")
+    print(f"  Gradient norm:    {result['grad_norm']:.3e}")
+    print(f"  Negative eigs:    {result['n_negative']}")
+    print(f"  Hessian asymmetry:{result['hessian_asymmetry']:.3e}")
 
     if n <= 70:
-        # Print all eigenvalues grouped
-        print(f"  Full spectrum (sorted by |value|):")
+        print("  Full spectrum (sorted by |value|):")
         for idx in range(n):
             marker = ""
             if idx == pred:
-                marker = " <<<< PREDICTED GAUGE BOUNDARY"
-            ratio_to_max = eigs[idx] / max_eig if max_eig > 0 else 0
-            print(f"    [{idx:3d}] {eigs[idx]:15.8e}  ({ratio_to_max:.4e}){marker}")
+                marker = " <<<< predicted linear gauge boundary"
+            ratio_to_max = eigs[idx] / max_eig if max_eig > 0 else 0.0
+            print(f"    [{idx:3d}] {eigs[idx]:15.8e} ({ratio_to_max:.4e}){marker}")
     else:
-        print(f"  Smallest 15:")
+        print("  Smallest 15:")
         for idx in range(min(15, n)):
             print(f"    [{idx:3d}] {eigs[idx]:15.8e}")
         if pred > 0 and pred < n:
@@ -334,210 +515,413 @@ def print_eigenvalue_details(r):
             hi = min(n, pred + 5)
             print(f"  Around predicted boundary (idx {pred}):")
             for idx in range(lo, hi):
-                marker = " <<<< PREDICTED" if idx == pred else ""
+                marker = " <<<< predicted" if idx == pred else ""
                 print(f"    [{idx:3d}] {eigs[idx]:15.8e}{marker}")
-        print(f"  Largest 5:")
+        print("  Largest 5:")
         for idx in range(max(0, n - 5), n):
             print(f"    [{idx:3d}] {eigs[idx]:15.8e}")
 
-    if pred > 0 and pred < n and eigs[pred - 1] > 0:
+    if 0 < pred < n and eigs[pred - 1] > 0:
         gap = eigs[pred] / eigs[pred - 1]
-        print(f"  Spectral gap at boundary: eig[{pred}]/eig[{pred-1}] = {gap:.1f}x")
+        print(f"  Boundary gap eig[{pred}]/eig[{pred - 1}] = {gap:.1f}x")
 
 
-def main():
+
+def print_interpretive_summary(bundle):
+    """Print an evidence-tied summary without overclaiming."""
+    results = bundle["results"]
+    thresholds = bundle["plan"]["null_thresholds"]
+    primary_threshold = thresholds[0]
+
+    linear_min = select_results(results, group="linear_exact_minimum")
+    linear_rand = select_results(results, group="linear_random_control")
+    relu_runs = select_results(results, group="relu_trained_exploratory")
+
+    print(f"\n{'=' * 100}")
+    print("INTERPRETIVE SUMMARY")
     print("=" * 100)
-    print("Experiment 1.3b-ii-B: Hessian Null Space Dimension vs Network Symmetry Count")
+    print(
+        "Primary observable: thresholded counts of near-zero Hessian eigenvalues, "
+        f"using relative thresholds {', '.join(threshold_to_display(t) for t in thresholds)}."
+    )
+    print(
+        "Primary theoretical comparison: deep linear exact-minimum cases vs the "
+        "linear gauge-dimension prediction d^2 (L - 1)."
+    )
+
+    if linear_min:
+        print("\nLinear exact-minimum cases (primary test):")
+        match_like = 0
+        for r in linear_min:
+            ratio = r["null_ratios_to_prediction"][primary_threshold]
+            verdict = "consistent" if 0.8 <= ratio <= 1.2 else "threshold-sensitive"
+            if verdict == "consistent":
+                match_like += 1
+            print(
+                f"  {r['label']}: predicted={r['predicted_gauge_dim']}, "
+                f"observed@{threshold_to_display(primary_threshold)}={r['null_counts'][primary_threshold]}, "
+                f"ratio={ratio:.3f}, verdict={verdict}"
+            )
+        print(
+            f"  -> {match_like}/{len(linear_min)} exact-minimum linear runs are within a "
+            "0.8-1.2 observed/predicted ratio band at the loosest threshold."
+        )
+
+    if linear_rand:
+        print("\nLinear random-initialization controls:")
+        for r in linear_rand:
+            ratio = r["null_ratios_to_prediction"][primary_threshold]
+            print(
+                f"  {r['label']}: predicted={r['predicted_gauge_dim']}, "
+                f"observed@{threshold_to_display(primary_threshold)}={r['null_counts'][primary_threshold]}, "
+                f"ratio={ratio:.3f}"
+            )
+
+    if relu_runs:
+        print("\nExploratory ReLU-trained runs:")
+        for rr in relu_runs:
+            matched_linear = next(
+                (
+                    r for r in linear_min
+                    if r["d"] == rr["d"] and r["L"] == rr["L"]
+                ),
+                None,
+            )
+            comparison = ""
+            if matched_linear is not None:
+                comparison = (
+                    f", linear exact-minimum observed@{threshold_to_display(primary_threshold)}="
+                    f"{matched_linear['null_counts'][primary_threshold]}"
+                )
+            print(
+                f"  {rr['label']}: loss={rr['loss_value']:.3e}, |grad|={rr['grad_norm']:.3e}, "
+                f"observed@{threshold_to_display(primary_threshold)}={rr['null_counts'][primary_threshold]}"
+                f"{comparison}"
+            )
+        print("  -> These runs are exploratory only; no nonlinear symmetry dimension is computed.")
+
+    print("\nEstablished in this script's actual computation:")
+    print("  - The measured quantity is a thresholded near-zero Hessian count, not an exact symmetry count.")
+    print("  - Constructed deep linear minima are the main test bed; random linear initializations are controls.")
+    print("  - ReLU results, if any, should be interpreted cautiously and only as exploratory comparisons.")
+
+    print("\nUntested in this experiment:")
+    print("  - direct construction of gauge tangent vectors and overlap with the null eigenspace")
+    print("  - finite-difference step-size robustness sweeps")
+    print("  - Muon-vs-SGD update alignment with Hessian flat directions")
+
+
+
+def print_bundle_report(bundle):
+    results = bundle["results"]
+    groups = bundle["groups"]
+
     print("=" * 100)
-    print()
-    print("Theory: For L layers of width d, gauge group GL(d)^{L-1} => d^2*(L-1) flat directions.")
-    print("At a MINIMUM, these become zero-eigenvalue directions of the Hessian.")
-    print()
-    print("Approach: Construct exact minima for deep linear networks via")
-    print("  W_1 = W*, W_2=...=W_L=I, then apply random gauge transforms.")
-    print("  Product is preserved exactly, so we are at a true minimum.")
-    print()
-
-    configs = [
-        (4, 2),  # 32 params, predicted gauge dim = 16
-        (4, 3),  # 48 params, predicted gauge dim = 32
-        (4, 4),  # 64 params, predicted gauge dim = 48
-        (6, 3),  # 108 params, predicted gauge dim = 72
-    ]
-
-    n_samples = 20
-    all_results = []
-
-    # ========================================================================
-    # PART 1: Linear networks at EXACT minimum
-    # ========================================================================
-    print("\n" + "#" * 100)
-    print("# PART 1: Deep Linear Networks at Exact Minimum")
-    print("#" * 100)
-
-    for d, L in configs:
-        print(f"\n{'='*80}")
-        print(f"d={d}, L={L}: params={d*d*L}, gauge_dim={d*d*(L-1)}, "
-              f"physical_dim={d*d}")
-        print(f"{'='*80}")
-
-        np.random.seed(100 + d * 10 + L)
-        x = np.random.randn(d, n_samples)
-        W_target = np.random.randn(d, d) * 0.5
-        y_target = W_target @ x
-
-        result = run_experiment(
-            d, L, forward_linear, "linear", x, y_target,
-            seed=42, at_minimum=True,
-            label=f"LINEAR@min d={d},L={L}")
-        all_results.append(result)
-
-    # ========================================================================
-    # PART 2: Linear networks at random init (control)
-    # ========================================================================
-    print("\n\n" + "#" * 100)
-    print("# PART 2: Deep Linear Networks at Random Init (Control)")
-    print("#" * 100)
-
-    for d, L in [(4, 2), (4, 3)]:
-        print(f"\n{'='*80}")
-        print(f"d={d}, L={L}: random init (NOT at minimum)")
-        print(f"{'='*80}")
-
-        np.random.seed(100 + d * 10 + L)
-        x = np.random.randn(d, n_samples)
-        W_target = np.random.randn(d, d) * 0.5
-        y_target = W_target @ x
-
-        result = run_experiment(
-            d, L, forward_linear, "lin-rand", x, y_target,
-            seed=42, at_minimum=False,
-            label=f"LINEAR@rand d={d},L={L}")
-        all_results.append(result)
-
-    # ========================================================================
-    # PART 3: ReLU networks trained toward minimum
-    # ========================================================================
-    print("\n\n" + "#" * 100)
-    print("# PART 3: ReLU Networks Trained Toward Minimum")
-    print("#" * 100)
-
-    for d, L in [(4, 2), (4, 3)]:
-        print(f"\n{'='*80}")
-        print(f"d={d}, L={L}: ReLU trained")
-        print(f"{'='*80}")
-
-        np.random.seed(100 + d * 10 + L)
-        x = np.random.randn(d, n_samples)
-        W_target = np.random.randn(d, d) * 0.5
-        y_target = W_target @ x
-
-        result = run_experiment(
-            d, L, forward_relu, "relu", x, y_target,
-            seed=42, at_minimum=True,
-            label=f"RELU@min d={d},L={L}")
-        all_results.append(result)
-
-    # ========================================================================
-    # Print results
-    # ========================================================================
-    linear_min = [r for r in all_results if "LINEAR@min" in r["label"]]
-    linear_rand = [r for r in all_results if "LINEAR@rand" in r["label"]]
-    relu_min = [r for r in all_results if "RELU" in r["label"]]
-
-    print_results_table(linear_min, "LINEAR NETWORKS AT EXACT MINIMUM")
-    print("\n  EIGENVALUE SPECTRA:")
-    for r in linear_min:
-        print_eigenvalue_details(r)
-
-    print_results_table(linear_rand, "LINEAR NETWORKS AT RANDOM INIT (CONTROL)")
-    for r in linear_rand:
-        print_eigenvalue_details(r)
-
-    print_results_table(relu_min, "RELU NETWORKS AT MINIMUM")
-    for r in relu_min:
-        print_eigenvalue_details(r)
-
-    # ========================================================================
-    # Analysis
-    # ========================================================================
-    print("\n\n" + "=" * 100)
-    print("ANALYSIS")
+    print(bundle["title"])
     print("=" * 100)
+    print(bundle["scope"])
+    print(
+        f"\nPlan '{bundle['plan']['plan_name']}' | n_samples={bundle['plan']['n_samples']} | "
+        f"grad_eps={bundle['plan']['grad_eps']} | hess_eps={bundle['plan']['hess_eps']}"
+    )
+    print(
+        "Thresholds: "
+        + ", ".join(threshold_to_display(t) for t in bundle["plan"]["null_thresholds"])
+    )
 
-    print("\n--- Linear at minimum: Does null count match d^2*(L-1)? ---")
-    print(f"{'Config':<25} {'predicted':<10} {'obs(1%)':<10} {'ratio':<8} {'verdict':<10}")
-    print("-" * 63)
-    good_count = 0
-    for r in linear_min:
-        pred = r["predicted_gauge_dim"]
-        obs = r["null_counts"][0.01]
-        ratio = obs / pred if pred > 0 else 0
-        verdict = "MATCH" if 0.8 <= ratio <= 1.2 else (
-            "CLOSE" if 0.5 <= ratio <= 1.5 else "MISMATCH")
-        if ratio >= 0.8:
-            good_count += 1
-        print(f"{r['label']:<25} {pred:<10} {obs:<10} {ratio:<8.3f} {verdict:<10}")
+    for group_name in [
+        "linear_exact_minimum",
+        "linear_random_control",
+        "relu_trained_exploratory",
+    ]:
+        group_results = groups[group_name]
+        if not group_results:
+            continue
+        print_results_table(group_results, GROUP_TITLES[group_name])
+        print("\n  EIGENVALUE DETAILS:")
+        for result in group_results:
+            print_eigenvalue_details(result)
 
-    print("\n--- Control: Random init should NOT show null space ---")
-    for r in linear_rand:
-        pred = r["predicted_gauge_dim"]
-        obs = r["null_counts"][0.01]
-        ratio = obs / pred if pred > 0 else 0
-        print(f"  {r['label']}: predicted={pred}, observed={obs}, ratio={ratio:.3f}")
+    print_interpretive_summary(bundle)
 
-    print("\n--- ReLU: Should show fewer null directions than linear ---")
-    for rr in relu_min:
-        rl = [r for r in linear_min if r["d"] == rr["d"] and r["L"] == rr["L"]]
-        if rl:
-            lin_null = rl[0]["null_counts"][0.01]
-            relu_null = rr["null_counts"][0.01]
-            print(f"  d={rr['d']},L={rr['L']}: linear_null={lin_null}, "
-                  f"relu_null={relu_null}")
 
-    # Key test
-    print("\n--- KEY TEST: d=4, L=3 (Linear at minimum) ---")
-    key = [r for r in linear_min if r["d"] == 4 and r["L"] == 3]
-    if key:
-        r = key[0]
-        pred = r["predicted_gauge_dim"]
-        eigs = np.sort(np.abs(r["eigenvalues"]))
-        print(f"  Total params: {r['total_params']}")
-        print(f"  Predicted gauge dim: {pred} = 4^2 * 2 = 32")
-        print(f"  Non-null (physical) dims: {r['total_params'] - pred} = 16")
-        for thr in [0.01, 0.001, 0.0001]:
-            obs = r["null_counts"][thr]
-            print(f"  Threshold {thr}: null_count={obs}, "
-                  f"ratio={obs/pred:.3f}")
-        # Show the gap
-        if pred < len(eigs) and eigs[pred - 1] > 0:
-            print(f"  Spectral gap: eig[{pred}]/eig[{pred-1}] = "
-                  f"{eigs[pred]/eigs[pred-1]:.1f}x")
+# ============================================================================
+# Single-run and full-run execution
+# ============================================================================
 
-    # Verdict
-    print("\n" + "=" * 100)
-    print("VERDICT")
-    print("=" * 100)
+def run_experiment(d, L, forward_fn, net_type, x, y_target, seed=42,
+                   at_minimum=True, label="", group="", condition="",
+                   grad_eps=DEFAULT_GRAD_EPS, hess_eps=DEFAULT_HESS_EPS,
+                   thresholds=DEFAULT_NULL_THRESHOLDS,
+                   relu_train_kwargs=None, data_seed=None,
+                   print_progress=True):
+    """Run Hessian near-zero-count analysis for a single configuration."""
+    total_params = d * d * L
+    predicted_gauge_dim = d * d * (L - 1)
+    thresholds = tuple(float(t) for t in thresholds)
+    relu_train_kwargs = dict(relu_train_kwargs or {})
+    warnings = []
 
-    if good_count >= len(linear_min) * 0.75:
-        print("\n=> HYPOTHESIS STRONGLY SUPPORTED:")
-        print("   Hessian null space dimension matches d^2*(L-1) at minima")
-        print("   of deep linear networks. DIRECT evidence of gauge flat directions.")
-    elif good_count >= len(linear_min) * 0.5:
-        print("\n=> HYPOTHESIS PARTIALLY SUPPORTED:")
-        print("   Some configs match, others do not.")
+    loss_value = None
+    grad_norm = None
+    reconstruction_error = None
+    xtx_condition_number = None
+    training_info = None
+
+    if print_progress:
+        print(f"\n{'=' * 88}")
+        print(
+            f"{label} | group={group} | params={total_params} | "
+            f"predicted linear gauge dim={predicted_gauge_dim}"
+        )
+        print(f"{'=' * 88}")
+
+    if net_type == "linear" and at_minimum:
+        xtx = x @ x.T
+        xtx_condition_number = float(np.linalg.cond(xtx))
+        if xtx_condition_number > 1e8:
+            warnings.append(
+                f"x @ x.T is ill-conditioned (cond={xtx_condition_number:.3e}); W_star recovery may be unstable."
+            )
+        W_star = y_target @ x.T @ np.linalg.inv(xtx)
+        weights, reconstruction_error = construct_linear_minimum(
+            d, L, W_star, scramble=True, seed=seed
+        )
+        loss_value = float(loss_fn(weights, x, y_target, forward_fn))
+        grad_norm = float(
+            np.linalg.norm(compute_gradient(weights, x, y_target, forward_fn, eps=grad_eps))
+        )
+        if print_progress:
+            print(
+                f"    Constructed exact minimum: recon_err={reconstruction_error:.2e}, "
+                f"loss={loss_value:.2e}, |grad|={grad_norm:.2e}"
+            )
+    elif net_type == "relu" and at_minimum:
+        rng = np.random.RandomState(seed)
+        weights = [np.eye(d) * 0.5 + rng.randn(d, d) * 0.1 for _ in range(L)]
+        if print_progress:
+            print("    Training ReLU network toward low loss...", flush=True)
+        weights, training_info = train_to_minimum_gd(
+            weights,
+            x,
+            y_target,
+            forward_fn,
+            grad_eps=grad_eps,
+            **relu_train_kwargs,
+        )
+        loss_value = float(training_info["final_loss"])
+        grad_norm = float(training_info["final_grad_norm"])
+        if print_progress:
+            print(
+                f"    Final trained endpoint: loss={loss_value:.2e}, |grad|={grad_norm:.2e}, "
+                f"stop_reason={training_info['stop_reason']}"
+            )
     else:
-        print("\n=> RESULTS NEED EXAMINATION:")
-        print("   Check eigenvalue spectra for a clear gap at the predicted boundary.")
-        print("   The exact null space count depends on threshold choice.")
-        print("   Look at the SPECTRAL GAP rather than raw counts.")
+        rng = np.random.RandomState(seed)
+        weights = [rng.randn(d, d) * 0.5 / np.sqrt(d) for _ in range(L)]
+        loss_value = float(loss_fn(weights, x, y_target, forward_fn))
+        grad_norm = float(
+            np.linalg.norm(compute_gradient(weights, x, y_target, forward_fn, eps=grad_eps))
+        )
+        if print_progress:
+            print(f"    Random init control: loss={loss_value:.2e}, |grad|={grad_norm:.2e}")
 
-    print("\nTheoretical prediction:")
-    for d, L in configs:
-        total = d * d * L
-        gauge = d * d * (L - 1)
-        phys = d * d
-        print(f"  d={d}, L={L}: {total} params = {gauge} gauge + {phys} physical")
+    if print_progress:
+        print(f"    Computing Hessian ({total_params}x{total_params})...", end=" ", flush=True)
+    t0 = time.time()
+    H_raw = compute_hessian(weights, x, y_target, forward_fn, eps=hess_eps)
+    elapsed = time.time() - t0
+    if print_progress:
+        print(f"done in {elapsed:.1f}s")
+
+    hessian_asymmetry = float(
+        np.linalg.norm(H_raw - H_raw.T) / (np.linalg.norm(H_raw) + 1e-15)
+    )
+    H = 0.5 * (H_raw + H_raw.T)
+    eigenvalues = np.linalg.eigvalsh(H)
+    eigenvalues_abs_sorted = np.sort(np.abs(eigenvalues))
+
+    max_abs_eig = float(np.max(np.abs(eigenvalues)))
+    if max_abs_eig == 0.0:
+        max_abs_eig = 1.0
+
+    n_negative = int(np.sum(eigenvalues < 0.0))
+    null_counts = {}
+    null_ratios_to_prediction = {}
+    threshold_epsilons = {}
+    for threshold in thresholds:
+        abs_eps = float(threshold * max_abs_eig)
+        count = int(np.sum(np.abs(eigenvalues) < abs_eps))
+        null_counts[threshold] = count
+        null_ratios_to_prediction[threshold] = (
+            count / predicted_gauge_dim if predicted_gauge_dim > 0 else 0.0
+        )
+        threshold_epsilons[threshold] = abs_eps
+
+    if at_minimum and grad_norm is not None and grad_norm > 1e-5:
+        warnings.append(
+            f"Gradient norm at claimed minimum/endpoint is not very small (|grad|={grad_norm:.3e})."
+        )
+    if reconstruction_error is not None and reconstruction_error > 1e-10:
+        warnings.append(
+            f"Linear factorization reconstruction error is not tiny (recon_err={reconstruction_error:.3e})."
+        )
+    if at_minimum and n_negative > 0:
+        warnings.append(
+            f"Hessian has {n_negative} negative eigenvalues at the analyzed endpoint."
+        )
+    if null_counts:
+        spread = max(null_counts.values()) - min(null_counts.values())
+        if predicted_gauge_dim > 0 and spread > max(2, int(0.25 * predicted_gauge_dim)):
+            warnings.append(
+                "Thresholded null count varies substantially across thresholds; interpretation is threshold-sensitive."
+            )
+
+    return {
+        "d": int(d),
+        "L": int(L),
+        "net_type": net_type,
+        "forward_name": forward_fn.__name__,
+        "group": group,
+        "condition": condition,
+        "label": label,
+        "at_minimum": bool(at_minimum),
+        "data_seed": data_seed,
+        "model_seed": int(seed),
+        "n_samples": int(x.shape[1]),
+        "total_params": int(total_params),
+        "predicted_gauge_dim": int(predicted_gauge_dim),
+        "loss_value": loss_value,
+        "grad_norm": grad_norm,
+        "reconstruction_error": reconstruction_error,
+        "xtx_condition_number": xtx_condition_number,
+        "training_info": training_info,
+        "hessian_asymmetry": hessian_asymmetry,
+        "eigenvalues": eigenvalues,
+        "eigenvalues_abs_sorted": eigenvalues_abs_sorted,
+        "min_eigenvalue": float(np.min(eigenvalues)),
+        "max_eigenvalue": float(np.max(eigenvalues)),
+        "max_abs_eig": max_abs_eig,
+        "n_negative": n_negative,
+        "null_thresholds": thresholds,
+        "null_counts": null_counts,
+        "null_ratios_to_prediction": null_ratios_to_prediction,
+        "threshold_epsilons": threshold_epsilons,
+        "elapsed": float(elapsed),
+        "warnings": warnings,
+    }
+
+
+
+def run_full_experiment(plan=None, print_progress=True):
+    """Run the full configured experiment and return a notebook-friendly result bundle."""
+    if plan is None:
+        plan = get_default_experiment_plan()
+
+    plan = dict(plan)
+    plan["linear_min_configs"] = [tuple(cfg) for cfg in plan.get("linear_min_configs", [])]
+    plan["linear_control_configs"] = [tuple(cfg) for cfg in plan.get("linear_control_configs", [])]
+    plan["relu_configs"] = [tuple(cfg) for cfg in plan.get("relu_configs", [])]
+    plan["null_thresholds"] = tuple(float(t) for t in plan.get("null_thresholds", DEFAULT_NULL_THRESHOLDS))
+    plan["relu_train_kwargs"] = dict(plan.get("relu_train_kwargs", {}))
+
+    tasks = build_experiment_tasks(plan)
+    results = []
+
+    last_group = None
+    for task in tasks:
+        if print_progress and task["group"] != last_group:
+            print("\n" + "#" * 100)
+            print(f"# {GROUP_TITLES[task['group']]}")
+            print("#" * 100)
+            last_group = task["group"]
+
+        dataset = make_dataset(
+            task["d"], task["L"], plan["n_samples"], task["data_seed"]
+        )
+        result = run_experiment(
+            task["d"],
+            task["L"],
+            task["forward_fn"],
+            task["net_type"],
+            dataset["x"],
+            dataset["y_target"],
+            seed=task["model_seed"],
+            at_minimum=task["at_minimum"],
+            label=task["label"],
+            group=task["group"],
+            condition=task["condition"],
+            grad_eps=plan["grad_eps"],
+            hess_eps=plan["hess_eps"],
+            thresholds=plan["null_thresholds"],
+            relu_train_kwargs=plan["relu_train_kwargs"],
+            data_seed=task["data_seed"],
+            print_progress=print_progress,
+        )
+        results.append(result)
+
+    groups = {
+        "linear_exact_minimum": select_results(results, group="linear_exact_minimum"),
+        "linear_random_control": select_results(results, group="linear_random_control"),
+        "relu_trained_exploratory": select_results(results, group="relu_trained_exploratory"),
+    }
+
+    return {
+        "experiment_id": "1.3b-ii-B",
+        "title": "Experiment 1.3b-ii-B: Thresholded Near-Zero Hessian Counts vs Linear Gauge-Dimension Prediction",
+        "scope": (
+            "Toy finite-difference Hessian study. Linear exact-minimum cases are the main comparison; "
+            "random linear initializations are controls; ReLU runs are exploratory only."
+        ),
+        "plan": plan,
+        "tasks": tasks,
+        "results": results,
+        "groups": groups,
+        "summary_rows": make_summary_rows(results),
+    }
+
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run Experiment 1.3b-ii-B: compare thresholded near-zero Hessian counts "
+            "to the linear gauge-dimension prediction in selected toy cases."
+        )
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run a reduced configuration set for quick verification.",
+    )
+    parser.add_argument(
+        "--no-relu",
+        action="store_true",
+        help="Skip the exploratory ReLU runs.",
+    )
+    parser.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="Suppress per-configuration progress messages during execution.",
+    )
+    parser.add_argument(
+        "--relu-verbose",
+        action="store_true",
+        help="Print intermediate ReLU training progress every 1000 steps.",
+    )
+    args = parser.parse_args(argv)
+
+    plan = (
+        get_smoke_experiment_plan(relu_verbose=args.relu_verbose)
+        if args.smoke
+        else get_default_experiment_plan(relu_verbose=args.relu_verbose)
+    )
+    if args.no_relu:
+        plan["relu_configs"] = []
+
+    bundle = run_full_experiment(plan=plan, print_progress=not args.quiet_progress)
+    print_bundle_report(bundle)
+    return bundle
 
 
 if __name__ == "__main__":

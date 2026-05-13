@@ -3,69 +3,125 @@
 Exp 2.1b: Does Conjugation Covariance Persist Through Momentum?
 ================================================================
 
-KEY QUESTION: Momentum breaks equivariance because:
-  m_t = beta * m_{t-1} + (1-beta) * G_t
-accumulates gradients from different W_t values (which have drifted from the
-initial rotation). After 50 training steps, is equivariance still approximately
-preserved?
+Finite-scope numerical study of Muon+momentum under bilateral orthogonal
+conjugation. The default configuration preserves the original first-pass setup:
+50 Muon-style updates, momentum beta=0.9, 20 seeds, and matrix sizes 4x4 and 8x8.
 
-Protocol:
-  - Generate random W_0, training data (X, Y), and orthogonal R, S.
-  - Path A: Run 50 Muon steps from W_0 -> W_50
-  - Path B: Run 50 Muon steps from R*W_0*S^T -> W_50'
-  - If perfectly equivariant: W_50' = R * W_50 * S^T
-  - Measure: ||W_50' - R * W_50 * S^T||_F / ||W_50||_F
+This file compares three single-matrix scenarios under W -> R W S^T:
+  A. Random conjugated gradients (positive control)
+  B. Fixed-frame single-layer linear MSE gradients (negative control)
+  C. Equivariant Frobenius-loss gradients (positive control)
 
-Two sub-experiments:
-  1. ISOLATED (no data dependence): G_t is random noise each step.
-     This tests pure optimizer equivariance.
-     Expected: EXACT equivariance (because R*noise*S^T has same distribution).
-     Actually: the SAME random G_t must be used for both paths, conjugated.
+Primary metric:
+  final relative covariance error
+    ||W'_T - R W_T S^T||_F / ||W_T||_F
 
-  2. DATA-DRIVEN: G_t comes from actual backprop on shared data.
-     The gradients depend on W_t, so the paths diverge.
-     Expected: equivariance BREAKS because gradient depends on W nonlinearly
-     through the loss function (unless the loss itself is equivariant).
+Secondary diagnostics:
+  sampled single-trial trajectories over the 50 updates.
 
-  For a linear net y = W_L ... W_1 x with MSE loss:
-     The loss IS equivariant under orthogonal conjugation of a SINGLE layer
-     ONLY if adjacent layers also transform. So for a single-layer net
-     y = Wx, the loss L(W) = ||Wx - y||^2 is NOT equivariant under
-     W -> RWS^T (because x and y don't transform).
-
-  We test both cases:
-    (a) Single matrix, random gradients (exact equivariance expected)
-    (b) Single matrix, data-driven gradients (equivariance breaks expected)
-    (c) Multi-step Muon on a single layer with EQUIVARIANT loss:
-        L(W) depends only on singular values of W -> equivariant loss
+Interpretation is intentionally calibrated:
+  - Positive-control success here is sampled numerical evidence at the tested
+    float64 configuration, not a universal proof claim by itself.
+  - The failure in case B is attributed to the fixed-frame data-driven gradient
+    map not being conjugation-equivariant under this setup; this file does not
+    isolate momentum as the sole causal variable.
 """
 
+from __future__ import annotations
+
+import time
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Tuple
+
 import numpy as np
-import os
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-N_STEPS = 50
-LR = 0.02
-MOMENTUM_BETA = 0.9
-NS_ITERS = 5
-N_TRIALS = 20
-BASE_SEED = 42
-MATRIX_SIZES = [(4, 4), (8, 8)]
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-# =============================================================================
-# NEWTON-SCHULZ
-# =============================================================================
+@dataclass(frozen=True)
+class ExperimentConfig:
+    n_steps: int = 50
+    lr: float = 0.02
+    momentum_beta: float = 0.9
+    ns_iters: int = 5
+    n_trials: int = 20
+    base_seed: int = 42
+    matrix_sizes: Tuple[Tuple[int, int], ...] = ((4, 4), (8, 8))
+    n_samples: int = 50
+    trial_seed_stride: int = 17
+    trajectory_size: Tuple[int, int] = (8, 8)
+    trajectory_seed: int = 42
+    random_trajectory_seed_offset: int = 777
+    trajectory_checkpoints: Tuple[int, ...] = (0, 1, 2, 5, 10, 20, 30, 40, 49)
 
-def newton_schulz(M, n_iters=NS_ITERS):
-    norm = np.linalg.norm(M, ord='fro')
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["matrix_sizes"] = [list(size) for size in self.matrix_sizes]
+        data["trajectory_size"] = list(self.trajectory_size)
+        data["trajectory_checkpoints"] = list(self.trajectory_checkpoints)
+        return data
+
+
+DEFAULT_CONFIG = ExperimentConfig()
+
+
+EXPERIMENT_SPECS = {
+    "A_random_conjugated_gradients": {
+        "label": "A. Random conjugated gradients",
+        "short_label": "A (random G)",
+        "description": (
+            "Positive control: both paths see the same random gradient sequence, "
+            "with path B using G'_t = R G_t S^T."
+        ),
+        "gradient_map_equivariant": True,
+    },
+    "B_fixed_frame_data_driven": {
+        "label": "B. Fixed-frame data-driven gradients",
+        "short_label": "B (data-driven)",
+        "description": (
+            "Negative control: a single linear layer is trained against fixed X and Y, "
+            "so the induced gradient map does not commute with W -> R W S^T."
+        ),
+        "gradient_map_equivariant": False,
+    },
+    "C_equivariant_frobenius_loss": {
+        "label": "C. Equivariant Frobenius-loss gradients",
+        "short_label": "C (equiv loss)",
+        "description": (
+            "Positive control: L(W) = 0.5 ||W||_F^2 gives G(W) = W, which is conjugation-equivariant."
+        ),
+        "gradient_map_equivariant": True,
+    },
+}
+
+EXPERIMENT_ORDER = (
+    "A_random_conjugated_gradients",
+    "B_fixed_frame_data_driven",
+    "C_equivariant_frobenius_loss",
+)
+
+HEURISTIC_CHECK_ORDER = ("H1", "H2", "H3", "H4")
+
+
+def validate_config(config: ExperimentConfig) -> None:
+    if config.n_steps <= 0:
+        raise ValueError("n_steps must be positive")
+    if config.n_trials <= 0:
+        raise ValueError("n_trials must be positive")
+    if config.ns_iters <= 0:
+        raise ValueError("ns_iters must be positive")
+    if not config.matrix_sizes:
+        raise ValueError("matrix_sizes must be non-empty")
+    if max(config.trajectory_checkpoints) >= config.n_steps:
+        raise ValueError("trajectory checkpoints must be < n_steps")
+
+
+def size_key(m: int, n: int) -> str:
+    return f"{m}x{n}"
+
+
+def newton_schulz(M: np.ndarray, n_iters: int) -> np.ndarray:
+    norm = np.linalg.norm(M, ord="fro")
     if norm < 1e-15:
-        return M
+        return M.copy()
     X = M / norm
     for _ in range(n_iters):
         A = X.T @ X
@@ -73,411 +129,594 @@ def newton_schulz(M, n_iters=NS_ITERS):
     return X
 
 
-def random_orthogonal(n, rng):
+def random_orthogonal(n: int, rng: np.random.RandomState) -> np.ndarray:
     A = rng.randn(n, n)
     Q, R = np.linalg.qr(A)
-    D = np.diag(np.sign(np.diag(R)))
+    signs = np.sign(np.diag(R))
+    signs[signs == 0] = 1.0
+    D = np.diag(signs)
     return Q @ D
 
 
-# =============================================================================
-# SUB-EXPERIMENT A: Random gradients (conjugated), with momentum
-# =============================================================================
-
-def run_random_gradient_test(m, n, rng):
-    """
-    Both paths use the SAME sequence of random gradients, but path B
-    conjugates them: G_t' = R * G_t * S^T.
-    This should give EXACT equivariance because:
-      m_t' = beta * m_{t-1}' + (1-beta) * R * G_t * S^T
-           = R * (beta * m_{t-1} + (1-beta) * G_t) * S^T = R * m_t * S^T
-    And NS(R * m_t * S^T) = R * NS(m_t) * S^T.
-    So W_t' = R * W_t * S^T at every step.
-    """
-    W0 = rng.randn(m, n)
-    R = random_orthogonal(m, rng)
-    S = random_orthogonal(n, rng)
-
-    # Pre-generate random gradients
-    gradients = [rng.randn(m, n) for _ in range(N_STEPS)]
-
-    # Path A: original
-    W_a = W0.copy()
-    mom_a = np.zeros((m, n))
-    for t in range(N_STEPS):
-        G = gradients[t]
-        mom_a = MOMENTUM_BETA * mom_a + (1 - MOMENTUM_BETA) * G
-        ortho_mom = newton_schulz(mom_a)
-        W_a = W_a - LR * ortho_mom
-
-    # Path B: conjugated
-    W_b = R @ W0 @ S.T
-    mom_b = np.zeros((m, n))
-    for t in range(N_STEPS):
-        G_conj = R @ gradients[t] @ S.T
-        mom_b = MOMENTUM_BETA * mom_b + (1 - MOMENTUM_BETA) * G_conj
-        ortho_mom = newton_schulz(mom_b)
-        W_b = W_b - LR * ortho_mom
-
-    # Check: W_b should equal R @ W_a @ S.T
+def relative_covariance_error(
+    W_a: np.ndarray,
+    W_b: np.ndarray,
+    R: np.ndarray,
+    S: np.ndarray,
+) -> float:
     expected = R @ W_a @ S.T
-    err = np.linalg.norm(W_b - expected) / max(np.linalg.norm(W_a), 1e-30)
-    return err
+    denom = max(np.linalg.norm(W_a), 1e-30)
+    return float(np.linalg.norm(W_b - expected) / denom)
 
 
-# =============================================================================
-# SUB-EXPERIMENT B: Data-driven gradients (single layer linear)
-# =============================================================================
-
-def run_data_driven_test(m, n, rng):
-    """
-    Train a single linear layer y = Wx with MSE loss.
-    Path A: from W_0. Path B: from R*W_0*S^T.
-    Gradients depend on W_t, so equivariance should BREAK
-    (because loss is not equivariant under W -> RWS^T).
-    """
-    N_samples = 50
-    W0 = rng.randn(m, n)
-    R = random_orthogonal(m, rng)
-    S = random_orthogonal(n, rng)
-
-    X = rng.randn(n, N_samples) * 0.3
-    Y = rng.randn(m, N_samples) * 0.3
-
-    def compute_grad(W, X, Y):
-        pred = W @ X
-        return (pred - Y) @ X.T / N_samples
-
-    # Path A
-    W_a = W0.copy()
-    mom_a = np.zeros((m, n))
-    for t in range(N_STEPS):
-        G = compute_grad(W_a, X, Y)
-        mom_a = MOMENTUM_BETA * mom_a + (1 - MOMENTUM_BETA) * G
-        ortho_mom = newton_schulz(mom_a)
-        W_a = W_a - LR * ortho_mom
-
-    # Path B
-    W_b = R @ W0 @ S.T
-    mom_b = np.zeros((m, n))
-    for t in range(N_STEPS):
-        G = compute_grad(W_b, X, Y)
-        mom_b = MOMENTUM_BETA * mom_b + (1 - MOMENTUM_BETA) * G
-        ortho_mom = newton_schulz(mom_b)
-        W_b = W_b - LR * ortho_mom
-
-    expected = R @ W_a @ S.T
-    err = np.linalg.norm(W_b - expected) / max(np.linalg.norm(W_a), 1e-30)
-    return err
+def summarize_errors(errors: List[float]) -> Dict[str, float]:
+    values = np.asarray(errors, dtype=float)
+    n = len(values)
+    std = float(np.std(values, ddof=1)) if n > 1 else 0.0
+    sem = std / np.sqrt(n) if n > 1 else 0.0
+    mean = float(np.mean(values))
+    return {
+        "n": int(n),
+        "mean": mean,
+        "std": std,
+        "median": float(np.median(values)),
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+        "ci95_low": mean - 1.96 * sem,
+        "ci95_high": mean + 1.96 * sem,
+    }
 
 
-# =============================================================================
-# SUB-EXPERIMENT C: Equivariant loss (||W||_F^2 or spectral loss)
-# =============================================================================
-
-def run_equivariant_loss_test(m, n, rng):
-    """
-    Loss L(W) = ||W - I||_F^2 is NOT equivariant.
-    Loss L(W) = sum(sigma_i(W)^2) = ||W||_F^2 IS equivariant.
-    Gradient of ||W||_F^2 = 2W.
-
-    But G = 2W, so G' = 2*RWS^T = R * (2W) * S^T = R*G*S^T.
-    This is EXACTLY the conjugation of the gradient.
-    So equivariance should hold perfectly.
-    """
-    W0 = rng.randn(m, n)
-    R = random_orthogonal(m, rng)
-    S = random_orthogonal(n, rng)
-
-    def equivariant_grad(W):
-        """Gradient of L(W) = ||W||_F^2 / 2."""
-        return W  # gradient = W
-
-    # Path A
-    W_a = W0.copy()
-    mom_a = np.zeros((m, n))
-    for t in range(N_STEPS):
-        G = equivariant_grad(W_a)
-        mom_a = MOMENTUM_BETA * mom_a + (1 - MOMENTUM_BETA) * G
-        ortho_mom = newton_schulz(mom_a)
-        W_a = W_a - LR * ortho_mom
-
-    # Path B
-    W_b = R @ W0 @ S.T
-    mom_b = np.zeros((m, n))
-    for t in range(N_STEPS):
-        G = equivariant_grad(W_b)
-        mom_b = MOMENTUM_BETA * mom_b + (1 - MOMENTUM_BETA) * G
-        ortho_mom = newton_schulz(mom_b)
-        W_b = W_b - LR * ortho_mom
-
-    expected = R @ W_a @ S.T
-    err = np.linalg.norm(W_b - expected) / max(np.linalg.norm(W_a), 1e-30)
-    return err
+def sample_trace(trace: List[float], checkpoints: Tuple[int, ...], value_name: str) -> List[Dict[str, float]]:
+    return [{"step": int(step), value_name: float(trace[step])} for step in checkpoints]
 
 
-# =============================================================================
-# MAIN EXPERIMENT
-# =============================================================================
-
-print("=" * 90)
-print("Exp 2.1b: DOES CONJUGATION COVARIANCE PERSIST THROUGH MOMENTUM?")
-print("=" * 90)
-print(f"Steps: {N_STEPS}, Momentum: {MOMENTUM_BETA}, LR: {LR}")
-print(f"Trials: {N_TRIALS} per size per sub-experiment")
-print(f"Sizes: {MATRIX_SIZES}")
-print()
-print("SUB-EXPERIMENTS:")
-print("  A: Random gradients (conjugated) -- EXACT equivariance expected")
-print("  B: Data-driven gradients -- equivariance BREAKS expected")
-print("  C: Equivariant loss (||W||_F^2) -- EXACT equivariance expected")
-print("=" * 90)
-
-
-# ---- Sub-experiment A ----
-print(f"\n\n{'=' * 90}")
-print("SUB-EXPERIMENT A: Random Gradients (Conjugated)")
-print(f"{'=' * 90}")
-
-results_A = {}
-for (m, n) in MATRIX_SIZES:
-    errors = []
-    for trial in range(N_TRIALS):
-        rng = np.random.RandomState(BASE_SEED + trial * 17)
-        err = run_random_gradient_test(m, n, rng)
-        errors.append(err)
-    errors = np.array(errors)
-    results_A[(m, n)] = errors
-    print(f"\n  Size {m}x{n} ({N_STEPS} steps, {N_TRIALS} trials):")
-    print(f"    Mean rel error: {np.mean(errors):.2e}")
-    print(f"    Max rel error:  {np.max(errors):.2e}")
-    print(f"    Min rel error:  {np.min(errors):.2e}")
-
-
-# ---- Sub-experiment B ----
-print(f"\n\n{'=' * 90}")
-print("SUB-EXPERIMENT B: Data-Driven Gradients (Single Layer Linear)")
-print(f"{'=' * 90}")
-
-results_B = {}
-for (m, n) in MATRIX_SIZES:
-    errors = []
-    for trial in range(N_TRIALS):
-        rng = np.random.RandomState(BASE_SEED + trial * 17)
-        err = run_data_driven_test(m, n, rng)
-        errors.append(err)
-    errors = np.array(errors)
-    results_B[(m, n)] = errors
-    print(f"\n  Size {m}x{n} ({N_STEPS} steps, {N_TRIALS} trials):")
-    print(f"    Mean rel error: {np.mean(errors):.2e}")
-    print(f"    Max rel error:  {np.max(errors):.2e}")
-    print(f"    Min rel error:  {np.min(errors):.2e}")
-
-
-# ---- Sub-experiment C ----
-print(f"\n\n{'=' * 90}")
-print("SUB-EXPERIMENT C: Equivariant Loss (||W||_F^2)")
-print(f"{'=' * 90}")
-
-results_C = {}
-for (m, n) in MATRIX_SIZES:
-    errors = []
-    for trial in range(N_TRIALS):
-        rng = np.random.RandomState(BASE_SEED + trial * 17)
-        err = run_equivariant_loss_test(m, n, rng)
-        errors.append(err)
-    errors = np.array(errors)
-    results_C[(m, n)] = errors
-    print(f"\n  Size {m}x{n} ({N_STEPS} steps, {N_TRIALS} trials):")
-    print(f"    Mean rel error: {np.mean(errors):.2e}")
-    print(f"    Max rel error:  {np.max(errors):.2e}")
-    print(f"    Min rel error:  {np.min(errors):.2e}")
-
-
-# =============================================================================
-# COMPARISON TABLE
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("COMPARISON TABLE: Mean Relative Error After {N_STEPS} Steps")
-print(f"{'=' * 90}")
-
-print(f"\n{'Size':>6}  {'A (random G)':>14}  {'B (data-driven)':>16}  {'C (equiv loss)':>15}")
-print("-" * 55)
-
-for (m, n) in MATRIX_SIZES:
-    a = np.mean(results_A[(m, n)])
-    b = np.mean(results_B[(m, n)])
-    c = np.mean(results_C[(m, n)])
-    print(f"{m}x{n:>3}  {a:>14.2e}  {b:>16.2e}  {c:>15.2e}")
-
-
-# =============================================================================
-# STEP-BY-STEP DRIFT ANALYSIS (for one trial, tracking error at each step)
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("STEP-BY-STEP DRIFT ANALYSIS (single trial, 8x8)")
-print(f"{'=' * 90}")
-
-m, n = 8, 8
-rng = np.random.RandomState(BASE_SEED)
-
-# Data-driven: track error at each step
-N_samples = 50
-W0 = rng.randn(m, n)
-R = random_orthogonal(m, rng)
-S = random_orthogonal(n, rng)
-X = rng.randn(n, N_samples) * 0.3
-Y = rng.randn(m, N_samples) * 0.3
-
-def compute_grad_fn(W, X, Y):
+def linear_mse_grad(W: np.ndarray, X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+    n_samples = X.shape[1]
     pred = W @ X
-    return (pred - Y) @ X.T / N_samples
-
-W_a = W0.copy()
-W_b = R @ W0 @ S.T
-mom_a = np.zeros((m, n))
-mom_b = np.zeros((m, n))
-
-print(f"\n{'Step':>6}  {'Data-driven err':>16}  {'Equiv loss err':>15}")
-print("-" * 42)
-
-# Also track equivariant loss path
-W_ae = W0.copy()
-W_be = R @ W0 @ S.T
-mom_ae = np.zeros((m, n))
-mom_be = np.zeros((m, n))
-
-for t in range(N_STEPS):
-    # Data-driven
-    G_a = compute_grad_fn(W_a, X, Y)
-    G_b = compute_grad_fn(W_b, X, Y)
-    mom_a = MOMENTUM_BETA * mom_a + (1 - MOMENTUM_BETA) * G_a
-    mom_b = MOMENTUM_BETA * mom_b + (1 - MOMENTUM_BETA) * G_b
-    W_a = W_a - LR * newton_schulz(mom_a)
-    W_b = W_b - LR * newton_schulz(mom_b)
-
-    err_data = np.linalg.norm(W_b - R @ W_a @ S.T) / max(np.linalg.norm(W_a), 1e-30)
-
-    # Equivariant loss
-    G_ae = W_ae
-    G_be = W_be
-    mom_ae = MOMENTUM_BETA * mom_ae + (1 - MOMENTUM_BETA) * G_ae
-    mom_be = MOMENTUM_BETA * mom_be + (1 - MOMENTUM_BETA) * G_be
-    W_ae = W_ae - LR * newton_schulz(mom_ae)
-    W_be = W_be - LR * newton_schulz(mom_be)
-
-    err_equiv = np.linalg.norm(W_be - R @ W_ae @ S.T) / max(np.linalg.norm(W_ae), 1e-30)
-
-    if t in [0, 1, 2, 5, 10, 20, 30, 40, 49]:
-        print(f"{t:>6}  {err_data:>16.2e}  {err_equiv:>15.2e}")
+    return (pred - Y) @ X.T / n_samples
 
 
-# =============================================================================
-# ALSO: random gradients, step-by-step
-# =============================================================================
-
-print(f"\n\nRandom gradient step-by-step (8x8, single trial):")
-rng2 = np.random.RandomState(BASE_SEED + 777)
-W0 = rng2.randn(m, n)
-R = random_orthogonal(m, rng2)
-S = random_orthogonal(n, rng2)
-gradients = [rng2.randn(m, n) for _ in range(N_STEPS)]
-
-W_a = W0.copy()
-W_b = R @ W0 @ S.T
-mom_a = np.zeros((m, n))
-mom_b = np.zeros((m, n))
-
-print(f"\n{'Step':>6}  {'Rel error':>12}")
-print("-" * 22)
-
-for t in range(N_STEPS):
-    G = gradients[t]
-    G_conj = R @ G @ S.T
-
-    mom_a = MOMENTUM_BETA * mom_a + (1 - MOMENTUM_BETA) * G
-    mom_b = MOMENTUM_BETA * mom_b + (1 - MOMENTUM_BETA) * G_conj
-    W_a = W_a - LR * newton_schulz(mom_a)
-    W_b = W_b - LR * newton_schulz(mom_b)
-
-    err = np.linalg.norm(W_b - R @ W_a @ S.T) / max(np.linalg.norm(W_a), 1e-30)
-
-    if t in [0, 1, 2, 5, 10, 20, 30, 40, 49]:
-        print(f"{t:>6}  {err:>12.2e}")
+def linear_mse_loss(W: np.ndarray, X: np.ndarray, Y: np.ndarray) -> float:
+    n_samples = X.shape[1]
+    residual = W @ X - Y
+    return 0.5 * float(np.sum(residual**2) / n_samples)
 
 
-# =============================================================================
-# HYPOTHESIS TESTS
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("HYPOTHESIS TESTS")
-print(f"{'=' * 90}")
-
-# H1: Random gradients maintain exact equivariance (<1e-12)
-all_A = np.concatenate([results_A[k] for k in MATRIX_SIZES])
-h1 = np.max(all_A) < 1e-12
-print(f"\nH1: Random gradient equivariance holds after {N_STEPS} steps (<1e-12)?")
-print(f"    Max error: {np.max(all_A):.2e}")
-print(f"    --> {'PASS' if h1 else 'FAIL'}")
-
-# H2: Data-driven breaks equivariance (error > 0.01)
-all_B = np.concatenate([results_B[k] for k in MATRIX_SIZES])
-h2 = np.mean(all_B) > 0.01
-print(f"\nH2: Data-driven equivariance breaks (mean error > 0.01)?")
-print(f"    Mean error: {np.mean(all_B):.2e}")
-print(f"    --> {'PASS' if h2 else 'FAIL'}")
-
-# H3: Equivariant loss maintains exact equivariance (<1e-12)
-all_C = np.concatenate([results_C[k] for k in MATRIX_SIZES])
-h3 = np.max(all_C) < 1e-12
-print(f"\nH3: Equivariant loss maintains equivariance after {N_STEPS} steps (<1e-12)?")
-print(f"    Max error: {np.max(all_C):.2e}")
-print(f"    --> {'PASS' if h3 else 'FAIL'}")
-
-# H4: Data-driven error is orders of magnitude larger than random/equivariant
-ratio_B_over_A = np.mean(all_B) / max(np.mean(all_A), 1e-30)
-ratio_B_over_C = np.mean(all_B) / max(np.mean(all_C), 1e-30)
-h4 = ratio_B_over_A > 1e6
-print(f"\nH4: Data-driven error >> random gradient error (ratio > 1e6)?")
-print(f"    Ratio B/A: {ratio_B_over_A:.2e}")
-print(f"    Ratio B/C: {ratio_B_over_C:.2e}")
-print(f"    --> {'PASS' if h4 else 'FAIL'}")
-
-total_pass = sum([h1, h2, h3, h4])
+def frobenius_half_squared_loss(W: np.ndarray) -> float:
+    return 0.5 * float(np.sum(W**2))
 
 
-# =============================================================================
-# FINAL VERDICT
-# =============================================================================
+def run_random_gradient_test(
+    m: int,
+    n: int,
+    rng: np.random.RandomState,
+    *,
+    config: ExperimentConfig = DEFAULT_CONFIG,
+    return_trace: bool = False,
+) -> Dict[str, Any]:
+    """
+    Positive control: path B receives the conjugated gradient sequence G'_t = R G_t S^T.
+    When the update rule is implemented consistently, covariance should remain at
+    machine precision in this float64 experiment.
+    """
+    W0 = rng.randn(m, n)
+    R = random_orthogonal(m, rng)
+    S = random_orthogonal(n, rng)
+    gradients = [rng.randn(m, n) for _ in range(config.n_steps)]
 
-print(f"\n\n{'=' * 90}")
-print(f"FINAL VERDICT: Exp 2.1b COVARIANCE THROUGH MOMENTUM ({N_STEPS} steps)")
-print(f"{'=' * 90}")
+    W_a = W0.copy()
+    W_b = R @ W0 @ S.T
+    mom_a = np.zeros((m, n))
+    mom_b = np.zeros((m, n))
 
-print(f"""
-  Sub-experiment A (random conjugated gradients):
-    Mean error: {np.mean(all_A):.2e}  -- {"EXACT" if np.max(all_A) < 1e-12 else "BROKEN"}
+    error_trace: List[float] = []
+    for step in range(config.n_steps):
+        G = gradients[step]
+        G_conj = R @ G @ S.T
+        mom_a = config.momentum_beta * mom_a + (1.0 - config.momentum_beta) * G
+        mom_b = config.momentum_beta * mom_b + (1.0 - config.momentum_beta) * G_conj
+        W_a = W_a - config.lr * newton_schulz(mom_a, config.ns_iters)
+        W_b = W_b - config.lr * newton_schulz(mom_b, config.ns_iters)
+        if return_trace:
+            error_trace.append(relative_covariance_error(W_a, W_b, R, S))
 
-  Sub-experiment B (data-driven gradients):
-    Mean error: {np.mean(all_B):.2e}  -- {"EXACT" if np.max(all_B) < 1e-12 else "BROKEN"}
+    result: Dict[str, Any] = {
+        "final_error": relative_covariance_error(W_a, W_b, R, S),
+        "metadata": {
+            "initial_weight_norm": float(np.linalg.norm(W0)),
+            "det_R": float(np.linalg.det(R)),
+            "det_S": float(np.linalg.det(S)),
+            "orthogonality_error_R": float(np.linalg.norm(R.T @ R - np.eye(m))),
+            "orthogonality_error_S": float(np.linalg.norm(S.T @ S - np.eye(n))),
+        },
+    }
+    if return_trace:
+        result.update(
+            {
+                "step_indices": list(range(config.n_steps)),
+                "error_trace": [float(x) for x in error_trace],
+                "sampled_errors": sample_trace(error_trace, config.trajectory_checkpoints, "error"),
+            }
+        )
+    return result
 
-  Sub-experiment C (equivariant loss ||W||^2):
-    Mean error: {np.mean(all_C):.2e}  -- {"EXACT" if np.max(all_C) < 1e-12 else "BROKEN"}
 
-  Tests passed: {total_pass}/4
-""")
+def run_data_driven_test(
+    m: int,
+    n: int,
+    rng: np.random.RandomState,
+    *,
+    config: ExperimentConfig = DEFAULT_CONFIG,
+    return_trace: bool = False,
+) -> Dict[str, Any]:
+    """
+    Negative control: a single linear layer y = W x is trained against fixed-frame
+    Gaussian X and Y. Under this setup, the induced gradient map does not satisfy
+    G(R W S^T) = R G(W) S^T, so covariance is expected to break.
+    """
+    W0 = rng.randn(m, n)
+    R = random_orthogonal(m, rng)
+    S = random_orthogonal(n, rng)
+    X = rng.randn(n, config.n_samples) * 0.3
+    Y = rng.randn(m, config.n_samples) * 0.3
 
-print("  CONCLUSION:")
-print("  - Muon + momentum IS exactly equivariant when the gradient function")
-print("    itself is equivariant (G(RWS^T) = R*G(W)*S^T).")
-print("  - This holds for: random conjugated gradients, equivariant losses.")
-print("  - This BREAKS for: standard data-driven losses, because the loss")
-print("    L(W) = ||Wx - y||^2 is NOT invariant under W -> RWS^T.")
-print("  - In neural networks, equivariance holds for the INTER-LAYER gauge")
-print("    (W_{l+1} -> R*W_{l+1}, W_l -> W_l*R^T) ONLY if both layers")
-print("    are updated simultaneously and consistently.")
+    W_a = W0.copy()
+    W_b = R @ W0 @ S.T
+    mom_a = np.zeros((m, n))
+    mom_b = np.zeros((m, n))
 
-print(f"\n{'=' * 90}")
+    initial_loss_a = linear_mse_loss(W_a, X, Y)
+    initial_loss_b = linear_mse_loss(W_b, X, Y)
+
+    error_trace: List[float] = []
+    loss_trace_a: List[float] = []
+    loss_trace_b: List[float] = []
+
+    for step in range(config.n_steps):
+        G_a = linear_mse_grad(W_a, X, Y)
+        G_b = linear_mse_grad(W_b, X, Y)
+        mom_a = config.momentum_beta * mom_a + (1.0 - config.momentum_beta) * G_a
+        mom_b = config.momentum_beta * mom_b + (1.0 - config.momentum_beta) * G_b
+        W_a = W_a - config.lr * newton_schulz(mom_a, config.ns_iters)
+        W_b = W_b - config.lr * newton_schulz(mom_b, config.ns_iters)
+        if return_trace:
+            error_trace.append(relative_covariance_error(W_a, W_b, R, S))
+            loss_trace_a.append(linear_mse_loss(W_a, X, Y))
+            loss_trace_b.append(linear_mse_loss(W_b, X, Y))
+
+    final_loss_a = linear_mse_loss(W_a, X, Y)
+    final_loss_b = linear_mse_loss(W_b, X, Y)
+
+    result = {
+        "final_error": relative_covariance_error(W_a, W_b, R, S),
+        "metadata": {
+            "initial_weight_norm": float(np.linalg.norm(W0)),
+            "input_norm": float(np.linalg.norm(X)),
+            "target_norm": float(np.linalg.norm(Y)),
+            "initial_loss_path_a": initial_loss_a,
+            "initial_loss_path_b": initial_loss_b,
+            "initial_loss_gap": abs(initial_loss_b - initial_loss_a),
+            "final_loss_path_a": final_loss_a,
+            "final_loss_path_b": final_loss_b,
+            "final_loss_gap": abs(final_loss_b - final_loss_a),
+        },
+    }
+    if return_trace:
+        result.update(
+            {
+                "step_indices": list(range(config.n_steps)),
+                "error_trace": [float(x) for x in error_trace],
+                "sampled_errors": sample_trace(error_trace, config.trajectory_checkpoints, "error"),
+                "loss_trace_a": [float(x) for x in loss_trace_a],
+                "loss_trace_b": [float(x) for x in loss_trace_b],
+            }
+        )
+    return result
+
+
+def run_equivariant_loss_test(
+    m: int,
+    n: int,
+    rng: np.random.RandomState,
+    *,
+    config: ExperimentConfig = DEFAULT_CONFIG,
+    return_trace: bool = False,
+) -> Dict[str, Any]:
+    """
+    Positive control: L(W) = 0.5 ||W||_F^2 gives G(W) = W, so the gradient map is
+    conjugation-equivariant and covariance should persist at machine precision in
+    this float64 experiment.
+    """
+    W0 = rng.randn(m, n)
+    R = random_orthogonal(m, rng)
+    S = random_orthogonal(n, rng)
+
+    W_a = W0.copy()
+    W_b = R @ W0 @ S.T
+    mom_a = np.zeros((m, n))
+    mom_b = np.zeros((m, n))
+
+    error_trace: List[float] = []
+    loss_trace_a: List[float] = []
+    loss_trace_b: List[float] = []
+
+    for step in range(config.n_steps):
+        G_a = W_a
+        G_b = W_b
+        mom_a = config.momentum_beta * mom_a + (1.0 - config.momentum_beta) * G_a
+        mom_b = config.momentum_beta * mom_b + (1.0 - config.momentum_beta) * G_b
+        W_a = W_a - config.lr * newton_schulz(mom_a, config.ns_iters)
+        W_b = W_b - config.lr * newton_schulz(mom_b, config.ns_iters)
+        if return_trace:
+            error_trace.append(relative_covariance_error(W_a, W_b, R, S))
+            loss_trace_a.append(frobenius_half_squared_loss(W_a))
+            loss_trace_b.append(frobenius_half_squared_loss(W_b))
+
+    result = {
+        "final_error": relative_covariance_error(W_a, W_b, R, S),
+        "metadata": {
+            "initial_weight_norm": float(np.linalg.norm(W0)),
+            "initial_loss_path_a": frobenius_half_squared_loss(W0),
+            "initial_loss_path_b": frobenius_half_squared_loss(R @ W0 @ S.T),
+            "initial_singular_values": [float(x) for x in np.linalg.svd(W0, compute_uv=False)],
+            "final_loss_path_a": frobenius_half_squared_loss(W_a),
+            "final_loss_path_b": frobenius_half_squared_loss(W_b),
+        },
+    }
+    if return_trace:
+        result.update(
+            {
+                "step_indices": list(range(config.n_steps)),
+                "error_trace": [float(x) for x in error_trace],
+                "sampled_errors": sample_trace(error_trace, config.trajectory_checkpoints, "error"),
+                "loss_trace_a": [float(x) for x in loss_trace_a],
+                "loss_trace_b": [float(x) for x in loss_trace_b],
+            }
+        )
+    return result
+
+
+def _trial_seed(config: ExperimentConfig, trial_index: int) -> int:
+    return config.base_seed + trial_index * config.trial_seed_stride
+
+
+def _run_suite_for_experiment(
+    experiment_key: str,
+    runner,
+    config: ExperimentConfig,
+) -> Dict[str, Any]:
+    spec = EXPERIMENT_SPECS[experiment_key]
+    size_results: Dict[str, Any] = {}
+
+    for m, n in config.matrix_sizes:
+        errors: List[float] = []
+        trial_seeds: List[int] = []
+        for trial in range(config.n_trials):
+            seed = _trial_seed(config, trial)
+            trial_seeds.append(seed)
+            rng = np.random.RandomState(seed)
+            trial_result = runner(m, n, rng, config=config, return_trace=False)
+            errors.append(float(trial_result["final_error"]))
+
+        size_results[size_key(m, n)] = {
+            "shape": [m, n],
+            "trial_seeds": trial_seeds,
+            "raw_trial_errors": [float(x) for x in errors],
+            "summary": summarize_errors(errors),
+        }
+
+    return {
+        "label": spec["label"],
+        "short_label": spec["short_label"],
+        "description": spec["description"],
+        "gradient_map_equivariant": spec["gradient_map_equivariant"],
+        "sizes": size_results,
+    }
+
+
+def collect_single_trial_diagnostics(config: ExperimentConfig) -> Dict[str, Any]:
+    m, n = config.trajectory_size
+    data_trace = run_data_driven_test(
+        m,
+        n,
+        np.random.RandomState(config.trajectory_seed),
+        config=config,
+        return_trace=True,
+    )
+    equiv_trace = run_equivariant_loss_test(
+        m,
+        n,
+        np.random.RandomState(config.trajectory_seed),
+        config=config,
+        return_trace=True,
+    )
+    random_trace = run_random_gradient_test(
+        m,
+        n,
+        np.random.RandomState(config.trajectory_seed + config.random_trajectory_seed_offset),
+        config=config,
+        return_trace=True,
+    )
+
+    checkpoints = list(config.trajectory_checkpoints)
+    paired_rows = []
+    for step in checkpoints:
+        paired_rows.append(
+            {
+                "step": int(step),
+                "data_driven_error": float(data_trace["error_trace"][step]),
+                "equivariant_loss_error": float(equiv_trace["error_trace"][step]),
+            }
+        )
+
+    random_rows = []
+    for step in checkpoints:
+        random_rows.append({"step": int(step), "random_gradient_error": float(random_trace["error_trace"][step])})
+
+    return {
+        "data_vs_equivariant": {
+            "size": [m, n],
+            "seed": int(config.trajectory_seed),
+            "step_indices": data_trace["step_indices"],
+            "checkpoints": checkpoints,
+            "data_driven_error_trace": data_trace["error_trace"],
+            "equivariant_loss_error_trace": equiv_trace["error_trace"],
+            "data_driven_loss_trace_path_a": data_trace["loss_trace_a"],
+            "data_driven_loss_trace_path_b": data_trace["loss_trace_b"],
+            "sampled_rows": paired_rows,
+            "metadata": {
+                "initial_loss_gap": data_trace["metadata"]["initial_loss_gap"],
+                "final_loss_gap": data_trace["metadata"]["final_loss_gap"],
+                "initial_equivariant_loss_path_a": equiv_trace["metadata"]["initial_loss_path_a"],
+                "initial_equivariant_loss_path_b": equiv_trace["metadata"]["initial_loss_path_b"],
+            },
+        },
+        "random_gradient": {
+            "size": [m, n],
+            "seed": int(config.trajectory_seed + config.random_trajectory_seed_offset),
+            "step_indices": random_trace["step_indices"],
+            "checkpoints": checkpoints,
+            "error_trace": random_trace["error_trace"],
+            "sampled_rows": random_rows,
+            "metadata": random_trace["metadata"],
+        },
+    }
+
+
+def compute_heuristic_checks(experiment_results: Dict[str, Any], config: ExperimentConfig) -> Dict[str, Any]:
+    def collect(experiment_key: str) -> np.ndarray:
+        values: List[float] = []
+        for size_result in experiment_results[experiment_key]["sizes"].values():
+            values.extend(size_result["raw_trial_errors"])
+        return np.asarray(values, dtype=float)
+
+    all_A = collect("A_random_conjugated_gradients")
+    all_B = collect("B_fixed_frame_data_driven")
+    all_C = collect("C_equivariant_frobenius_loss")
+
+    mean_A = float(np.mean(all_A))
+    mean_B = float(np.mean(all_B))
+    mean_C = float(np.mean(all_C))
+    ratio_B_over_A = mean_B / max(mean_A, 1e-30)
+    ratio_B_over_C = mean_B / max(mean_C, 1e-30)
+
+    checks = {
+        "H1": {
+            "statement": (
+                "Positive control A stays at machine precision at the tested final endpoints"
+            ),
+            "criterion": f"max(final error over all sizes/trials) < 1e-12 after {config.n_steps} steps",
+            "observed": {"max_error": float(np.max(all_A))},
+            "pass": bool(np.max(all_A) < 1e-12),
+        },
+        "H2": {
+            "statement": "Negative control B shows macroscopic covariance failure",
+            "criterion": "mean(final error over all sizes/trials) > 1e-2",
+            "observed": {"mean_error": mean_B},
+            "pass": bool(mean_B > 1e-2),
+        },
+        "H3": {
+            "statement": (
+                "Positive control C stays at machine precision at the tested final endpoints"
+            ),
+            "criterion": f"max(final error over all sizes/trials) < 1e-12 after {config.n_steps} steps",
+            "observed": {"max_error": float(np.max(all_C))},
+            "pass": bool(np.max(all_C) < 1e-12),
+        },
+        "H4": {
+            "statement": "Negative control B is orders of magnitude worse than the positive controls",
+            "criterion": "heuristic only: mean(B) / mean(A) > 1e6; mean(B) / mean(C) is reported descriptively",
+            "observed": {
+                "ratio_B_over_A": float(ratio_B_over_A),
+                "ratio_B_over_C": float(ratio_B_over_C),
+            },
+            "pass": bool(ratio_B_over_A > 1e6),
+        },
+        "aggregate_means": {
+            "A_random_conjugated_gradients": mean_A,
+            "B_fixed_frame_data_driven": mean_B,
+            "C_equivariant_frobenius_loss": mean_C,
+        },
+        "aggregate_maxima": {
+            "A_random_conjugated_gradients": float(np.max(all_A)),
+            "B_fixed_frame_data_driven": float(np.max(all_B)),
+            "C_equivariant_frobenius_loss": float(np.max(all_C)),
+        },
+    }
+    checks["checks_total"] = 4
+    checks["checks_passed"] = int(sum(bool(checks[key]["pass"]) for key in ("H1", "H2", "H3", "H4")))
+    return checks
+
+
+def build_comparison_rows(experiment_results: Dict[str, Any], config: ExperimentConfig) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for m, n in config.matrix_sizes:
+        key = size_key(m, n)
+        rows.append(
+            {
+                "size": key,
+                "A_mean_error": experiment_results["A_random_conjugated_gradients"]["sizes"][key]["summary"]["mean"],
+                "B_mean_error": experiment_results["B_fixed_frame_data_driven"]["sizes"][key]["summary"]["mean"],
+                "C_mean_error": experiment_results["C_equivariant_frobenius_loss"]["sizes"][key]["summary"]["mean"],
+            }
+        )
+    return rows
+
+
+def run_experiment(config: ExperimentConfig = DEFAULT_CONFIG) -> Dict[str, Any]:
+    validate_config(config)
+    start = time.perf_counter()
+
+    runners = {
+        "A_random_conjugated_gradients": run_random_gradient_test,
+        "B_fixed_frame_data_driven": run_data_driven_test,
+        "C_equivariant_frobenius_loss": run_equivariant_loss_test,
+    }
+    experiment_results = {
+        experiment_key: _run_suite_for_experiment(experiment_key, runners[experiment_key], config)
+        for experiment_key in EXPERIMENT_ORDER
+    }
+
+    diagnostics = collect_single_trial_diagnostics(config)
+    heuristic_checks = compute_heuristic_checks(experiment_results, config)
+    comparison_rows = build_comparison_rows(experiment_results, config)
+    runtime_seconds = time.perf_counter() - start
+
+    return {
+        "title": "Exp 2.1b: Does Conjugation Covariance Persist Through Momentum?",
+        "scope_note": (
+            "Finite-scope float64 study at the default configuration only; the negative-control "
+            "failure in case B is attributed here to the non-equivariant fixed-frame gradient map, "
+            "not to momentum in isolation."
+        ),
+        "config": config.to_dict(),
+        "experiment_results": experiment_results,
+        "comparison_rows": comparison_rows,
+        "single_trial_diagnostics": diagnostics,
+        "heuristic_checks": heuristic_checks,
+        "runtime_seconds": float(runtime_seconds),
+    }
+
+
+def _print_experiment_block(experiment_key: str, results: Dict[str, Any], config: Dict[str, Any]) -> None:
+    block = results["experiment_results"][experiment_key]
+    print(f"\n\n{'=' * 90}")
+    print(block["label"])
+    print(f"{'=' * 90}")
+    print(block["description"])
+
+    for size_label, size_result in block["sizes"].items():
+        summary = size_result["summary"]
+        print(f"\n  Size {size_label} ({config['n_steps']} steps, {config['n_trials']} trials):")
+        print(f"    Mean rel error: {summary['mean']:.2e}")
+        print(f"    Std rel error:  {summary['std']:.2e}")
+        print(f"    Median error:   {summary['median']:.2e}")
+        print(f"    95% CI mean:    [{summary['ci95_low']:.2e}, {summary['ci95_high']:.2e}]")
+        print(f"    Max rel error:  {summary['max']:.2e}")
+        print(f"    Min rel error:  {summary['min']:.2e}")
+
+
+def print_cli_report(results: Dict[str, Any]) -> None:
+    config = results["config"]
+    checks = results["heuristic_checks"]
+
+    print("=" * 90)
+    print(results["title"].upper())
+    print("=" * 90)
+    print("Finite-scope numerical report of Muon+momentum covariance under W -> R W S^T.")
+    print(results["scope_note"])
+    print(f"Steps: {config['n_steps']}, Momentum beta: {config['momentum_beta']}, LR: {config['lr']}")
+    print(f"Trials: {config['n_trials']} per size per sub-experiment")
+    print(f"Sizes: {config['matrix_sizes']}")
+    print(f"Newton-Schulz iterations: {config['ns_iters']}")
+    print()
+    print("SUB-EXPERIMENTS:")
+    print("  A: Random conjugated gradients -- positive control")
+    print("  B: Fixed-frame data-driven gradients -- negative control")
+    print("  C: Equivariant Frobenius-loss gradients -- positive control")
+
+    for experiment_key in EXPERIMENT_ORDER:
+        _print_experiment_block(experiment_key, results, config)
+
+    print(f"\n\n{'=' * 90}")
+    print(f"COMPARISON TABLE: Mean Relative Error After {config['n_steps']} Steps")
+    print(f"{'=' * 90}")
+    print(f"\n{'Size':>6}  {'A (random G)':>14}  {'B (data-driven)':>16}  {'C (equiv loss)':>15}")
+    print("-" * 59)
+    for row in results["comparison_rows"]:
+        print(
+            f"{row['size']:>6}  {row['A_mean_error']:>14.2e}  "
+            f"{row['B_mean_error']:>16.2e}  {row['C_mean_error']:>15.2e}"
+        )
+
+    print(f"\n\n{'=' * 90}")
+    trajectory = results["single_trial_diagnostics"]["data_vs_equivariant"]
+    size = trajectory["size"]
+    print(f"SAMPLED STEP-BY-STEP DRIFT ANALYSIS (single trial, {size[0]}x{size[1]})")
+    print(f"{'=' * 90}")
+    print(f"Seed: {trajectory['seed']}")
+    print(f"\n{'Step':>6}  {'Data-driven err':>16}  {'Equiv loss err':>15}")
+    print("-" * 44)
+    for row in trajectory["sampled_rows"]:
+        print(
+            f"{row['step']:>6}  {row['data_driven_error']:>16.2e}  "
+            f"{row['equivariant_loss_error']:>15.2e}"
+        )
+
+    random_traj = results["single_trial_diagnostics"]["random_gradient"]
+    print(f"\nRandom-gradient sampled trajectory ({size[0]}x{size[1]}, seed={random_traj['seed']}):")
+    print(f"\n{'Step':>6}  {'Rel error':>12}")
+    print("-" * 22)
+    for row in random_traj["sampled_rows"]:
+        print(f"{row['step']:>6}  {row['random_gradient_error']:>12.2e}")
+
+    print(f"\n\n{'=' * 90}")
+    print("HEURISTIC THRESHOLD CHECKS (NOT FORMAL HYPOTHESIS TESTS)")
+    print(f"{'=' * 90}")
+    for key in HEURISTIC_CHECK_ORDER:
+        item = checks[key]
+        print(f"\n{key}: {item['statement']}")
+        print(f"    Criterion: {item['criterion']}")
+        observed_parts = ", ".join(f"{name}={value:.2e}" for name, value in item["observed"].items())
+        print(f"    Observed:  {observed_parts}")
+        print(f"    --> {'PASS' if item['pass'] else 'FAIL'}")
+
+    total_pass = checks["checks_passed"]
+    total_checks = checks["checks_total"]
+    print(f"\n\n{'=' * 90}")
+    print(f"FINAL VERDICT: {results['title']} ({config['n_steps']} steps)")
+    print(f"{'=' * 90}")
+    print(
+        f"\n  A mean error: {checks['aggregate_means']['A_random_conjugated_gradients']:.2e}"
+        f" | max: {checks['aggregate_maxima']['A_random_conjugated_gradients']:.2e}"
+    )
+    print(
+        f"  B mean error: {checks['aggregate_means']['B_fixed_frame_data_driven']:.2e}"
+        f" | max: {checks['aggregate_maxima']['B_fixed_frame_data_driven']:.2e}"
+    )
+    print(
+        f"  C mean error: {checks['aggregate_means']['C_equivariant_frobenius_loss']:.2e}"
+        f" | max: {checks['aggregate_maxima']['C_equivariant_frobenius_loss']:.2e}"
+    )
+    print(f"  Heuristic checks passed: {total_pass}/{total_checks}")
+    print(f"  Runtime: {results['runtime_seconds']:.2f} s")
+    print()
+    print("  CALIBRATED CONCLUSION:")
+    print("  - At the tested float64 configuration, positive controls A and C remain at")
+    print("    machine precision at the sampled final endpoints and single-trial trajectory.")
+    print("  - The fixed-frame data-driven single-layer MSE case B develops macroscopic")
+    print("    covariance error under the same optimizer settings.")
+    print("  - In this first pass, that failure is attributed to the non-equivariant")
+    print("    fixed-frame gradient map under W -> R W S^T, not to momentum alone.")
+    print("  - This report does not establish unconditional behavior across all momentum")
+    print("    values, losses, matrix sizes, or network architectures.")
+
+
+def main() -> None:
+    results = run_experiment()
+    print_cli_report(results)
+
+
+if __name__ == "__main__":
+    main()

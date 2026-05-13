@@ -1,40 +1,46 @@
 #!/usr/bin/env python3
 """
-H3: NORMALIZED SGD vs MUON — Is the Polar Factor Necessary?
-=============================================================
+H3: NORMALIZED SGD vs MUON
+==========================
 
-THE QUESTION:
-  If the Muon Paradox comes from discarding gradient MAGNITUDE (scale collapse),
-  then simple normalized SGD (step = G/||G||_F) should show similar paradox strength
-  AND convergence benefit. The polar factor would be unnecessary — just normalizing
-  the gradient norm is enough.
+Toy-scope synthetic comparison of Muon's Newton-Schulz orthogonalized updates
+against several magnitude-discarding baselines:
+  - SGD
+  - Muon-style orthogonalized updates
+  - Frobenius-normalized SGD
+  - Spectral-norm-normalized SGD
+  - Sign SGD
 
-OPTIMIZERS COMPARED (all with momentum=0.9):
-  (a) SGD — baseline
-  (b) Muon — ortho of momentum via Newton-Schulz (UV^T)
-  (c) Normalized SGD — step = lr * M / ||M||_F  (Frobenius normalization)
-  (d) Spectral-normalized SGD — step = lr * M / ||M||_op  (spectral norm)
-  (e) Sign SGD — step = lr * sign(M)  (element-wise sign)
+This script keeps the original 4-layer 32x32 convergence-basin experiment, but
+reports it more carefully:
+  - descriptive statistics, not formal statistical tests
+  - heuristic comparison rules, not universal adjudication
+  - architecture-specific conclusions for deep linear vs ReLU nets
 
-KEY TESTS:
-  T1: Does normalized SGD create the paradox?
-  T2: Does normalized SGD match Muon's convergence speed?
-  T3: Does Muon beat normalized SGD on LOSS?
-  T4: Which normalization creates the strongest paradox?
-
-Setup: 4-layer nets (32x32), quadratic loss, 20 independent runs.
-Architectures: deep linear + ReLU.
+Default behavior remains script-friendly: running
+    python run_experiment.py
+executes the full experiment and saves figures next to this file unless an
+explicit output directory is provided.
 """
 
-import numpy as np
-import os
+from __future__ import annotations
+
+import argparse
+import platform
+import subprocess
+import sys
 import time
+from pathlib import Path
 
-np.random.seed(42)
+import numpy as np
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+
+EXPERIMENT_ID = "H3_NORMALIZED_SGD_vs_MUON"
+EXPERIMENT_TITLE = "H3: Normalized SGD vs Muon"
+SCOPE_NOTE = (
+    "Controlled synthetic basin experiment on fixed 4-layer 32x32 networks; "
+    "results are descriptive and architecture-dependent."
+)
 
 DIM = 32
 NUM_LAYERS = 4
@@ -44,36 +50,61 @@ MOMENTUM = 0.9
 NS_ITERS = 5
 NUM_INDEPENDENT_RUNS = 20
 NUM_TEST_INPUTS = 50
+LR_SWEEP_STEPS = 200
+DATA_SEED = 42
+RUN_SEED_START = 1000
+DIVERGENCE_MULTIPLIER = 50.0
+DIVERGENCE_ABS_THRESHOLD = 1e10
+EPS = 1e-12
 
-# Fixed target and data
-W_target = np.random.randn(DIM, DIM) * 0.5
-X_data = np.random.randn(DIM, BATCH_SIZE) * 0.3
-X_test = np.random.randn(DIM, NUM_TEST_INPUTS) * 0.3
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-OPTIMIZER_NAMES = ['sgd', 'muon', 'norm_sgd', 'spectral_sgd', 'sign_sgd']
+ARCHITECTURES = ("linear", "relu")
+OPTIMIZER_NAMES = ("sgd", "muon", "norm_sgd", "spectral_sgd", "sign_sgd")
 OPTIMIZER_LABELS = {
-    'sgd': 'SGD',
-    'muon': 'Muon (UV^T)',
-    'norm_sgd': 'Normalized SGD (Frob)',
-    'spectral_sgd': 'Spectral-Norm SGD',
-    'sign_sgd': 'Sign SGD',
+    "sgd": "SGD",
+    "muon": "Muon (UV^T)",
+    "norm_sgd": "Normalized SGD (Frob)",
+    "spectral_sgd": "Spectral-Norm SGD",
+    "sign_sgd": "Sign SGD",
 }
 OPTIMIZER_COLORS = {
-    'sgd': '#4477AA',
-    'muon': '#CC3311',
-    'norm_sgd': '#228B22',
-    'spectral_sgd': '#9933CC',
-    'sign_sgd': '#FF8800',
+    "sgd": "#4477AA",
+    "muon": "#CC3311",
+    "norm_sgd": "#228B22",
+    "spectral_sgd": "#9933CC",
+    "sign_sgd": "#FF8800",
+}
+LR_CANDIDATE_GRIDS = {
+    "sgd": [0.1, 0.07, 0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001],
+    "muon": [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.002, 0.001],
+    "norm_sgd": [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.002, 0.001, 0.0005],
+    "spectral_sgd": [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.002, 0.001, 0.0005],
+    "sign_sgd": [0.005, 0.003, 0.002, 0.001, 0.0007, 0.0005, 0.0003, 0.0002, 0.0001, 0.00005],
 }
 
+SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR
+
+
+def generate_fixed_problem(seed=DATA_SEED):
+    rng = np.random.RandomState(seed)
+    return {
+        "W_target": rng.randn(DIM, DIM) * 0.5,
+        "X_data": rng.randn(DIM, BATCH_SIZE) * 0.3,
+        "X_test": rng.randn(DIM, NUM_TEST_INPUTS) * 0.3,
+    }
+
+
+PROBLEM = generate_fixed_problem()
+W_target = PROBLEM["W_target"]
+X_data = PROBLEM["X_data"]
+X_test = PROBLEM["X_test"]
+
 
 # =============================================================================
-# NETWORK DEFINITIONS
+# Network definitions
 # =============================================================================
 
-def init_weights(num_layers, seed=42):
+def init_weights(num_layers, seed=DATA_SEED):
     rng = np.random.RandomState(seed)
     weights = []
     for _ in range(num_layers):
@@ -81,8 +112,6 @@ def init_weights(num_layers, seed=42):
         weights.append(W.copy())
     return weights
 
-
-# ---- DEEP LINEAR NET ----
 
 def forward_linear(weights, X):
     out = X.copy()
@@ -116,8 +145,6 @@ def compute_gradients_linear(weights, X, target):
             delta = weights[i].T @ delta
     return grads
 
-
-# ---- RELU NET ----
 
 def forward_relu(weights, X):
     out = X.copy()
@@ -162,12 +189,12 @@ def compute_gradients_relu(weights, X, target):
 
 
 # =============================================================================
-# OPTIMIZER STEP FUNCTIONS
+# Optimizer step functions
 # =============================================================================
 
 def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
-    norm = np.linalg.norm(G, ord='fro')
-    if norm < 1e-12:
+    norm = np.linalg.norm(G, ord="fro")
+    if norm < EPS:
         return G
     X = G / norm
     for _ in range(num_iters):
@@ -177,89 +204,69 @@ def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
 
 
 def optimizer_step(weights, velocities, grads, lr, method):
-    """Unified optimizer step for all 5 methods."""
     for i in range(len(weights)):
-        if method == 'sgd':
+        if method == "sgd":
             velocities[i] = MOMENTUM * velocities[i] + grads[i]
             weights[i] = weights[i] - lr * velocities[i]
 
-        elif method == 'muon':
-            # Muon: orthogonalize the gradient, then apply momentum
+        elif method == "muon":
             ortho_grad = newton_schulz_orthogonalize(grads[i])
             velocities[i] = MOMENTUM * velocities[i] + ortho_grad
             weights[i] = weights[i] - lr * velocities[i]
 
-        elif method == 'norm_sgd':
-            # Standard momentum, then normalize momentum to unit Frobenius
+        elif method == "norm_sgd":
             velocities[i] = MOMENTUM * velocities[i] + grads[i]
-            v_norm = np.linalg.norm(velocities[i], 'fro')
-            if v_norm > 1e-12:
-                step = velocities[i] / v_norm
-            else:
-                step = velocities[i]
+            v_norm = np.linalg.norm(velocities[i], ord="fro")
+            step = velocities[i] / v_norm if v_norm > EPS else velocities[i]
             weights[i] = weights[i] - lr * step
 
-        elif method == 'spectral_sgd':
-            # Standard momentum, then normalize to unit spectral norm
+        elif method == "spectral_sgd":
             velocities[i] = MOMENTUM * velocities[i] + grads[i]
             spec_norm = np.linalg.norm(velocities[i], ord=2)
-            if spec_norm > 1e-12:
-                step = velocities[i] / spec_norm
-            else:
-                step = velocities[i]
+            step = velocities[i] / spec_norm if spec_norm > EPS else velocities[i]
             weights[i] = weights[i] - lr * step
 
-        elif method == 'sign_sgd':
-            # Standard momentum, then take element-wise sign
+        elif method == "sign_sgd":
             velocities[i] = MOMENTUM * velocities[i] + grads[i]
             step = np.sign(velocities[i])
             weights[i] = weights[i] - lr * step
+
+        else:
+            raise ValueError(f"Unknown optimizer method: {method}")
 
     return weights, velocities
 
 
 # =============================================================================
-# LEARNING RATE SWEEP
+# Learning-rate sweep and training engine
 # =============================================================================
 
-def find_best_lr(method, net_type, num_steps=200):
-    """
-    Sweep over LR candidates for each method. Return the LR achieving the
-    lowest final loss without diverging.
-    """
-    compute_loss_fn = compute_loss_linear if net_type == 'linear' else compute_loss_relu
-    compute_grad_fn = compute_gradients_linear if net_type == 'linear' else compute_gradients_relu
+def find_best_lr(method, net_type, num_steps=LR_SWEEP_STEPS):
+    compute_loss_fn = compute_loss_linear if net_type == "linear" else compute_loss_relu
+    compute_grad_fn = compute_gradients_linear if net_type == "linear" else compute_gradients_relu
 
-    # Different LR ranges for different methods
-    if method == 'sgd':
-        candidates = [0.1, 0.07, 0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001]
-    elif method == 'muon':
-        candidates = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.002, 0.001]
-    elif method == 'norm_sgd':
-        candidates = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.002, 0.001, 0.0005]
-    elif method == 'spectral_sgd':
-        candidates = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.002, 0.001, 0.0005]
-    elif method == 'sign_sgd':
-        # Sign SGD needs much smaller LR (each element is +/-1 times dim*dim)
-        candidates = [0.005, 0.003, 0.002, 0.001, 0.0007, 0.0005, 0.0003, 0.0002, 0.0001, 0.00005]
-
+    candidates = list(LR_CANDIDATE_GRIDS[method])
     best_lr = candidates[-1]
-    best_loss = float('inf')
+    best_loss = float("inf")
+    trial_rows = []
 
-    for lr_cand in candidates:
-        np.random.seed(42)
+    for idx, lr_cand in enumerate(candidates):
+        np.random.seed(DATA_SEED)
         weights = init_weights(NUM_LAYERS)
         velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
         initial_loss = compute_loss_fn(weights, X_data, W_target)
         stable = True
         final_loss = initial_loss
+        break_step = None
 
         for step in range(num_steps):
             grads = compute_grad_fn(weights, X_data, W_target)
             weights, velocities = optimizer_step(weights, velocities, grads, lr_cand, method)
             loss = compute_loss_fn(weights, X_data, W_target)
-            if np.isnan(loss) or loss > initial_loss * 50:
+            if np.isnan(loss) or loss > initial_loss * DIVERGENCE_MULTIPLIER:
                 stable = False
+                final_loss = loss
+                break_step = step
                 break
             final_loss = loss
 
@@ -267,72 +274,112 @@ def find_best_lr(method, net_type, num_steps=200):
             best_loss = final_loss
             best_lr = lr_cand
 
-    return best_lr, best_loss
+        trial_rows.append(
+            {
+                "candidate_index": idx,
+                "lr": lr_cand,
+                "stable": bool(stable),
+                "final_loss": float(final_loss),
+                "break_step": break_step,
+            }
+        )
 
+    best_index = candidates.index(best_lr)
+    hit_grid_boundary = best_index in (0, len(candidates) - 1)
+    if best_index == 0:
+        boundary_side = "highest"
+    elif best_index == len(candidates) - 1:
+        boundary_side = "lowest"
+    else:
+        boundary_side = None
 
-# =============================================================================
-# TRAINING ENGINE
-# =============================================================================
+    return {
+        "method": method,
+        "net_type": net_type,
+        "num_steps": num_steps,
+        "candidates": np.array(candidates, dtype=float),
+        "trials": trial_rows,
+        "best_lr": float(best_lr),
+        "best_loss": float(best_loss),
+        "best_index": int(best_index),
+        "hit_grid_boundary": bool(hit_grid_boundary),
+        "boundary_side": boundary_side,
+    }
+
 
 def run_training(weights_init, method, lr, num_steps, net_type):
-    """
-    Run optimizer for num_steps from weights_init.
-    Returns loss curve and final weights.
-    """
-    compute_loss_fn = compute_loss_linear if net_type == 'linear' else compute_loss_relu
-    compute_grad_fn = compute_gradients_linear if net_type == 'linear' else compute_gradients_relu
+    compute_loss_fn = compute_loss_linear if net_type == "linear" else compute_loss_relu
+    compute_grad_fn = compute_gradients_linear if net_type == "linear" else compute_gradients_relu
 
     weights = [w.copy() for w in weights_init]
     velocities = [np.zeros_like(w) for w in weights]
     losses = [compute_loss_fn(weights, X_data, W_target)]
+    diverged = False
+    divergence_step = None
 
     for step in range(num_steps):
         grads = compute_grad_fn(weights, X_data, W_target)
         weights, velocities = optimizer_step(weights, velocities, grads, lr, method)
         loss = compute_loss_fn(weights, X_data, W_target)
         losses.append(loss)
-        if np.isnan(loss) or loss > 1e10:
-            # Pad remaining with NaN
+        if np.isnan(loss) or loss > DIVERGENCE_ABS_THRESHOLD:
+            diverged = True
+            divergence_step = step
             for _ in range(num_steps - step - 1):
                 losses.append(np.nan)
             break
 
-    return np.array(losses), weights
+    return {
+        "loss_curve": np.array(losses, dtype=float),
+        "final_weights": weights,
+        "diverged": bool(diverged),
+        "divergence_step": divergence_step,
+    }
 
 
-# =============================================================================
-# CONVERGENCE BASIN ANALYSIS (20 independent runs)
-# =============================================================================
+def _summarize_loss_curves(loss_curve_matrix):
+    valid = np.isfinite(loss_curve_matrix)
+    counts = valid.sum(axis=0)
+    sums = np.where(valid, loss_curve_matrix, 0.0).sum(axis=0)
+    means = np.divide(sums, counts, out=np.full(loss_curve_matrix.shape[1], np.nan), where=counts > 0)
 
-def measure_convergence_basin(method, lr, net_type, num_runs=NUM_INDEPENDENT_RUNS,
-                              num_steps=NUM_STEPS):
-    """
-    Run num_runs independent initializations. Measure:
-      - Weight diversity: mean pairwise ||W_i - W_j||_F
-      - Function diversity: mean pairwise ||f(X_test;W_i) - f(X_test;W_j)||_F
-      - Loss mean and std
-      - Per-layer condition number at convergence
-    """
-    forward_fn = forward_linear if net_type == 'linear' else forward_relu
-    compute_loss_fn = compute_loss_linear if net_type == 'linear' else compute_loss_relu
+    centered = np.where(valid, loss_curve_matrix - means, 0.0)
+    sq_sums = (centered ** 2).sum(axis=0)
+    stds = np.sqrt(
+        np.divide(sq_sums, counts, out=np.full(loss_curve_matrix.shape[1], np.nan), where=counts > 0)
+    )
+    sems = np.divide(stds, np.sqrt(counts), out=np.full(loss_curve_matrix.shape[1], np.nan), where=counts > 0)
+    return means, stds, sems, counts
+
+
+def measure_convergence_basin(method, lr, net_type, num_runs=NUM_INDEPENDENT_RUNS, num_steps=NUM_STEPS):
+    forward_fn = forward_linear if net_type == "linear" else forward_relu
+    compute_loss_fn = compute_loss_linear if net_type == "linear" else compute_loss_relu
 
     final_weights_list = []
     final_functions = []
     final_losses = []
     loss_curves = []
-    condition_numbers = []  # per-layer condition numbers
+    condition_numbers = []
+    diverged_flags = []
+    divergence_steps = []
+    run_seeds = []
 
     for run_idx in range(num_runs):
-        weights_init = init_weights(NUM_LAYERS, seed=1000 + run_idx)
-        loss_curve, final_weights = run_training(
-            weights_init, method, lr, num_steps, net_type)
+        seed = RUN_SEED_START + run_idx
+        run_seeds.append(seed)
+        weights_init = init_weights(NUM_LAYERS, seed=seed)
+        train_result = run_training(weights_init, method, lr, num_steps, net_type)
+        loss_curve = train_result["loss_curve"]
+        final_weights = train_result["final_weights"]
 
         loss_curves.append(loss_curve)
         final_weights_list.append(final_weights)
         final_functions.append(forward_fn(final_weights, X_test).copy())
         final_losses.append(compute_loss_fn(final_weights, X_data, W_target))
+        diverged_flags.append(train_result["diverged"])
+        divergence_steps.append(train_result["divergence_step"])
 
-        # Per-layer condition number
         cond_per_layer = []
         for W in final_weights:
             svs = np.linalg.svd(W, compute_uv=False)
@@ -342,7 +389,6 @@ def measure_convergence_basin(method, lr, net_type, num_runs=NUM_INDEPENDENT_RUN
                 cond_per_layer.append(np.inf)
         condition_numbers.append(cond_per_layer)
 
-    # Pairwise diversity
     n = len(final_weights_list)
     weight_dists = []
     func_dists = []
@@ -350,543 +396,760 @@ def measure_convergence_basin(method, lr, net_type, num_runs=NUM_INDEPENDENT_RUN
         for j in range(i + 1, n):
             d_w = 0.0
             for k in range(NUM_LAYERS):
-                d_w += np.linalg.norm(
-                    final_weights_list[i][k] - final_weights_list[j][k], 'fro') ** 2
+                d_w += np.linalg.norm(final_weights_list[i][k] - final_weights_list[j][k], ord="fro") ** 2
             weight_dists.append(np.sqrt(d_w))
-            d_f = np.linalg.norm(
-                final_functions[i] - final_functions[j], 'fro') / np.linalg.norm(X_test, 'fro')
+            d_f = np.linalg.norm(final_functions[i] - final_functions[j], ord="fro") / np.linalg.norm(X_test, ord="fro")
             func_dists.append(d_f)
 
-    # Mean condition number per layer
-    cond_arr = np.array(condition_numbers)  # shape (num_runs, NUM_LAYERS)
+    cond_arr = np.array(condition_numbers, dtype=float)
     mean_cond = np.mean(cond_arr, axis=0)
+    geom_cond_by_run = np.exp(np.mean(np.log(np.clip(cond_arr, 1e-15, None)), axis=1))
 
-    # Mean loss curve (handle NaN)
-    max_len = max(len(lc) for lc in loss_curves)
+    max_len = max(len(curve) for curve in loss_curves)
     padded = np.full((num_runs, max_len), np.nan)
-    for i, lc in enumerate(loss_curves):
-        padded[i, :len(lc)] = lc
-    mean_loss_curve = np.nanmean(padded, axis=0)
+    for idx, curve in enumerate(loss_curves):
+        padded[idx, : len(curve)] = curve
+
+    mean_loss_curve, std_loss_curve, sem_loss_curve, valid_counts = _summarize_loss_curves(padded)
+    weight_dists = np.array(weight_dists, dtype=float)
+    func_dists = np.array(func_dists, dtype=float)
+    final_losses = np.array(final_losses, dtype=float)
+
+    weight_diversity_mean = np.mean(weight_dists)
+    func_diversity_mean = np.mean(func_dists)
+    function_over_weight_ratio = (
+        func_diversity_mean / weight_diversity_mean if weight_diversity_mean > 1e-15 else np.nan
+    )
 
     return {
-        'weight_diversity_mean': np.mean(weight_dists),
-        'weight_diversity_std': np.std(weight_dists),
-        'func_diversity_mean': np.mean(func_dists),
-        'func_diversity_std': np.std(func_dists),
-        'loss_mean': np.mean(final_losses),
-        'loss_std': np.std(final_losses),
-        'losses': np.array(final_losses),
-        'weight_dists': np.array(weight_dists),
-        'func_dists': np.array(func_dists),
-        'mean_loss_curve': mean_loss_curve,
-        'mean_cond_per_layer': mean_cond,
-        'cond_all': cond_arr,
+        "lr": float(lr),
+        "net_type": net_type,
+        "method": method,
+        "loss_mean": float(np.mean(final_losses)),
+        "loss_std": float(np.std(final_losses)),
+        "losses": final_losses,
+        "loss_curve_matrix": padded,
+        "loss_curve_mean": mean_loss_curve,
+        "loss_curve_std": std_loss_curve,
+        "loss_curve_sem": sem_loss_curve,
+        "loss_curve_valid_counts": valid_counts,
+        "weight_diversity_mean": float(weight_diversity_mean),
+        "weight_diversity_std": float(np.std(weight_dists)),
+        "func_diversity_mean": float(func_diversity_mean),
+        "func_diversity_std": float(np.std(func_dists)),
+        "function_over_weight_ratio": float(function_over_weight_ratio),
+        "weight_dists": weight_dists,
+        "func_dists": func_dists,
+        "mean_cond_per_layer": mean_cond,
+        "cond_all": cond_arr,
+        "condition_geom_by_run": geom_cond_by_run,
+        "condition_geom_mean": float(np.mean(geom_cond_by_run)),
+        "condition_geom_std": float(np.std(geom_cond_by_run)),
+        "run_seeds": run_seeds,
+        "num_diverged_runs": int(np.sum(diverged_flags)),
+        "stable_run_fraction": float(1.0 - np.mean(diverged_flags)),
+        "diverged_flags": np.array(diverged_flags, dtype=bool),
+        "divergence_steps": divergence_steps,
     }
 
 
 # =============================================================================
-# MAIN EXPERIMENT
+# Heuristic interpretation helpers
 # =============================================================================
 
-print("=" * 110)
-print("H3: NORMALIZED SGD vs MUON — Is the Polar Factor Necessary?")
-print("=" * 110)
-print(f"Setup: {NUM_LAYERS}-layer nets (dim={DIM}), quadratic loss, {NUM_STEPS} steps")
-print(f"{NUM_INDEPENDENT_RUNS} independent inits per optimizer, momentum={MOMENTUM}")
-print(f"Optimizers: SGD, Muon, Normalized SGD (Frob), Spectral-Norm SGD, Sign SGD")
-print("=" * 110)
-
-all_results = {}
-
-for net_type in ['linear', 'relu']:
-    print(f"\n{'#' * 110}")
-    print(f"  ARCHITECTURE: {net_type.upper()} ({NUM_LAYERS}-layer, {DIM}x{DIM})")
-    print(f"{'#' * 110}")
-
-    # Phase 1: LR sweep for each optimizer
-    print(f"\n  --- Phase 1: Learning Rate Sweep ---")
-    best_lrs = {}
-    for method in OPTIMIZER_NAMES:
-        lr, loss = find_best_lr(method, net_type, num_steps=200)
-        best_lrs[method] = lr
-        print(f"    {OPTIMIZER_LABELS[method]:<30} best_lr={lr:.5f}  (200-step loss={loss:.6e})")
-
-    # Phase 2: Full training + convergence basin analysis (20 runs)
-    print(f"\n  --- Phase 2: Convergence Basin ({NUM_INDEPENDENT_RUNS} runs, {NUM_STEPS} steps) ---")
-    net_results = {}
-    for method in OPTIMIZER_NAMES:
-        t0 = time.time()
-        result = measure_convergence_basin(method, best_lrs[method], net_type)
-        elapsed = time.time() - t0
-        net_results[method] = result
-        net_results[method]['lr'] = best_lrs[method]
-        print(f"    {OPTIMIZER_LABELS[method]:<30} loss={result['loss_mean']:.6e} +/- {result['loss_std']:.6e}  "
-              f"d_w={result['weight_diversity_mean']:.4f}  d_f={result['func_diversity_mean']:.6f}  "
-              f"({elapsed:.1f}s)")
-
-    all_results[net_type] = net_results
-
-
-# =============================================================================
-# RESULTS TABLES
-# =============================================================================
-
-for net_type in ['linear', 'relu']:
-    res = all_results[net_type]
-
-    print(f"\n\n{'=' * 110}")
-    print(f"RESULTS TABLE: {net_type.upper()} NET")
-    print(f"{'=' * 110}")
-
-    # ---- Convergence & Loss ----
-    print(f"\n  {'Optimizer':<30} | {'LR':>8} | {'Final Loss':>14} | {'Loss Std':>14} | {'Mean Loss Curve End':>18}")
-    print(f"  {'-' * 100}")
-    for m in OPTIMIZER_NAMES:
-        r = res[m]
-        curve_end = r['mean_loss_curve'][-1] if len(r['mean_loss_curve']) > 0 else np.nan
-        print(f"  {OPTIMIZER_LABELS[m]:<30} | {r['lr']:>8.5f} | {r['loss_mean']:>14.6e} | "
-              f"{r['loss_std']:>14.6e} | {curve_end:>18.6e}")
-
-    # ---- Paradox Metrics ----
-    print(f"\n  {'Optimizer':<30} | {'Weight Div':>12} | {'Func Div':>12} | {'F/W Ratio':>12} | {'Loss Std':>14}")
-    print(f"  {'-' * 90}")
-    for m in OPTIMIZER_NAMES:
-        r = res[m]
-        ratio = r['func_diversity_mean'] / r['weight_diversity_mean'] if r['weight_diversity_mean'] > 1e-15 else np.nan
-        print(f"  {OPTIMIZER_LABELS[m]:<30} | {r['weight_diversity_mean']:>12.4f} | {r['func_diversity_mean']:>12.6f} | "
-              f"{ratio:>12.6f} | {r['loss_std']:>14.6e}")
-
-    # ---- Per-Layer Condition Numbers ----
-    print(f"\n  {'Optimizer':<30} |", end='')
-    for l in range(NUM_LAYERS):
-        print(f" {'Layer '+str(l):>10} |", end='')
-    print(f" {'Geom Mean':>10}")
-    print(f"  {'-' * (35 + 13 * NUM_LAYERS + 12)}")
-    for m in OPTIMIZER_NAMES:
-        r = res[m]
-        conds = r['mean_cond_per_layer']
-        geo_mean = np.exp(np.mean(np.log(np.clip(conds, 1e-15, None))))
-        print(f"  {OPTIMIZER_LABELS[m]:<30} |", end='')
-        for l in range(NUM_LAYERS):
-            print(f" {conds[l]:>10.2f} |", end='')
-        print(f" {geo_mean:>10.2f}")
-
-
-# =============================================================================
-# KEY HYPOTHESIS TESTS
-# =============================================================================
-
-print(f"\n\n{'=' * 110}")
-print("KEY HYPOTHESIS TESTS")
-print("=" * 110)
-
-total_pass = 0
-total_tests = 0
-all_test_results = {}
-
-for net_type in ['linear', 'relu']:
-    res = all_results[net_type]
-    print(f"\n  {'=' * 80}")
-    print(f"  {net_type.upper()} NET")
-    print(f"  {'=' * 80}")
-
-    # Helper: compute paradox ratio for a method
-    def paradox_ratio(m):
-        r = res[m]
-        if r['weight_diversity_mean'] > 1e-15:
-            return r['func_diversity_mean'] / r['weight_diversity_mean']
+def _safe_ratio(numerator, denominator):
+    if denominator <= 1e-15:
         return np.nan
+    return numerator / denominator
 
-    # Helper: paradox strength = weight_div * (1 / func_div) * (1 / loss_std)
-    # Higher = stronger paradox (more weight diversity, less function diversity, less loss spread)
-    def paradox_strength(m):
-        r = res[m]
-        if r['func_diversity_mean'] > 1e-15 and r['loss_std'] > 1e-20:
-            return r['weight_diversity_mean'] / (r['func_diversity_mean'] * r['loss_std'])
+
+def _comparable_ratio(a, b):
+    if a > 1e-15 and b > 1e-15:
+        return min(a, b) / max(a, b)
+    return np.nan
+
+
+def compute_heuristic_tests(net_results):
+    def paradox_ratio(method):
+        return net_results[method]["function_over_weight_ratio"]
+
+    def paradox_strength(method):
+        result = net_results[method]
+        if result["func_diversity_mean"] > 1e-15 and result["loss_std"] > 1e-20:
+            return result["weight_diversity_mean"] / (result["func_diversity_mean"] * result["loss_std"])
         return 0.0
 
-    # ----- T1: Does normalized SGD create the paradox? -----
-    # Paradox = high weight diversity AND low loss std AND low func diversity
-    # Compare to SGD baseline
-    sgd_ratio = paradox_ratio('sgd')
-    norm_ratio = paradox_ratio('norm_sgd')
-    muon_ratio = paradox_ratio('muon')
+    sgd_ratio = paradox_ratio("sgd")
+    norm_ratio = paradox_ratio("norm_sgd")
+    muon_ratio = paradox_ratio("muon")
 
-    t1 = norm_ratio < sgd_ratio  # Lower ratio means stronger paradox
-    total_tests += 1
-    total_pass += t1
-    print(f"\n  T1: Does Normalized SGD create the paradox?")
-    print(f"      F/W Ratio: SGD={sgd_ratio:.6f}, Norm_SGD={norm_ratio:.6f}, Muon={muon_ratio:.6f}")
-    print(f"      Norm SGD ratio < SGD ratio? {norm_ratio:.6f} < {sgd_ratio:.6f} --> {'PASS' if t1 else 'FAIL'}")
+    t1 = bool(norm_ratio < sgd_ratio)
 
-    # ----- T2: Does normalized SGD match Muon convergence speed? -----
-    # Compare mean loss curves at 50%, 100% of steps
-    muon_curve = res['muon']['mean_loss_curve']
-    norm_curve = res['norm_sgd']['mean_loss_curve']
-    half = len(muon_curve) // 2
-    # Match = within 2x of each other at 50% and 100%
-    muon_half = muon_curve[half] if half < len(muon_curve) else np.nan
-    norm_half = norm_curve[half] if half < len(norm_curve) else np.nan
-    muon_final = res['muon']['loss_mean']
-    norm_final = res['norm_sgd']['loss_mean']
-    # Within 3x is a rough match
-    t2_half = (min(muon_half, norm_half) / max(muon_half, norm_half) > 0.33) if (muon_half > 1e-15 and norm_half > 1e-15) else False
-    t2_final = (min(muon_final, norm_final) / max(muon_final, norm_final) > 0.33) if (muon_final > 1e-15 and norm_final > 1e-15) else False
-    t2 = t2_half and t2_final
-    total_tests += 1
-    total_pass += t2
-    print(f"\n  T2: Does Normalized SGD match Muon convergence speed?")
-    print(f"      At 50% steps: Muon={muon_half:.6e}, Norm={norm_half:.6e}, ratio={min(muon_half,norm_half)/max(muon_half,norm_half):.3f}")
-    print(f"      Final loss:   Muon={muon_final:.6e}, Norm={norm_final:.6e}, ratio={min(muon_final,norm_final)/max(muon_final,norm_final):.3f}")
-    print(f"      --> {'PASS (comparable)' if t2 else 'FAIL (not comparable)'}")
+    muon_curve = net_results["muon"]["loss_curve_mean"]
+    norm_curve = net_results["norm_sgd"]["loss_curve_mean"]
+    half_idx = len(muon_curve) // 2
+    muon_half = muon_curve[half_idx] if half_idx < len(muon_curve) else np.nan
+    norm_half = norm_curve[half_idx] if half_idx < len(norm_curve) else np.nan
+    muon_final = net_results["muon"]["loss_mean"]
+    norm_final = net_results["norm_sgd"]["loss_mean"]
+    half_ratio = _comparable_ratio(muon_half, norm_half)
+    final_ratio = _comparable_ratio(muon_final, norm_final)
+    t2_half = bool(half_ratio > 0.33) if np.isfinite(half_ratio) else False
+    t2_final = bool(final_ratio > 0.33) if np.isfinite(final_ratio) else False
+    t2 = bool(t2_half and t2_final)
 
-    # ----- T3: Does Muon beat normalized SGD on LOSS? -----
-    t3 = muon_final < norm_final
-    total_tests += 1
-    total_pass += t3
-    print(f"\n  T3: Does Muon beat Normalized SGD on final loss?")
-    print(f"      Muon={muon_final:.6e} vs Norm={norm_final:.6e}")
-    print(f"      --> {'PASS (Muon wins)' if t3 else 'FAIL (Norm wins or tie)'}")
+    t3 = bool(muon_final < norm_final)
 
-    # ----- T4: Which normalization creates strongest paradox? -----
-    norm_methods = ['norm_sgd', 'spectral_sgd', 'sign_sgd', 'muon']
-    ratios = {m: paradox_ratio(m) for m in norm_methods}
-    strengths = {m: paradox_strength(m) for m in norm_methods}
-    best_ratio = min(ratios, key=lambda m: ratios[m])
-    best_strength = max(strengths, key=lambda m: strengths[m])
-    total_tests += 1
-    t4 = best_ratio == 'muon'
-    total_pass += t4
-    print(f"\n  T4: Which normalization creates strongest paradox?")
-    print(f"      F/W Ratios (lower = stronger paradox):")
-    for m in norm_methods:
-        marker = " <-- BEST" if m == best_ratio else ""
-        print(f"        {OPTIMIZER_LABELS[m]:<30} ratio={ratios[m]:.6f}{marker}")
-    print(f"      Paradox Strength (weight_div / (func_div * loss_std)):")
-    for m in norm_methods:
-        marker = " <-- BEST" if m == best_strength else ""
-        print(f"        {OPTIMIZER_LABELS[m]:<30} strength={strengths[m]:.2f}{marker}")
-    print(f"      Muon has lowest F/W ratio? --> {'PASS' if t4 else 'FAIL'}")
+    norm_methods = ["norm_sgd", "spectral_sgd", "sign_sgd", "muon"]
+    ratios = {method: paradox_ratio(method) for method in norm_methods}
+    strengths = {method: paradox_strength(method) for method in norm_methods}
+    best_ratio_method = min(ratios, key=lambda method: ratios[method])
+    best_strength_method = max(strengths, key=lambda method: strengths[method])
+    t4 = bool(best_ratio_method == "muon")
 
-    all_test_results[net_type] = {
-        't1': t1, 't2': t2, 't3': t3, 't4': t4,
-        'ratios': ratios, 'strengths': strengths,
+    norm_matches_paradox = bool(norm_ratio < sgd_ratio * 0.8)
+    norm_matches_loss = bool(abs(norm_final - muon_final) / max(muon_final, 1e-15) < 0.5)
+    spec_ratio = paradox_ratio("spectral_sgd")
+    spec_loss = net_results["spectral_sgd"]["loss_mean"]
+    spec_matches_paradox = bool(spec_ratio < sgd_ratio * 0.8)
+    spec_matches_loss = bool(abs(spec_loss - muon_final) / max(muon_final, 1e-15) < 0.5)
+    any_matches_both = (norm_matches_paradox and norm_matches_loss) or (
+        spec_matches_paradox and spec_matches_loss
+    )
+    any_matches_paradox_only = (norm_matches_paradox or spec_matches_paradox) and not any_matches_both
+
+    if any_matches_both:
+        critical_conclusion = (
+            "On this toy architecture, simple normalization can reproduce both a stronger paradox-style "
+            "F/W signature and Muon-comparable loss. That still does not establish universal necessity or "
+            "non-necessity of the polar factor beyond this setting."
+        )
+    elif any_matches_paradox_only or (norm_matches_paradox and not norm_matches_loss) or (
+        spec_matches_paradox and not spec_matches_loss
+    ):
+        critical_conclusion = (
+            "On this toy architecture, simple normalization can reproduce some paradox-style diversity "
+            "signatures, but Muon's orthogonalized update still gives clearly different optimization quality."
+        )
+    else:
+        critical_conclusion = (
+            "On this toy architecture, the normalization baselines do not reproduce Muon's combination of "
+            "diversity signature and loss behavior."
+        )
+
+    tests = {
+        "t1": {
+            "name": "Normalized SGD has lower F/W ratio than SGD",
+            "passed": t1,
+            "summary": f"Norm F/W={norm_ratio:.6f} vs SGD F/W={sgd_ratio:.6f}",
+            "details": {
+                "sgd_ratio": float(sgd_ratio),
+                "norm_ratio": float(norm_ratio),
+                "muon_ratio": float(muon_ratio),
+            },
+        },
+        "t2": {
+            "name": "Normalized SGD has roughly Muon-comparable mid/final mean loss",
+            "passed": t2,
+            "summary": (
+                f"half-step ratio={half_ratio:.3f}, final-loss ratio={final_ratio:.3f} "
+                f"(threshold > 0.33 at both checkpoints)"
+            ),
+            "details": {
+                "half_index": int(half_idx),
+                "muon_half_loss": float(muon_half),
+                "norm_half_loss": float(norm_half),
+                "half_ratio": float(half_ratio),
+                "muon_final_loss": float(muon_final),
+                "norm_final_loss": float(norm_final),
+                "final_ratio": float(final_ratio),
+            },
+        },
+        "t3": {
+            "name": "Muon achieves lower final mean loss than normalized SGD",
+            "passed": t3,
+            "summary": f"Muon={muon_final:.6e}, Norm={norm_final:.6e}",
+            "details": {
+                "muon_final_loss": float(muon_final),
+                "norm_final_loss": float(norm_final),
+            },
+        },
+        "t4": {
+            "name": "Muon has the lowest F/W ratio among the normalization-style methods",
+            "passed": t4,
+            "summary": (
+                f"best F/W={OPTIMIZER_LABELS[best_ratio_method]}, "
+                f"best ad hoc strength={OPTIMIZER_LABELS[best_strength_method]}"
+            ),
+            "details": {
+                "ratios": {method: float(value) for method, value in ratios.items()},
+                "strengths": {method: float(value) for method, value in strengths.items()},
+                "best_ratio_method": best_ratio_method,
+                "best_strength_method": best_strength_method,
+            },
+        },
+    }
+
+    return {
+        "tests": tests,
+        "ratios": ratios,
+        "strengths": strengths,
+        "best_ratio_method": best_ratio_method,
+        "best_strength_method": best_strength_method,
+        "critical_comparison": {
+            "norm_matches_paradox": norm_matches_paradox,
+            "norm_matches_loss": norm_matches_loss,
+            "spec_matches_paradox": spec_matches_paradox,
+            "spec_matches_loss": spec_matches_loss,
+            "any_matches_both": bool(any_matches_both),
+            "any_matches_paradox_only": bool(any_matches_paradox_only),
+            "conclusion": critical_conclusion,
+        },
+        "pass_count": int(sum(1 for test in tests.values() if test["passed"])),
+        "test_count": int(len(tests)),
     }
 
 
 # =============================================================================
-# THE CRITICAL COMPARISON
+# Tabular helpers for the notebook and console summaries
 # =============================================================================
 
-print(f"\n\n{'=' * 110}")
-print("THE CRITICAL COMPARISON: Is the Polar Factor Necessary?")
-print("=" * 110)
+def build_lr_summary_rows(results_bundle):
+    rows = []
+    for net_type in ARCHITECTURES:
+        for method in OPTIMIZER_NAMES:
+            sweep = results_bundle["lr_sweeps"][net_type][method]
+            rows.append(
+                {
+                    "architecture": net_type,
+                    "optimizer": OPTIMIZER_LABELS[method],
+                    "selected_lr": float(sweep["best_lr"]),
+                    "best_200_step_loss": float(sweep["best_loss"]),
+                    "hit_grid_boundary": bool(sweep["hit_grid_boundary"]),
+                    "boundary_side": sweep["boundary_side"] or "interior",
+                    "num_candidates": int(len(sweep["candidates"])),
+                }
+            )
+    return rows
 
-for net_type in ['linear', 'relu']:
-    res = all_results[net_type]
-    tr = all_test_results[net_type]
 
-    print(f"\n  --- {net_type.upper()} NET ---")
+def build_optimizer_summary_rows(results_bundle, net_type):
+    rows = []
+    for method in OPTIMIZER_NAMES:
+        result = results_bundle["architectures"][net_type][method]
+        rows.append(
+            {
+                "optimizer": OPTIMIZER_LABELS[method],
+                "selected_lr": float(result["lr"]),
+                "final_loss_mean": float(result["loss_mean"]),
+                "final_loss_std": float(result["loss_std"]),
+                "weight_diversity_mean": float(result["weight_diversity_mean"]),
+                "func_diversity_mean": float(result["func_diversity_mean"]),
+                "function_over_weight_ratio": float(result["function_over_weight_ratio"]),
+                "condition_geom_mean": float(result["condition_geom_mean"]),
+                "condition_geom_std": float(result["condition_geom_std"]),
+                "stable_run_fraction": float(result["stable_run_fraction"]),
+                "num_diverged_runs": int(result["num_diverged_runs"]),
+            }
+        )
+    return rows
 
-    muon_loss = res['muon']['loss_mean']
-    norm_loss = res['norm_sgd']['loss_mean']
-    spec_loss = res['spectral_sgd']['loss_mean']
 
-    muon_ratio = tr['ratios']['muon']
-    norm_ratio = tr['ratios']['norm_sgd']
-    spec_ratio = tr['ratios']['spectral_sgd']
-    sgd_ratio = res['sgd']['func_diversity_mean'] / res['sgd']['weight_diversity_mean'] if res['sgd']['weight_diversity_mean'] > 1e-15 else np.nan
+def build_paradox_metric_rows(results_bundle, net_type):
+    heuristic = results_bundle["heuristic_results"][net_type]
+    rows = []
+    for method in OPTIMIZER_NAMES:
+        result = results_bundle["architectures"][net_type][method]
+        rows.append(
+            {
+                "optimizer": OPTIMIZER_LABELS[method],
+                "weight_diversity_mean": float(result["weight_diversity_mean"]),
+                "weight_diversity_std": float(result["weight_diversity_std"]),
+                "func_diversity_mean": float(result["func_diversity_mean"]),
+                "func_diversity_std": float(result["func_diversity_std"]),
+                "function_over_weight_ratio": float(result["function_over_weight_ratio"]),
+                "paradox_strength": float(heuristic["strengths"].get(method, np.nan)),
+                "final_loss_std": float(result["loss_std"]),
+            }
+        )
+    return rows
 
-    # Check if norm/spectral SGD match Muon on BOTH paradox AND loss
-    norm_matches_paradox = norm_ratio < sgd_ratio * 0.8  # At least 20% better than SGD
-    norm_matches_loss = abs(norm_loss - muon_loss) / max(muon_loss, 1e-15) < 0.5  # Within 50%
-    spec_matches_paradox = spec_ratio < sgd_ratio * 0.8
-    spec_matches_loss = abs(spec_loss - muon_loss) / max(muon_loss, 1e-15) < 0.5
 
-    any_matches_both = (norm_matches_paradox and norm_matches_loss) or (spec_matches_paradox and spec_matches_loss)
-    any_matches_paradox_only = (norm_matches_paradox or spec_matches_paradox) and not any_matches_both
+def build_heuristic_rule_rows(results_bundle, net_type):
+    heuristic = results_bundle["heuristic_results"][net_type]
+    rows = []
+    for test_key in ("t1", "t2", "t3", "t4"):
+        test = heuristic["tests"][test_key]
+        rows.append(
+            {
+                "rule": test_key.upper(),
+                "description": test["name"],
+                "passed": bool(test["passed"]),
+                "summary": test["summary"],
+            }
+        )
+    return rows
 
-    print(f"\n    SGD baseline F/W ratio:        {sgd_ratio:.6f}")
-    print(f"    Muon F/W ratio:                {muon_ratio:.6f}  loss={muon_loss:.6e}")
-    print(f"    Norm SGD F/W ratio:            {norm_ratio:.6f}  loss={norm_loss:.6e}")
-    print(f"    Spectral SGD F/W ratio:        {spec_ratio:.6f}  loss={spec_loss:.6e}")
-    print(f"    Sign SGD F/W ratio:            {tr['ratios']['sign_sgd']:.6f}  loss={res['sign_sgd']['loss_mean']:.6e}")
 
-    print(f"\n    Norm SGD paradox?  {norm_matches_paradox}  (ratio < 80% of SGD)")
-    print(f"    Norm SGD loss match?  {norm_matches_loss}  (within 50% of Muon)")
-    print(f"    Spec SGD paradox?  {spec_matches_paradox}")
-    print(f"    Spec SGD loss match?  {spec_matches_loss}")
+def build_overall_summary(results_bundle):
+    total_passes = sum(results_bundle["heuristic_results"][net_type]["pass_count"] for net_type in ARCHITECTURES)
+    total_tests = sum(results_bundle["heuristic_results"][net_type]["test_count"] for net_type in ARCHITECTURES)
 
-    if any_matches_both:
-        print(f"\n    ==> CONCLUSION: Polar factor is UNNECESSARY.")
-        print(f"        Simple normalization suffices for both paradox and convergence.")
-        print(f"        The key mechanism is scale removal, not orthogonal projection.")
-    elif any_matches_paradox_only or (norm_matches_paradox and not norm_matches_loss) or (spec_matches_paradox and not spec_matches_loss):
-        print(f"\n    ==> CONCLUSION: Normalization creates the paradox but DIRECTIONAL QUALITY matters.")
-        print(f"        The polar factor provides better convergence than simple normalization.")
-        print(f"        Scale removal creates gauge exploration; ortho projection provides gradient quality.")
+    both_match_both = all(
+        results_bundle["heuristic_results"][net_type]["critical_comparison"]["any_matches_both"]
+        for net_type in ARCHITECTURES
+    )
+    any_match_both = any(
+        results_bundle["heuristic_results"][net_type]["critical_comparison"]["any_matches_both"]
+        for net_type in ARCHITECTURES
+    )
+    any_paradox_only = any(
+        results_bundle["heuristic_results"][net_type]["critical_comparison"]["any_matches_paradox_only"]
+        for net_type in ARCHITECTURES
+    )
+
+    if both_match_both:
+        interpretation = (
+            "Within this toy setup, scale-normalized baselines can match Muon on both architectures. "
+            "That still would not justify a universal claim about the polar factor outside this experiment."
+        )
+    elif any_match_both or any_paradox_only:
+        interpretation = (
+            "Evidence is mixed and architecture-dependent: some normalization baselines can reproduce parts of "
+            "the diversity signature, but Muon still differs materially in optimization quality on at least one architecture."
+        )
     else:
-        print(f"\n    ==> CONCLUSION: Polar factor is doing something QUALITATIVELY DIFFERENT.")
-        print(f"        Simple normalization does NOT replicate the Muon paradox or convergence.")
-        print(f"        The orthogonal projection is essential, not just the normalization.")
+        interpretation = (
+            "Within this toy setup, the normalization baselines do not reproduce Muon's combined behavior. "
+            "This remains limited evidence about this specific experiment, not a universal theorem."
+        )
+
+    return {
+        "total_passes": int(total_passes),
+        "total_tests": int(total_tests),
+        "interpretation": interpretation,
+    }
 
 
 # =============================================================================
-# COMPREHENSIVE NUMBERS DUMP
+# Plotting helpers
 # =============================================================================
 
-print(f"\n\n{'=' * 110}")
-print("COMPREHENSIVE NUMBERS (for paper)")
-print("=" * 110)
-
-for net_type in ['linear', 'relu']:
-    res = all_results[net_type]
-    print(f"\n  {net_type.upper()} NET:")
-    print(f"  {'Method':<30} | {'Loss':>12} | {'Loss Std':>12} | {'W Div':>10} | {'F Div':>12} | "
-          f"{'F/W Ratio':>10} | {'Cond(geom)':>10} | {'Paradox Str':>12}")
-    print(f"  {'-' * 125}")
-    for m in OPTIMIZER_NAMES:
-        r = res[m]
-        ratio = r['func_diversity_mean'] / r['weight_diversity_mean'] if r['weight_diversity_mean'] > 1e-15 else np.nan
-        conds = r['mean_cond_per_layer']
-        geo_cond = np.exp(np.mean(np.log(np.clip(conds, 1e-15, None))))
-        if r['func_diversity_mean'] > 1e-15 and r['loss_std'] > 1e-20:
-            pstr = r['weight_diversity_mean'] / (r['func_diversity_mean'] * r['loss_std'])
-        else:
-            pstr = 0.0
-        print(f"  {OPTIMIZER_LABELS[m]:<30} | {r['loss_mean']:>12.6e} | {r['loss_std']:>12.6e} | "
-              f"{r['weight_diversity_mean']:>10.4f} | {r['func_diversity_mean']:>12.6f} | "
-              f"{ratio:>10.6f} | {geo_cond:>10.2f} | {pstr:>12.2f}")
-
-
-# =============================================================================
-# PLOTS
-# =============================================================================
-
-print(f"\n\n{'=' * 110}")
-print("GENERATING PLOTS")
-print("=" * 110)
-
-try:
-    import matplotlib
-    matplotlib.use('Agg')
+def _require_matplotlib():
     import matplotlib.pyplot as plt
 
-    for net_type in ['linear', 'relu']:
-        res = all_results[net_type]
+    return plt
 
-        fig, axes = plt.subplots(2, 3, figsize=(22, 14))
-        fig.suptitle(
-            f'H3: Normalized SGD vs Muon ({net_type.upper()} net)\n'
-            f'{NUM_LAYERS}-layer, dim={DIM}, {NUM_STEPS} steps, {NUM_INDEPENDENT_RUNS} runs',
-            fontsize=14, fontweight='bold')
 
-        # ---- (a) Loss Curves ----
-        ax = axes[0, 0]
-        ax.set_title('Mean Loss Curves (Best LR)')
-        for m in OPTIMIZER_NAMES:
-            curve = res[m]['mean_loss_curve']
-            ax.semilogy(np.arange(len(curve)), curve, color=OPTIMIZER_COLORS[m],
-                        linewidth=2, label=f"{OPTIMIZER_LABELS[m]} (lr={res[m]['lr']:.4f})")
-        ax.set_xlabel('Step')
-        ax.set_ylabel('Loss')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+def _annotate_best_bar(ax, values, best_index, mode="min"):
+    if best_index is None or best_index >= len(values):
+        return
+    best_value = values[best_index]
+    if not np.isfinite(best_value):
+        return
+    if ax.get_yscale() == "log":
+        y = best_value * 1.25
+    else:
+        spread = max(values) - min(values) if values else 0.0
+        y = best_value + 0.05 * (spread if spread > 0 else max(abs(best_value), 1.0))
+    label = "best" if mode == "min" else "best"
+    ax.text(best_index, y, label, ha="center", va="bottom", fontsize=9)
 
-        # ---- (b) Final Loss Bar Chart ----
-        ax = axes[0, 1]
-        ax.set_title('Final Loss (mean +/- std)')
-        x_pos = np.arange(len(OPTIMIZER_NAMES))
-        means = [res[m]['loss_mean'] for m in OPTIMIZER_NAMES]
-        stds = [res[m]['loss_std'] for m in OPTIMIZER_NAMES]
-        colors = [OPTIMIZER_COLORS[m] for m in OPTIMIZER_NAMES]
-        bars = ax.bar(x_pos, means, yerr=stds, color=colors, edgecolor='black',
-                      capsize=3, width=0.6)
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels([OPTIMIZER_LABELS[m] for m in OPTIMIZER_NAMES],
-                           rotation=30, ha='right', fontsize=8)
-        ax.set_ylabel('Final Loss')
-        ax.set_yscale('log')
-        ax.grid(True, alpha=0.3, axis='y')
-        for i, bar in enumerate(bars):
-            ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height(),
-                    f'{means[i]:.2e}', ha='center', va='bottom', fontsize=7, fontweight='bold')
 
-        # ---- (c) Paradox Ratio (F/W) ----
-        ax = axes[0, 2]
-        ax.set_title('Paradox Ratio: Func_Div / Weight_Div\n(Lower = stronger paradox)')
-        ratios = []
-        for m in OPTIMIZER_NAMES:
-            r = res[m]
-            if r['weight_diversity_mean'] > 1e-15:
-                ratios.append(r['func_diversity_mean'] / r['weight_diversity_mean'])
-            else:
-                ratios.append(0)
-        bars = ax.bar(x_pos, ratios, color=colors, edgecolor='black', width=0.6)
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels([OPTIMIZER_LABELS[m] for m in OPTIMIZER_NAMES],
-                           rotation=30, ha='right', fontsize=8)
-        ax.set_ylabel('Func Div / Weight Div')
-        ax.grid(True, alpha=0.3, axis='y')
-        for i, bar in enumerate(bars):
-            ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height(),
-                    f'{ratios[i]:.4f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+def planned_figure_paths(output_dir):
+    output_dir = resolve_output_dir(output_dir)
+    return {
+        "linear": str(output_dir / "h3_normalized_sgd_vs_muon_linear.png"),
+        "relu": str(output_dir / "h3_normalized_sgd_vs_muon_relu.png"),
+        "combined_summary": str(output_dir / "h3_combined_summary.png"),
+    }
 
-        # ---- (d) Weight Diversity ----
-        ax = axes[1, 0]
-        ax.set_title('Weight Diversity (pairwise)')
-        wdivs = [res[m]['weight_diversity_mean'] for m in OPTIMIZER_NAMES]
-        bars = ax.bar(x_pos, wdivs, color=colors, edgecolor='black', width=0.6)
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels([OPTIMIZER_LABELS[m] for m in OPTIMIZER_NAMES],
-                           rotation=30, ha='right', fontsize=8)
-        ax.set_ylabel('Mean Pairwise ||W_i - W_j||_F')
-        ax.grid(True, alpha=0.3, axis='y')
-        for i, bar in enumerate(bars):
-            ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height(),
-                    f'{wdivs[i]:.3f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
 
-        # ---- (e) Function Diversity ----
-        ax = axes[1, 1]
-        ax.set_title('Function Diversity (pairwise)')
-        fdivs = [res[m]['func_diversity_mean'] for m in OPTIMIZER_NAMES]
-        bars = ax.bar(x_pos, fdivs, color=colors, edgecolor='black', width=0.6)
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels([OPTIMIZER_LABELS[m] for m in OPTIMIZER_NAMES],
-                           rotation=30, ha='right', fontsize=8)
-        ax.set_ylabel('Mean Pairwise ||f_i - f_j||_F / ||X||_F')
-        ax.grid(True, alpha=0.3, axis='y')
-        for i, bar in enumerate(bars):
-            ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height(),
-                    f'{fdivs[i]:.5f}', ha='center', va='bottom', fontsize=7, fontweight='bold')
+def plot_architecture_overview(results_bundle, net_type, save_path=None, show=False):
+    plt = _require_matplotlib()
 
-        # ---- (f) Condition Number ----
-        ax = axes[1, 2]
-        ax.set_title('Per-Layer Condition Number (mean)')
-        x_layers = np.arange(NUM_LAYERS)
-        width_bar = 0.15
-        for idx, m in enumerate(OPTIMIZER_NAMES):
-            conds = res[m]['mean_cond_per_layer']
-            offset = (idx - len(OPTIMIZER_NAMES) / 2 + 0.5) * width_bar
-            ax.bar(x_layers + offset, conds, width_bar, color=OPTIMIZER_COLORS[m],
-                   edgecolor='black', label=OPTIMIZER_LABELS[m])
-        ax.set_xticks(x_layers)
-        ax.set_xticklabels([f'Layer {l}' for l in range(NUM_LAYERS)])
-        ax.set_ylabel('Condition Number')
-        ax.legend(fontsize=7, loc='upper left')
-        ax.grid(True, alpha=0.3, axis='y')
+    arch_results = results_bundle["architectures"][net_type]
+    heuristics = results_bundle["heuristic_results"][net_type]
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    ax_loss, ax_div, ax_ratio, ax_strength = axes.flatten()
 
-        plt.tight_layout()
-        plot_path = os.path.join(SCRIPT_DIR, f'h3_normalized_sgd_vs_muon_{net_type}.png')
-        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  Plot saved: {plot_path}")
+    for method in OPTIMIZER_NAMES:
+        result = arch_results[method]
+        color = OPTIMIZER_COLORS[method]
+        mean_curve = result["loss_curve_mean"]
+        std_curve = result["loss_curve_std"]
+        x = np.arange(len(mean_curve))
+        valid = np.isfinite(mean_curve)
+        ax_loss.plot(x[valid], mean_curve[valid], label=OPTIMIZER_LABELS[method], color=color, linewidth=2)
+        lower = np.clip(mean_curve - std_curve, 1e-18, None)
+        upper = mean_curve + std_curve
+        ax_loss.fill_between(x[valid], lower[valid], upper[valid], color=color, alpha=0.15)
+    ax_loss.set_yscale("log")
+    ax_loss.set_xlabel("Training step")
+    ax_loss.set_ylabel("Mean loss across runs")
+    ax_loss.set_title("Mean loss curve ± 1 std across 20 runs")
+    ax_loss.grid(True, alpha=0.3)
+    ax_loss.legend(fontsize=9)
 
-    # ---- Combined summary ----
-    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
-    fig.suptitle('H3: Is the Polar Factor Necessary?\n'
-                 'Paradox Ratio (F_div / W_div) — Lower = Stronger Paradox',
-                 fontsize=14, fontweight='bold')
+    idx = np.arange(len(OPTIMIZER_NAMES))
+    width = 0.38
+    weight_vals = [arch_results[method]["weight_diversity_mean"] for method in OPTIMIZER_NAMES]
+    func_vals = [arch_results[method]["func_diversity_mean"] for method in OPTIMIZER_NAMES]
+    colors = [OPTIMIZER_COLORS[method] for method in OPTIMIZER_NAMES]
+    ax_div.bar(idx - width / 2, weight_vals, width=width, color=colors, alpha=0.85, label="Weight diversity")
+    ax_div.bar(idx + width / 2, func_vals, width=width, color=colors, alpha=0.35, label="Function diversity")
+    ax_div.set_xticks(idx)
+    ax_div.set_xticklabels([OPTIMIZER_LABELS[method] for method in OPTIMIZER_NAMES], rotation=25, ha="right")
+    ax_div.set_yscale("log")
+    ax_div.set_ylabel("Descriptive scale (log)")
+    ax_div.set_title("Weight vs function diversity")
+    ax_div.grid(True, axis="y", alpha=0.3)
+    ax_div.legend(fontsize=9)
 
-    for idx, net_type in enumerate(['linear', 'relu']):
-        res = all_results[net_type]
-        ax = axes[idx]
-        ax.set_title(f'{net_type.upper()} Net')
+    ratio_vals = [arch_results[method]["function_over_weight_ratio"] for method in OPTIMIZER_NAMES]
+    ratio_best_method = heuristics["best_ratio_method"]
+    ratio_best_idx = OPTIMIZER_NAMES.index(ratio_best_method)
+    ax_ratio.bar(idx, ratio_vals, color=colors, alpha=0.9)
+    ax_ratio.set_xticks(idx)
+    ax_ratio.set_xticklabels([OPTIMIZER_LABELS[method] for method in OPTIMIZER_NAMES], rotation=25, ha="right")
+    ax_ratio.set_yscale("log")
+    ax_ratio.set_ylabel("Function / weight diversity")
+    ax_ratio.set_title("Lower F/W ratio = stronger paradox by this descriptive ratio")
+    ax_ratio.grid(True, axis="y", alpha=0.3)
+    _annotate_best_bar(ax_ratio, ratio_vals, ratio_best_idx, mode="min")
 
-        ratios = []
-        for m in OPTIMIZER_NAMES:
-            r = res[m]
-            if r['weight_diversity_mean'] > 1e-15:
-                ratios.append(r['func_diversity_mean'] / r['weight_diversity_mean'])
-            else:
-                ratios.append(0)
+    strength_vals = [heuristics["strengths"].get(method, np.nan) for method in OPTIMIZER_NAMES]
+    strength_best_method = heuristics["best_strength_method"]
+    strength_best_idx = OPTIMIZER_NAMES.index(strength_best_method)
+    ax_strength.bar(idx, strength_vals, color=colors, alpha=0.9)
+    ax_strength.set_xticks(idx)
+    ax_strength.set_xticklabels([OPTIMIZER_LABELS[method] for method in OPTIMIZER_NAMES], rotation=25, ha="right")
+    ax_strength.set_yscale("log")
+    ax_strength.set_ylabel("Weight / (function × loss std)")
+    ax_strength.set_title("Ad hoc paradox-strength heuristic (higher = stronger)")
+    ax_strength.grid(True, axis="y", alpha=0.3)
+    _annotate_best_bar(ax_strength, strength_vals, strength_best_idx, mode="max")
 
-        x_pos = np.arange(len(OPTIMIZER_NAMES))
-        colors = [OPTIMIZER_COLORS[m] for m in OPTIMIZER_NAMES]
-        bars = ax.bar(x_pos, ratios, color=colors, edgecolor='black', width=0.6)
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels([OPTIMIZER_LABELS[m] for m in OPTIMIZER_NAMES],
-                           rotation=25, ha='right', fontsize=9)
-        ax.set_ylabel('Func Diversity / Weight Diversity')
-        ax.grid(True, alpha=0.3, axis='y')
-        for i, bar in enumerate(bars):
-            ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height(),
-                    f'{ratios[i]:.4f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    fig.suptitle(
+        f"{EXPERIMENT_TITLE}: {net_type.upper()} architecture overview",
+        fontsize=16,
+    )
+    fig.text(
+        0.5,
+        0.01,
+        "Caveat: diversity metrics are descriptive summaries from 20 runs; the pairwise distances are not independent samples.",
+        ha="center",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
 
-        # Add loss info as text
-        loss_text = "Final Losses:\n"
-        for m in OPTIMIZER_NAMES:
-            loss_text += f"  {OPTIMIZER_LABELS[m]}: {res[m]['loss_mean']:.2e}\n"
-        ax.text(0.98, 0.98, loss_text, transform=ax.transAxes, fontsize=7,
-                ha='right', va='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
 
-    plt.tight_layout()
-    combined_path = os.path.join(SCRIPT_DIR, 'h3_combined_summary.png')
-    plt.savefig(combined_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Combined plot saved: {combined_path}")
 
-except ImportError:
-    print("  WARNING: matplotlib not available, skipping plots.")
+def plot_combined_summary(results_bundle, save_path=None, show=False):
+    plt = _require_matplotlib()
+
+    fig, axes = plt.subplots(len(ARCHITECTURES), 3, figsize=(18, 10), squeeze=False)
+    metric_specs = [
+        ("loss_mean", "Final loss mean", "log"),
+        ("function_over_weight_ratio", "F/W ratio", "log"),
+        ("condition_geom_mean", "Geom. mean condition number", "log"),
+    ]
+
+    for row_idx, net_type in enumerate(ARCHITECTURES):
+        arch_results = results_bundle["architectures"][net_type]
+        colors = [OPTIMIZER_COLORS[method] for method in OPTIMIZER_NAMES]
+        labels = [OPTIMIZER_LABELS[method] for method in OPTIMIZER_NAMES]
+        idx = np.arange(len(OPTIMIZER_NAMES))
+
+        for col_idx, (metric_key, title, yscale) in enumerate(metric_specs):
+            ax = axes[row_idx, col_idx]
+            values = [arch_results[method][metric_key] for method in OPTIMIZER_NAMES]
+            ax.bar(idx, values, color=colors, alpha=0.9)
+            if metric_key == "loss_mean":
+                errors = [arch_results[method]["loss_std"] for method in OPTIMIZER_NAMES]
+                ax.errorbar(idx, values, yerr=errors, fmt="none", ecolor="black", elinewidth=1, capsize=3)
+            ax.set_xticks(idx)
+            ax.set_xticklabels(labels, rotation=25, ha="right")
+            if yscale == "log":
+                ax.set_yscale("log")
+            ax.set_title(f"{net_type.upper()}: {title}")
+            ax.grid(True, axis="y", alpha=0.3)
+            if col_idx == 0:
+                ax.set_ylabel("Value")
+
+    fig.suptitle(f"{EXPERIMENT_TITLE}: cross-architecture summary", fontsize=16)
+    fig.text(
+        0.5,
+        0.01,
+        "Loss bars include ±1 std across runs. Conditioning is the geometric mean over per-layer condition numbers within each run, then averaged across runs.",
+        ha="center",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
+
+
+def save_all_figures(results_bundle, output_dir, verbose=True):
+    figure_paths = planned_figure_paths(output_dir)
+    try:
+        for net_type in ARCHITECTURES:
+            fig = plot_architecture_overview(results_bundle, net_type, save_path=figure_paths[net_type], show=False)
+            fig.canvas.draw_idle()
+            fig.clf()
+        summary_fig = plot_combined_summary(
+            results_bundle,
+            save_path=figure_paths["combined_summary"],
+            show=False,
+        )
+        summary_fig.canvas.draw_idle()
+        summary_fig.clf()
+    except ImportError as exc:
+        if verbose:
+            print(f"\n[warning] matplotlib unavailable; skipping figure generation: {exc}")
+        return {"matplotlib_unavailable": str(exc), **figure_paths}
+
+    if verbose:
+        print("\nSaved figures:")
+        for key, path in figure_paths.items():
+            print(f"  - {key}: {path}")
+    return figure_paths
 
 
 # =============================================================================
-# FINAL VERDICT
+# Execution and reporting
 # =============================================================================
 
-print(f"\n\n{'=' * 110}")
-print("FINAL VERDICT")
-print("=" * 110)
+def resolve_output_dir(output_dir=None):
+    resolved = DEFAULT_OUTPUT_DIR if output_dir is None else Path(output_dir).expanduser().resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
-for net_type in ['linear', 'relu']:
-    tr = all_test_results[net_type]
-    res = all_results[net_type]
-    print(f"\n  {net_type.upper()} NET:")
-    tests = [('T1', tr['t1'], 'Norm SGD creates paradox (lower F/W ratio than SGD)'),
-             ('T2', tr['t2'], 'Norm SGD matches Muon convergence speed'),
-             ('T3', tr['t3'], 'Muon beats Norm SGD on final loss'),
-             ('T4', tr['t4'], 'Muon has strongest paradox (lowest F/W ratio)')]
-    for tname, tval, desc in tests:
-        print(f"    {tname}: {'PASS' if tval else 'FAIL'}  -- {desc}")
-    n_pass = sum(1 for _, v, _ in tests if v)
-    print(f"    Total: {n_pass}/4 tests passed")
 
-all_pass = sum(1 for net_type in ['linear', 'relu']
-               for v in [all_test_results[net_type]['t1'], all_test_results[net_type]['t2'],
-                         all_test_results[net_type]['t3'], all_test_results[net_type]['t4']] if v)
+def get_config(output_dir=None):
+    resolved_output_dir = resolve_output_dir(output_dir)
+    return {
+        "experiment_id": EXPERIMENT_ID,
+        "title": EXPERIMENT_TITLE,
+        "scope_note": SCOPE_NOTE,
+        "dim": DIM,
+        "num_layers": NUM_LAYERS,
+        "num_steps": NUM_STEPS,
+        "batch_size": BATCH_SIZE,
+        "momentum": MOMENTUM,
+        "ns_iters": NS_ITERS,
+        "num_independent_runs": NUM_INDEPENDENT_RUNS,
+        "num_test_inputs": NUM_TEST_INPUTS,
+        "lr_sweep_steps": LR_SWEEP_STEPS,
+        "data_seed": DATA_SEED,
+        "run_seed_start": RUN_SEED_START,
+        "run_seeds": list(range(RUN_SEED_START, RUN_SEED_START + NUM_INDEPENDENT_RUNS)),
+        "architectures": list(ARCHITECTURES),
+        "optimizers": list(OPTIMIZER_NAMES),
+        "lr_candidate_grids": {key: list(values) for key, values in LR_CANDIDATE_GRIDS.items()},
+        "script_path": str(SCRIPT_DIR / "run_experiment.py"),
+        "default_output_dir": str(DEFAULT_OUTPUT_DIR),
+        "resolved_output_dir": str(resolved_output_dir),
+    }
 
-print(f"\n  Overall: {all_pass}/8 tests passed across both architectures")
 
-# Determine the paper thesis
-print(f"\n  {'=' * 80}")
-print(f"  PAPER THESIS DETERMINATION:")
-print(f"  {'=' * 80}")
+def _get_git_commit():
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=SCRIPT_DIR,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            .strip()
+        )
+    except Exception:
+        return None
 
-# Check the dominant pattern
-both_paradox = all(all_test_results[nt]['t1'] for nt in ['linear', 'relu'])
-both_conv = all(all_test_results[nt]['t2'] for nt in ['linear', 'relu'])
-muon_wins_loss = all(all_test_results[nt]['t3'] for nt in ['linear', 'relu'])
-muon_wins_paradox = all(all_test_results[nt]['t4'] for nt in ['linear', 'relu'])
 
-if both_paradox and both_conv:
-    print(f"  Normalization alone creates the paradox AND matches Muon convergence.")
-    print(f"  ==> The polar factor is NOT necessary. Scale removal is the key mechanism.")
-elif both_paradox and muon_wins_loss:
-    print(f"  Normalization creates the paradox BUT Muon wins on loss.")
-    print(f"  ==> The paradox comes from scale removal, but the polar factor provides")
-    print(f"      superior gradient DIRECTION quality for faster convergence.")
-    print(f"  ==> TWO-MECHANISM STORY: scale removal for gauge exploration,")
-    print(f"      orthogonal projection for convergence quality.")
-elif both_paradox:
-    print(f"  Normalization creates the paradox. Mixed results on convergence.")
-    print(f"  ==> Scale removal is sufficient for the paradox mechanism.")
-elif muon_wins_paradox:
-    print(f"  Only Muon creates strong paradox. The polar factor is essential.")
-    print(f"  ==> The orthogonal projection does something qualitatively different")
-    print(f"      from simple normalization.")
-else:
-    print(f"  Mixed results. The picture is more nuanced than any simple thesis.")
+def _print_header(output_dir):
+    print("=" * 110)
+    print(EXPERIMENT_TITLE)
+    print("=" * 110)
+    print("Question: does removing update scale alone reproduce Muon-like diversity signatures and loss behavior?")
+    print(f"Scope: {SCOPE_NOTE}")
+    print("Reporting note: heuristic comparison rules and descriptive spread, not formal hypothesis tests.")
+    print(f"Output directory: {output_dir}")
+    print("=" * 110)
 
-print(f"\n{'=' * 110}")
-print("EXPERIMENT COMPLETE")
-print(f"{'=' * 110}")
+
+def _print_architecture_summary(results_bundle, net_type):
+    print(f"\n{'#' * 110}")
+    print(f"ARCHITECTURE: {net_type.upper()}")
+    print(f"{'#' * 110}")
+
+    print("\nLearning-rate sweep (200-step final loss from one fixed initialization):")
+    for method in OPTIMIZER_NAMES:
+        sweep = results_bundle["lr_sweeps"][net_type][method]
+        boundary_note = ""
+        if sweep["hit_grid_boundary"]:
+            boundary_note = f"  [grid-boundary warning: best is {sweep['boundary_side']} candidate]"
+        print(
+            f"  {OPTIMIZER_LABELS[method]:<30} best_lr={sweep['best_lr']:.5f}  "
+            f"best_200_step_loss={sweep['best_loss']:.6e}{boundary_note}"
+        )
+
+    print("\nConvergence basin summary (20 runs, 500 steps):")
+    print(
+        f"  {'Optimizer':<30} | {'Final loss mean':>14} | {'Loss std':>12} | {'F/W ratio':>10} | {'Cond geom':>10} | {'Stable':>8}"
+    )
+    print(f"  {'-' * 102}")
+    for row in build_optimizer_summary_rows(results_bundle, net_type):
+        print(
+            f"  {row['optimizer']:<30} | {row['final_loss_mean']:>14.6e} | {row['final_loss_std']:>12.6e} | "
+            f"{row['function_over_weight_ratio']:>10.6f} | {row['condition_geom_mean']:>10.2f} | "
+            f"{row['stable_run_fraction']:>7.2%}"
+        )
+
+    heuristics = results_bundle["heuristic_results"][net_type]
+    print("\nHeuristic comparison rules:")
+    for test_key in ("t1", "t2", "t3", "t4"):
+        test = heuristics["tests"][test_key]
+        print(f"  {test_key.upper()}: {'PASS' if test['passed'] else 'FAIL'}  {test['name']}")
+        print(f"      {test['summary']}")
+    print("\nCurrent interpretation:")
+    print(f"  {heuristics['critical_comparison']['conclusion']}")
+
+
+def _print_overall_summary(results_bundle):
+    overall = results_bundle["overall_summary"]
+    print(f"\n{'=' * 110}")
+    print("OVERALL SUMMARY")
+    print(f"{'=' * 110}")
+    print(
+        f"Heuristic rule passes: {overall['total_passes']}/{overall['total_tests']} across both architectures."
+    )
+    print(overall["interpretation"])
+    print("Caveat: this experiment does not directly test statistical significance, gauge coordinates, or universal necessity of the polar factor.")
+
+
+def run_full_experiment(output_dir=None, make_plots=True, verbose=True):
+    output_dir = resolve_output_dir(output_dir)
+    config = get_config(output_dir=output_dir)
+    metadata = {
+        "experiment_id": EXPERIMENT_ID,
+        "title": EXPERIMENT_TITLE,
+        "scope_note": SCOPE_NOTE,
+        "script_path": str(SCRIPT_DIR / "run_experiment.py"),
+        "output_dir": str(output_dir),
+        "python_version": sys.version.split()[0],
+        "platform": platform.platform(),
+        "numpy_version": np.__version__,
+        "git_commit": _get_git_commit(),
+        "data_seed": DATA_SEED,
+        "run_seeds": list(range(RUN_SEED_START, RUN_SEED_START + NUM_INDEPENDENT_RUNS)),
+    }
+
+    if verbose:
+        _print_header(output_dir)
+
+    experiment_start = time.time()
+    architectures = {}
+    lr_sweeps = {}
+    timings = {net_type: {"lr_sweep_seconds": 0.0, "basin_seconds": {}, "total_seconds": 0.0} for net_type in ARCHITECTURES}
+
+    for net_type in ARCHITECTURES:
+        arch_start = time.time()
+        lr_start = time.time()
+        lr_sweeps[net_type] = {}
+        selected_lrs = {}
+        for method in OPTIMIZER_NAMES:
+            sweep = find_best_lr(method, net_type, num_steps=LR_SWEEP_STEPS)
+            lr_sweeps[net_type][method] = sweep
+            selected_lrs[method] = sweep["best_lr"]
+        timings[net_type]["lr_sweep_seconds"] = time.time() - lr_start
+
+        architectures[net_type] = {}
+        for method in OPTIMIZER_NAMES:
+            t0 = time.time()
+            result = measure_convergence_basin(method, selected_lrs[method], net_type)
+            result["lr_sweep"] = lr_sweeps[net_type][method]
+            architectures[net_type][method] = result
+            timings[net_type]["basin_seconds"][method] = time.time() - t0
+
+        timings[net_type]["total_seconds"] = time.time() - arch_start
+
+    heuristic_results = {
+        net_type: compute_heuristic_tests(architectures[net_type]) for net_type in ARCHITECTURES
+    }
+
+    results_bundle = {
+        "metadata": metadata,
+        "config": config,
+        "lr_sweeps": lr_sweeps,
+        "selected_lrs": {
+            net_type: {method: architectures[net_type][method]["lr"] for method in OPTIMIZER_NAMES}
+            for net_type in ARCHITECTURES
+        },
+        "architectures": architectures,
+        "heuristic_results": heuristic_results,
+        "timings": timings,
+        "figure_paths": planned_figure_paths(output_dir),
+    }
+    results_bundle["overall_summary"] = build_overall_summary(results_bundle)
+    results_bundle["metadata"]["runtime_seconds"] = time.time() - experiment_start
+
+    if verbose:
+        for net_type in ARCHITECTURES:
+            _print_architecture_summary(results_bundle, net_type)
+
+    if make_plots:
+        results_bundle["figure_paths"] = save_all_figures(results_bundle, output_dir, verbose=verbose)
+
+    if verbose:
+        _print_overall_summary(results_bundle)
+
+    return results_bundle
+
+
+run_experiment = run_full_experiment
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Run H3 normalized-SGD-vs-Muon toy basin experiment.")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory for saved figures. Defaults to the experiment directory.",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip figure generation and only compute/print results.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress console reporting and only run the computation.",
+    )
+    args = parser.parse_args(argv)
+
+    run_full_experiment(
+        output_dir=args.output_dir,
+        make_plots=not args.no_plots,
+        verbose=not args.quiet,
+    )
+
+
+if __name__ == "__main__":
+    main()

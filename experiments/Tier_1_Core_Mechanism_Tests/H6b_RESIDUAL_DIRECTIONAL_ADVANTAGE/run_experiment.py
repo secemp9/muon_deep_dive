@@ -1,34 +1,46 @@
 #!/usr/bin/env python3
 """
-H6b: Residual 7x Directional Advantage Across Activations
-============================================================
+H6b: Activation-dependent Muon vs SGD final-loss comparison
+===========================================================
 
-MOTIVATION (from H6 surprise):
-  After correcting for LR artifacts, Muon retains a genuine 7x advantage
-  over SGD in deep linear nets. This was measured at optimal LR for both.
-  QUESTION: Does this 7x advantage persist, grow, or shrink across
-  activation functions? If the advantage changes dramatically with
-  nonlinearity, the mechanism may be geometry-specific, not universal.
+Motivation:
+  H6 suggested that Muon can retain a sizable advantage over SGD in a deep
+  linear toy problem after separate learning-rate tuning. This H6b follow-up
+  keeps the same small synthetic setting and asks how the final-loss gap
+  changes across activation functions.
 
-PROTOCOL:
+Observed metric:
   For each activation in {linear, ReLU, tanh, GELU}:
     For each optimizer in {SGD, Muon}:
-      Sweep LR (10 candidates each), then train 500 steps.
-    Compute advantage = SGD_best_loss / Muon_best_loss.
+      Sweep a fixed LR grid on 3 seeds, training for 500 steps.
+      Select the LR with the lowest mean finite final loss.
+    Re-evaluate the chosen LR on 10 seeds.
+  Report advantage = mean_final_loss_SGD / mean_final_loss_Muon.
 
-KEY TESTS:
-  T1: Does Muon beat SGD (at optimal LR) for ALL activations?
-  T2: Is the advantage consistent (within 0.5-20x across activations)?
-  T3: Does tanh (vanishing gradients) show larger Muon advantage than ReLU?
-      (Hypothesis: SV equalization helps more when gradients vanish.)
-
-Setup: 4-layer, 32x32, 500 steps, 10 seeds, LR swept per activation.
+Important scope limits:
+  - This measures activation-dependent final-loss ratios in a 4-layer 32x32
+    Gaussian regression toy problem under separately tuned learning rates.
+  - It does NOT directly measure directional alignment, singular-value rescue,
+    or causal mechanisms.
+  - The linear activation is an internal control inside this protocol; whether
+    it reproduces any prior ~7x baseline is an empirical outcome, not an
+    assumption.
 """
 
+import time
 import numpy as np
-import os
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+EXPERIMENT_ID = 'H6b_RESIDUAL_DIRECTIONAL_ADVANTAGE'
+EXPERIMENT_TITLE = 'H6b: Activation-dependent Muon vs SGD final-loss comparison'
+EXPERIMENT_SCOPE = (
+    'Activation-dependent Muon-vs-SGD final-loss comparison under separately '
+    'tuned learning rates in a small synthetic regression task.'
+)
+SELECTION_RULE = (
+    'Choose the LR with the lowest mean finite final loss on the sweep seeds. '
+    'Partial divergence is reported but not separately penalized unless every '
+    'sweep seed diverges, in which case the candidate mean is inf.'
+)
 
 DIM = 32
 NUM_LAYERS = 4
@@ -37,11 +49,39 @@ MOMENTUM = 0.9
 NS_ITERS = 5
 NUM_SEEDS = 10
 BATCH_SIZE = 64
+SWEEP_NUM_SEEDS = 3
+DIVERGENCE_THRESHOLD = 1e10
+WEIGHT_INIT_SEED_OFFSET = 5000
+SEED_BASE = 42
+SEED_STRIDE = 137
 
 MUON_LRS = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.002, 0.001]
 SGD_LRS = [0.2, 0.1, 0.05, 0.03, 0.02, 0.01, 0.005, 0.003, 0.001, 0.0005]
 
 ACTIVATIONS = ['linear', 'relu', 'tanh', 'gelu']
+OPTIMIZERS = ['muon', 'sgd']
+
+
+def get_default_config():
+    return {
+        'dim': DIM,
+        'num_layers': NUM_LAYERS,
+        'num_steps': NUM_STEPS,
+        'momentum': MOMENTUM,
+        'ns_iters': NS_ITERS,
+        'num_seeds': NUM_SEEDS,
+        'batch_size': BATCH_SIZE,
+        'sweep_num_seeds': SWEEP_NUM_SEEDS,
+        'divergence_threshold': DIVERGENCE_THRESHOLD,
+        'weight_init_seed_offset': WEIGHT_INIT_SEED_OFFSET,
+        'seed_base': SEED_BASE,
+        'seed_stride': SEED_STRIDE,
+        'muon_lrs': list(MUON_LRS),
+        'sgd_lrs': list(SGD_LRS),
+        'activations': list(ACTIVATIONS),
+        'optimizers': list(OPTIMIZERS),
+        'selection_rule': SELECTION_RULE,
+    }
 
 
 def newton_schulz(M, n_iters=NS_ITERS):
@@ -69,23 +109,25 @@ def gelu_deriv(x):
 def apply_act(x, act_name):
     if act_name == 'linear':
         return x
-    elif act_name == 'relu':
+    if act_name == 'relu':
         return np.maximum(0, x)
-    elif act_name == 'tanh':
+    if act_name == 'tanh':
         return np.tanh(x)
-    elif act_name == 'gelu':
+    if act_name == 'gelu':
         return gelu(x)
+    raise ValueError(f'Unknown activation: {act_name}')
 
 
 def apply_act_deriv(pre, act_name):
     if act_name == 'linear':
         return np.ones_like(pre)
-    elif act_name == 'relu':
+    if act_name == 'relu':
         return (pre > 0).astype(float)
-    elif act_name == 'tanh':
+    if act_name == 'tanh':
         return 1 - np.tanh(pre)**2
-    elif act_name == 'gelu':
+    if act_name == 'gelu':
         return gelu_deriv(pre)
+    raise ValueError(f'Unknown activation: {act_name}')
 
 
 def init_weights(seed):
@@ -135,19 +177,22 @@ def compute_gradients(weights, X, Y, act):
     return grads
 
 
-def train(weights_init, X, Y, lr, optimizer, act):
+def train(weights_init, X, Y, lr, optimizer, act, num_steps=NUM_STEPS,
+          divergence_threshold=DIVERGENCE_THRESHOLD):
     weights = [W.copy() for W in weights_init]
     mom = [np.zeros_like(W) for W in weights]
-    for step in range(NUM_STEPS):
+    for _ in range(num_steps):
         loss = compute_loss(weights, X, Y, act)
-        if not np.isfinite(loss) or loss > 1e10:
+        if not np.isfinite(loss) or loss > divergence_threshold:
             return float('inf')
         grads = compute_gradients(weights, X, Y, act)
         for i in range(len(weights)):
             if optimizer == 'muon':
                 mom[i] = MOMENTUM * mom[i] + newton_schulz(grads[i])
-            else:
+            elif optimizer == 'sgd':
                 mom[i] = MOMENTUM * mom[i] + grads[i]
+            else:
+                raise ValueError(f'Unknown optimizer: {optimizer}')
             weights[i] = weights[i] - lr * mom[i]
     return compute_loss(weights, X, Y, act)
 
@@ -159,85 +204,255 @@ def make_data(seed):
     return X, Y
 
 
+def generate_seeds(num_seeds=NUM_SEEDS, seed_base=SEED_BASE, seed_stride=SEED_STRIDE):
+    return [seed_base + i * seed_stride for i in range(num_seeds)]
+
+
+def summarize_losses(seeds, losses):
+    seed_records = [
+        {'seed': int(seed), 'final_loss': float(loss)}
+        for seed, loss in zip(seeds, losses)
+    ]
+    finite = [float(loss) for loss in losses if np.isfinite(loss)]
+    mean_loss = float(np.mean(finite)) if finite else float('inf')
+    std_loss = float(np.std(finite)) if finite else float('inf')
+    return {
+        'seed_records': seed_records,
+        'seed_losses': [float(loss) for loss in losses],
+        'mean_loss': mean_loss,
+        'std_loss': std_loss,
+        'n_diverged': int(len(losses) - len(finite)),
+        'n_finite': int(len(finite)),
+        'n_total': int(len(losses)),
+    }
+
+
+def evaluate_candidate_lr(act, optimizer, lr, seeds, num_steps=NUM_STEPS,
+                          divergence_threshold=DIVERGENCE_THRESHOLD):
+    losses = []
+    for seed in seeds:
+        X, Y = make_data(seed)
+        weights = init_weights(seed + WEIGHT_INIT_SEED_OFFSET)
+        final_loss = train(
+            weights, X, Y, lr, optimizer, act,
+            num_steps=num_steps,
+            divergence_threshold=divergence_threshold,
+        )
+        losses.append(final_loss)
+    summary = summarize_losses(seeds, losses)
+    summary.update({
+        'lr': float(lr),
+        'activation': act,
+        'optimizer': optimizer,
+    })
+    return summary
+
+
+def select_best_lr(sweep_rows, fallback_lr):
+    best_lr = float(fallback_lr)
+    best_mean_loss = float('inf')
+    for row in sweep_rows:
+        if row['mean_loss'] < best_mean_loss:
+            best_mean_loss = row['mean_loss']
+            best_lr = row['lr']
+    return best_lr, best_mean_loss
+
+
+def compute_advantage(muon_loss, sgd_loss):
+    if np.isfinite(muon_loss) and np.isfinite(sgd_loss):
+        return float(sgd_loss / max(muon_loss, 1e-30))
+    return float('nan')
+
+
+def run_experiment(activations=None, num_seeds=NUM_SEEDS,
+                   sweep_num_seeds=SWEEP_NUM_SEEDS, num_steps=NUM_STEPS,
+                   muon_lrs=None, sgd_lrs=None, verbose=True):
+    config = get_default_config()
+    if activations is None:
+        activations = list(config['activations'])
+    else:
+        activations = list(activations)
+    if muon_lrs is None:
+        muon_lrs = list(config['muon_lrs'])
+    else:
+        muon_lrs = list(muon_lrs)
+    if sgd_lrs is None:
+        sgd_lrs = list(config['sgd_lrs'])
+    else:
+        sgd_lrs = list(sgd_lrs)
+
+    seeds = generate_seeds(num_seeds=num_seeds)
+    sweep_seeds = seeds[:sweep_num_seeds]
+    started_at = time.time()
+
+    results_by_activation = {}
+
+    if verbose:
+        print('=' * 100)
+        print(EXPERIMENT_TITLE.upper())
+        print('=' * 100)
+        print(EXPERIMENT_SCOPE)
+        print(f'Activations: {activations}')
+        print(
+            f'Network: {NUM_LAYERS}-layer, {DIM}x{DIM}, {num_steps} steps, '
+            f'{num_seeds} seeds ({sweep_num_seeds} sweep seeds)'
+        )
+        print(f'Selection rule: {SELECTION_RULE}')
+        print()
+
+    for act in activations:
+        if verbose:
+            print(f'\n--- Activation: {act.upper()} ---')
+
+        activation_results = {'optimizers': {}}
+        for optimizer, candidates in [('muon', muon_lrs), ('sgd', sgd_lrs)]:
+            sweep_rows = [
+                evaluate_candidate_lr(
+                    act,
+                    optimizer,
+                    lr,
+                    sweep_seeds,
+                    num_steps=num_steps,
+                    divergence_threshold=config['divergence_threshold'],
+                )
+                for lr in candidates
+            ]
+            best_lr, best_sweep_mean = select_best_lr(sweep_rows, candidates[-1])
+            for row in sweep_rows:
+                row['selected'] = bool(np.isclose(row['lr'], best_lr))
+
+            full_eval = evaluate_candidate_lr(
+                act,
+                optimizer,
+                best_lr,
+                seeds,
+                num_steps=num_steps,
+                divergence_threshold=config['divergence_threshold'],
+            )
+            full_eval['selected'] = True
+
+            activation_results['optimizers'][optimizer] = {
+                'candidate_lrs': [float(lr) for lr in candidates],
+                'lr_sweep': sweep_rows,
+                'selected_lr': float(best_lr),
+                'selected_lr_sweep_mean_loss': float(best_sweep_mean),
+                'selection_rule': SELECTION_RULE,
+                'full_eval': full_eval,
+            }
+
+            if verbose:
+                print(
+                    f"  {optimizer:>5} best_lr={best_lr:.4f} "
+                    f"sweep_mean={best_sweep_mean:.4e} "
+                    f"full_mean={full_eval['mean_loss']:.4e} "
+                    f"diverged={full_eval['n_diverged']}/{full_eval['n_total']}"
+                )
+
+        muon_mean = activation_results['optimizers']['muon']['full_eval']['mean_loss']
+        sgd_mean = activation_results['optimizers']['sgd']['full_eval']['mean_loss']
+        activation_results['advantage'] = compute_advantage(muon_mean, sgd_mean)
+        results_by_activation[act] = activation_results
+
+    runtime_seconds = float(time.time() - started_at)
+    advantages = {
+        act: float(results_by_activation[act]['advantage'])
+        for act in activations
+    }
+    valid_advs = [value for value in advantages.values() if np.isfinite(value)]
+    t1 = all(value > 1.0 for value in valid_advs)
+    t2 = all(0.5 < value < 20.0 for value in valid_advs) if valid_advs else False
+    t3 = advantages.get('tanh', 0.0) > advantages.get('relu', float('inf'))
+
+    tests = {
+        'T1': {
+            'description': 'Muon mean final loss is lower than SGD mean final loss for every finite activation result.',
+            'passed': bool(t1),
+            'criterion': 'advantage > 1 for all finite activation advantages',
+            'observed_advantages': advantages,
+        },
+        'T2': {
+            'description': 'All finite activation advantages fall inside the broad consistency band (0.5, 20).',
+            'passed': bool(t2),
+            'criterion': '0.5 < advantage < 20 for all finite activation advantages',
+            'observed_advantages': advantages,
+        },
+        'T3': {
+            'description': 'tanh shows larger advantage than ReLU under this proxy comparison.',
+            'passed': bool(t3),
+            'criterion': 'advantage(tanh) > advantage(relu)',
+            'observed_tanh_advantage': float(advantages.get('tanh', float('nan'))),
+            'observed_relu_advantage': float(advantages.get('relu', float('nan'))),
+        },
+    }
+
+    results = {
+        'metadata': {
+            'experiment_id': EXPERIMENT_ID,
+            'title': EXPERIMENT_TITLE,
+            'scope': EXPERIMENT_SCOPE,
+            'selection_rule': SELECTION_RULE,
+            'notes': [
+                'This is a final-loss comparison after separate LR sweeps, not a direct directional or spectral diagnostic.',
+                'The linear activation is treated as an internal control within this protocol; any ~7x baseline must be checked empirically.',
+            ],
+        },
+        'config': {
+            **config,
+            'num_steps': int(num_steps),
+            'num_seeds': int(num_seeds),
+            'sweep_num_seeds': int(sweep_num_seeds),
+            'activations': activations,
+            'muon_lrs': muon_lrs,
+            'sgd_lrs': sgd_lrs,
+        },
+        'seeds': [int(seed) for seed in seeds],
+        'sweep_seeds': [int(seed) for seed in sweep_seeds],
+        'results_by_activation': results_by_activation,
+        'advantages': advantages,
+        'tests': tests,
+        'runtime_seconds': runtime_seconds,
+    }
+
+    if verbose:
+        print(f"\n\n{'=' * 100}")
+        print('RESULTS: Muon vs SGD at separately tuned LR per activation')
+        print(f"{'=' * 100}")
+        print(
+            f"\n  {'Activation':>10}  {'Muon loss':>12} {'(lr)':>8}  {'SGD loss':>12} {'(lr)':>8}  {'Advantage':>12}"
+        )
+        print('  ' + '-' * 78)
+        for act in activations:
+            muon_eval = results_by_activation[act]['optimizers']['muon']['full_eval']
+            sgd_eval = results_by_activation[act]['optimizers']['sgd']['full_eval']
+            print(
+                f"  {act:>10}  {muon_eval['mean_loss']:>12.4e} "
+                f"{results_by_activation[act]['optimizers']['muon']['selected_lr']:>8.4f}  "
+                f"{sgd_eval['mean_loss']:>12.4e} "
+                f"{results_by_activation[act]['optimizers']['sgd']['selected_lr']:>8.4f}  "
+                f"{results_by_activation[act]['advantage']:>12.1f}x"
+            )
+
+        print(f"\n\n{'=' * 100}")
+        print('HYPOTHESIS TESTS')
+        print(f"{'=' * 100}")
+        print(f"\n  T1: Muon beats SGD for all finite activation results? --> {'PASS' if tests['T1']['passed'] else 'FAIL'}")
+        print(f"  T2: Advantage lies in the broad 0.5-20x band? --> {'PASS' if tests['T2']['passed'] else 'FAIL'}")
+        print(f"  T3: tanh advantage > ReLU advantage? --> {'PASS' if tests['T3']['passed'] else 'FAIL'}")
+        print(
+            '       '
+            f"tanh={tests['T3']['observed_tanh_advantage']:.1f}x, "
+            f"ReLU={tests['T3']['observed_relu_advantage']:.1f}x"
+        )
+        print(f"\nRuntime: {runtime_seconds:.2f}s")
+        print(f"\n{'=' * 100}")
+        print('EXPERIMENT COMPLETE')
+        print(f"{'=' * 100}")
+
+    return results
+
+
 def main():
-    seeds = [42 + i * 137 for i in range(NUM_SEEDS)]
-
-    print("=" * 100)
-    print("H6b: RESIDUAL 7x DIRECTIONAL ADVANTAGE ACROSS ACTIVATIONS")
-    print("=" * 100)
-    print(f"Activations: {ACTIVATIONS}")
-    print(f"Network: {NUM_LAYERS}-layer, {DIM}x{DIM}, {NUM_STEPS} steps, {NUM_SEEDS} seeds")
-    print()
-
-    results = {}
-    for act in ACTIVATIONS:
-        print(f"\n--- Activation: {act.upper()} ---")
-
-        # LR sweep (3 seeds, 200 steps)
-        best_lrs = {}
-        for opt, candidates in [('muon', MUON_LRS), ('sgd', SGD_LRS)]:
-            best_lr, best_loss = candidates[-1], float('inf')
-            for lr in candidates:
-                losses = []
-                for s in seeds[:3]:
-                    X, Y = make_data(s)
-                    w = init_weights(s + 5000)
-                    fl = train(w, X, Y, lr, opt, act)
-                    losses.append(fl)
-                ml = np.mean([l for l in losses if np.isfinite(l)]) if any(np.isfinite(l) for l in losses) else float('inf')
-                if ml < best_loss:
-                    best_loss = ml
-                    best_lr = lr
-            best_lrs[opt] = best_lr
-            print(f"  {opt:>5} best_lr={best_lr:.4f}")
-
-        # Full training
-        for opt in ['muon', 'sgd']:
-            losses = []
-            for s in seeds:
-                X, Y = make_data(s)
-                w = init_weights(s + 5000)
-                fl = train(w, X, Y, best_lrs[opt], opt, act)
-                losses.append(fl)
-            finite = [l for l in losses if np.isfinite(l)]
-            mean_l = np.mean(finite) if finite else float('inf')
-            results[(act, opt)] = {'lr': best_lrs[opt], 'mean_loss': mean_l}
-
-    # Results table
-    print(f"\n\n{'=' * 100}")
-    print("RESULTS: Muon vs SGD at Optimal LR per Activation")
-    print(f"{'=' * 100}")
-
-    print(f"\n  {'Activation':>10}  {'Muon loss':>12} {'(lr)':>8}  {'SGD loss':>12} {'(lr)':>8}  {'Advantage':>12}")
-    print("  " + "-" * 70)
-
-    advantages = {}
-    for act in ACTIVATIONS:
-        ml = results[(act, 'muon')]['mean_loss']
-        sl = results[(act, 'sgd')]['mean_loss']
-        adv = sl / max(ml, 1e-30) if np.isfinite(sl) and np.isfinite(ml) else float('nan')
-        advantages[act] = adv
-        print(f"  {act:>10}  {ml:>12.4e} {results[(act,'muon')]['lr']:>8.4f}  "
-              f"{sl:>12.4e} {results[(act,'sgd')]['lr']:>8.4f}  {adv:>12.1f}x")
-
-    # Hypothesis tests
-    print(f"\n\n{'=' * 100}")
-    print("HYPOTHESIS TESTS")
-    print(f"{'=' * 100}")
-
-    valid_advs = [v for v in advantages.values() if np.isfinite(v)]
-    t1 = all(v > 1.0 for v in valid_advs)
-    t2 = all(0.5 < v < 20.0 for v in valid_advs) if valid_advs else False
-    t3 = advantages.get('tanh', 0) > advantages.get('relu', float('inf'))
-
-    print(f"\n  T1: Muon beats SGD for ALL activations? --> {'PASS' if t1 else 'FAIL'}")
-    print(f"  T2: Advantage consistent (0.5-20x range)? --> {'PASS' if t2 else 'FAIL'}")
-    print(f"  T3: tanh advantage > ReLU advantage? --> {'PASS' if t3 else 'FAIL'}")
-    print(f"       tanh={advantages.get('tanh', 'N/A'):.1f}x, ReLU={advantages.get('relu', 'N/A'):.1f}x")
-
-    print(f"\n{'=' * 100}")
-    print("EXPERIMENT COMPLETE")
-    print(f"{'=' * 100}")
+    run_experiment(verbose=True)
 
 
 if __name__ == '__main__':

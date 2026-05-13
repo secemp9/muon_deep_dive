@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
 """
-H15: Normalization-Gauge Duality
-=================================
+H15: Conditioning-based probe of Muon in an alternating diagonal/matrix toy model
+=================================================================================
 
-Architecture: ALTERNATING diagonal and matrix layers (4 total)
-  Layer 1: diagonal (32 params)  — no gauge symmetry, only scale
-  Layer 2: matrix   (32x32=1024) — full gauge symmetry
-  Layer 3: diagonal (32 params)
-  Layer 4: matrix   (32x32=1024)
+This experiment compares momentum SGD against a Muon-style update rule in a
+small 4-layer network with alternating diagonal and matrix layers:
 
-Optimizers:
-  SGD: standard momentum SGD on all layers
-  Muon: sign normalization on diagonal layers, polar factor UV^T on matrix layers
+  L1: diagonal, L2: matrix, L3: diagonal, L4: matrix
 
-Measurements:
-  Per-layer condition number kappa(W_i) at regular intervals.
-  Ratio kappa_SGD / kappa_Muon per layer type.
+The primary observable is per-layer weight condition number kappa(W):
+  - diagonal layers: max(|d|) / min(|d|)
+  - matrix layers:   sigma_max / sigma_min
 
-PREDICTION:
-  Diagonal layers: kappa improvement ~2-5x (normalization only, no gauge to fix)
-  Matrix layers:   kappa improvement ~50-100x (normalization + gauge removal)
-  The DIFFERENCE is the gauge-specific contribution.
+Interpretation should remain modest:
+  - this is a conditioning-based toy probe,
+  - matrix-layer kappa is a conditioning / spectral anisotropy diagnostic,
+    not a direct gauge-coordinate or gauge-drift observable,
+  - matrix-vs-diagonal ratios are heuristic layer-type comparisons rather than
+    a clean causal decomposition of a gauge-specific contribution.
 
-500 steps, 5 seeds.
+Core default setup is intentionally preserved from the original H15 pass:
+500 steps, 5 seeds, synthetic Gaussian data, and alternating diagonal/matrix
+layers trained with either momentum SGD or Muon-style normalized updates.
 """
 
+from __future__ import annotations
+
+from pathlib import Path
 import numpy as np
-import os
 
 # =============================================================================
 # CONFIGURATION
@@ -42,12 +43,20 @@ NS_ITERS = 5
 NUM_SAMPLES = 100
 BASE_SEED = 42
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODULE_PATH = Path(__file__).resolve()
+NOTEBOOK_PATH = MODULE_PATH.with_suffix(".ipynb")
+
+LAYER_NAMES = ["L1 (diag)", "L2 (matrix)", "L3 (diag)", "L4 (matrix)"]
+LAYER_TYPES = ["diag", "matrix", "diag", "matrix"]
+DIAG_INDICES = [0, 2]
+MATRIX_INDICES = [1, 3]
+DEFAULT_SNAPSHOT_STEPS = [0, 25, 50, 100, 200, 300, 400, 499]
 
 
 # =============================================================================
 # NETWORK: alternating diagonal / matrix layers
 # =============================================================================
+
 
 def init_network(rng):
     """
@@ -57,19 +66,16 @@ def init_network(rng):
     Matrix layers stored as 2D arrays (DIM x DIM).
     """
     layers = []
-    # Layer 1: diagonal
-    d1 = rng.randn(DIM) * 0.5 + 1.0  # centered near 1
-    layers.append(('diag', d1.copy()))
-    # Layer 2: matrix
+    d1 = rng.randn(DIM) * 0.5 + 1.0
+    layers.append(("diag", d1.copy()))
     W2 = rng.randn(DIM, DIM) * np.sqrt(2.0 / DIM)
-    layers.append(('matrix', W2.copy()))
-    # Layer 3: diagonal
+    layers.append(("matrix", W2.copy()))
     d3 = rng.randn(DIM) * 0.5 + 1.0
-    layers.append(('diag', d3.copy()))
-    # Layer 4: matrix
+    layers.append(("diag", d3.copy()))
     W4 = rng.randn(DIM, DIM) * np.sqrt(2.0 / DIM)
-    layers.append(('matrix', W4.copy()))
+    layers.append(("matrix", W4.copy()))
     return layers
+
 
 
 def forward(layers, X):
@@ -80,12 +86,12 @@ def forward(layers, X):
     Layer 3 (diag): out = diag(d) @ X, then ReLU
     Layer 4 (matrix): out = W @ X (no activation)
     """
-    activations = [X.copy()]  # store post-activation outputs for backprop
+    activations = [X.copy()]
     pre_acts = []
     out = X.copy()
     for idx, (ltype, param) in enumerate(layers):
-        if ltype == 'diag':
-            pre = param[:, None] * out  # broadcast diagonal
+        if ltype == "diag":
+            pre = param[:, None] * out
         else:
             pre = param @ out
         pre_acts.append(pre.copy())
@@ -97,35 +103,32 @@ def forward(layers, X):
     return out, pre_acts, activations
 
 
+
 def compute_loss(layers, X, Y):
     pred, _, _ = forward(layers, X)
     diff = pred - Y
     return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
 
 
+
 def compute_gradients(layers, X, Y):
     """Backprop through the alternating network."""
     N = X.shape[1]
     pred, pre_acts, activations = forward(layers, X)
-    delta = (pred - Y) / N  # (DIM, N)
+    delta = (pred - Y) / N
 
     grads = [None] * len(layers)
     for l in range(len(layers) - 1, -1, -1):
         ltype, param = layers[l]
-        if ltype == 'diag':
-            # grad w.r.t. diagonal d: sum over samples of delta * activations[l]
-            grads[l] = np.sum(delta * activations[l], axis=1)  # (DIM,)
-            # propagate delta
+        if ltype == "diag":
+            grads[l] = np.sum(delta * activations[l], axis=1)
             if l > 0:
                 delta = param[:, None] * delta
         else:
-            # grad w.r.t. matrix W
-            grads[l] = delta @ activations[l].T  # (DIM, DIM)
-            # propagate delta
+            grads[l] = delta @ activations[l].T
             if l > 0:
                 delta = param.T @ delta
 
-        # ReLU derivative for the layer below
         if l > 0:
             delta = delta * (pre_acts[l - 1] > 0).astype(float)
 
@@ -136,9 +139,10 @@ def compute_gradients(layers, X, Y):
 # NEWTON-SCHULZ ORTHOGONALIZATION (for matrix layers)
 # =============================================================================
 
+
 def newton_schulz_ortho(M, n_iters=NS_ITERS):
-    """Newton-Schulz iteration to approximate polar factor."""
-    norm = np.linalg.norm(M, ord='fro')
+    """Newton-Schulz iteration to approximate the polar factor."""
+    norm = np.linalg.norm(M, ord="fro")
     if norm < 1e-12:
         return M
     X = M / norm
@@ -152,6 +156,7 @@ def newton_schulz_ortho(M, n_iters=NS_ITERS):
 # CONDITION NUMBER
 # =============================================================================
 
+
 def condition_number(layers, idx):
     """
     Compute condition number of layer idx.
@@ -159,316 +164,558 @@ def condition_number(layers, idx):
     For matrix: sigma_max / sigma_min from SVD
     """
     ltype, param = layers[idx]
-    if ltype == 'diag':
+    if ltype == "diag":
         abs_d = np.abs(param)
         dmax = np.max(abs_d)
         dmin = np.max([np.min(abs_d), 1e-12])
         return dmax / dmin
-    else:
-        s = np.linalg.svd(param, compute_uv=False)
-        return s[0] / max(s[-1], 1e-12)
+    s = np.linalg.svd(param, compute_uv=False)
+    return s[0] / max(s[-1], 1e-12)
 
 
 # =============================================================================
 # TRAINING
 # =============================================================================
 
-def train(layers_init, X, Y, optimizer='sgd', n_steps=NUM_STEPS):
+
+def train(layers_init, X, Y, optimizer="sgd", n_steps=NUM_STEPS):
     """
-    Train the network. Returns losses, kappa_history (shape [n_steps, 4]).
+    Train the network.
+
+    Returns a dict with:
+      - losses: shape [n_steps]
+      - kappas: shape [n_steps, 4]
+      - diverged: bool
+      - divergence_step: int | None
+
+    Measurement timing is intentionally preserved from the original H15 pass:
+    the loss and kappa recorded at step t are measured *before* the parameter
+    update at that step.
     """
     layers = [(t, p.copy()) for t, p in layers_init]
-    # momentum buffers
     velocities = [np.zeros_like(p) for _, p in layers]
     n_layers = len(layers)
 
     losses = []
-    kappas = []  # [step, layer]
+    kappas = []
+    diverged = False
+    divergence_step = None
 
     for step in range(n_steps):
         loss = compute_loss(layers, X, Y)
         losses.append(loss)
 
         if np.isnan(loss) or loss > 1e10:
+            diverged = True
+            divergence_step = step
+            losses[-1] = 1e10
+            kappas.append([1e10] * n_layers)
             for _ in range(n_steps - step - 1):
                 losses.append(1e10)
                 kappas.append([1e10] * n_layers)
             break
 
-        # Measure condition numbers
         step_kappas = [condition_number(layers, i) for i in range(n_layers)]
         kappas.append(step_kappas)
-
         grads = compute_gradients(layers, X, Y)
 
         for i in range(n_layers):
             ltype, param = layers[i]
             g = grads[i]
 
-            if optimizer == 'sgd':
+            if optimizer == "sgd":
                 velocities[i] = MOMENTUM * velocities[i] + g
                 new_param = param - LR_SGD * velocities[i]
-            elif optimizer == 'muon':
-                if ltype == 'diag':
-                    # Sign normalization for diagonal layers
+            elif optimizer == "muon":
+                if ltype == "diag":
                     ortho_g = np.sign(g)
                     ortho_g[ortho_g == 0] = 1.0
                 else:
-                    # Polar factor (Newton-Schulz) for matrix layers
                     ortho_g = newton_schulz_ortho(g)
                 velocities[i] = MOMENTUM * velocities[i] + ortho_g
                 new_param = param - LR_MUON * velocities[i]
+            else:
+                raise ValueError(f"Unknown optimizer: {optimizer}")
 
             layers[i] = (ltype, new_param)
 
-    return np.array(losses), np.array(kappas)
+    return {
+        "losses": np.array(losses),
+        "kappas": np.array(kappas),
+        "diverged": diverged,
+        "divergence_step": divergence_step,
+    }
 
 
 # =============================================================================
-# MAIN EXPERIMENT
+# AGGREGATION / REPORTING HELPERS
 # =============================================================================
 
-print("=" * 90)
-print("H15: NORMALIZATION-GAUGE DUALITY")
-print("=" * 90)
-print(f"Architecture: 4 alternating layers (diag-matrix-diag-matrix), width={DIM}")
-print(f"Steps: {NUM_STEPS}, Seeds: {NUM_SEEDS}")
-print(f"Muon on diag: sign normalization. Muon on matrix: polar factor UV^T.")
-print()
-print("PREDICTION:")
-print("  Diagonal layers: kappa improvement ~2-5x (normalization only)")
-print("  Matrix layers:   kappa improvement ~50-100x (normalization + gauge removal)")
-print("=" * 90)
 
-all_sgd_kappas = []    # [seed, step, layer]
-all_muon_kappas = []
-all_sgd_losses = []
-all_muon_losses = []
-
-for seed_idx in range(NUM_SEEDS):
-    run_seed = BASE_SEED + seed_idx * 37
-    rng = np.random.RandomState(run_seed)
-    print(f"\n--- Seed {run_seed} ---")
-
-    X = rng.randn(DIM, NUM_SAMPLES) * 0.3
-    Y = rng.randn(DIM, NUM_SAMPLES) * 0.3
-
-    layers_init = init_network(rng)
-
-    # SGD
-    print("  Training with SGD...", flush=True)
-    sgd_losses, sgd_kappas = train(layers_init, X, Y, 'sgd')
-    all_sgd_losses.append(sgd_losses)
-    all_sgd_kappas.append(sgd_kappas)
-
-    # Muon
-    print("  Training with Muon...", flush=True)
-    muon_losses, muon_kappas = train(layers_init, X, Y, 'muon')
-    all_muon_losses.append(muon_losses)
-    all_muon_kappas.append(muon_kappas)
-
-    # Quick summary
-    final_sgd = sgd_losses[-1] if len(sgd_losses) > 0 else float('nan')
-    final_muon = muon_losses[-1] if len(muon_losses) > 0 else float('nan')
-    print(f"  Final loss: SGD={final_sgd:.4f}, Muon={final_muon:.4f}")
+def _safe_ratio(numerator, denominator):
+    return numerator / max(denominator, 1e-12)
 
 
-# =============================================================================
-# AGGREGATE
-# =============================================================================
 
-sgd_kappas_all = np.array(all_sgd_kappas)    # (seeds, steps, 4)
-muon_kappas_all = np.array(all_muon_kappas)
-
-sgd_kappas_mean = np.mean(sgd_kappas_all, axis=0)   # (steps, 4)
-muon_kappas_mean = np.mean(muon_kappas_all, axis=0)
-
-sgd_losses_mean = np.mean(np.array(all_sgd_losses), axis=0)
-muon_losses_mean = np.mean(np.array(all_muon_losses), axis=0)
-
-layer_names = ['L1 (diag)', 'L2 (matrix)', 'L3 (diag)', 'L4 (matrix)']
-layer_types = ['diag', 'matrix', 'diag', 'matrix']
+def _snapshot_steps_for(num_steps):
+    last_index = max(num_steps - 1, 0)
+    return [step for step in DEFAULT_SNAPSHOT_STEPS if step <= last_index]
 
 
-# =============================================================================
-# CONDITION NUMBER TABLE: snapshots over training
-# =============================================================================
 
-print(f"\n\n{'=' * 90}")
-print("CONDITION NUMBER OVER TRAINING (mean over seeds)")
-print(f"{'=' * 90}")
-
-snapshot_steps = [0, 25, 50, 100, 200, 300, 400, 499]
-
-for li in range(4):
-    print(f"\n  {layer_names[li]}:")
-    print(f"    {'Step':>6}  {'kappa_SGD':>12}  {'kappa_Muon':>12}  {'Ratio SGD/Muon':>16}")
-    print(f"    {'-'*50}")
-    for s in snapshot_steps:
-        if s < sgd_kappas_mean.shape[0] and s < muon_kappas_mean.shape[0]:
-            k_sgd = sgd_kappas_mean[s, li]
-            k_muon = muon_kappas_mean[s, li]
-            ratio = k_sgd / max(k_muon, 1e-12)
-            print(f"    {s:>6}  {k_sgd:>12.2f}  {k_muon:>12.2f}  {ratio:>16.2f}")
+def _mean_std(array, axis=0):
+    return np.mean(array, axis=axis), np.std(array, axis=axis)
 
 
-# =============================================================================
-# FINAL CONDITION NUMBER: kappa at step 499 (or last valid)
-# =============================================================================
 
-print(f"\n\n{'=' * 90}")
-print("FINAL CONDITION NUMBERS (step 499, mean +/- std over seeds)")
-print(f"{'=' * 90}")
+def _describe_vector(values):
+    arr = np.asarray(values, dtype=float)
+    n = int(arr.size)
+    if n == 0:
+        return {
+            "n": 0,
+            "mean": float("nan"),
+            "std": float("nan"),
+            "sem": float("nan"),
+            "median": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+            "values": arr,
+        }
+    std = float(np.std(arr))
+    return {
+        "n": n,
+        "mean": float(np.mean(arr)),
+        "std": std,
+        "sem": float(std / np.sqrt(n)),
+        "median": float(np.median(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "values": arr,
+    }
 
-last_step = min(499, sgd_kappas_all.shape[1] - 1)
 
-print(f"\n{'Layer':>12}  {'Type':>8}  {'SGD kappa':>12}  {'Muon kappa':>12}  {'Ratio':>8}  {'Improvement':>12}")
-print("-" * 75)
 
-diag_ratios = []
-matrix_ratios = []
+def run_experiment(verbose=True):
+    """
+    Run the default H15 experiment and return structured raw results plus
+    aggregated summaries for downstream notebook analysis.
+    """
+    config = {
+        "dim": DIM,
+        "num_steps": NUM_STEPS,
+        "num_seeds": NUM_SEEDS,
+        "lr_sgd": LR_SGD,
+        "lr_muon": LR_MUON,
+        "momentum": MOMENTUM,
+        "ns_iters": NS_ITERS,
+        "num_samples": NUM_SAMPLES,
+        "base_seed": BASE_SEED,
+    }
+    seeds = [BASE_SEED + seed_idx * 37 for seed_idx in range(NUM_SEEDS)]
 
-for li in range(4):
-    k_sgd_seeds = sgd_kappas_all[:, last_step, li]
-    k_muon_seeds = muon_kappas_all[:, last_step, li]
-    k_sgd_mean = np.mean(k_sgd_seeds)
-    k_muon_mean = np.mean(k_muon_seeds)
-    k_sgd_std = np.std(k_sgd_seeds)
-    k_muon_std = np.std(k_muon_seeds)
-    ratio = k_sgd_mean / max(k_muon_mean, 1e-12)
+    if verbose:
+        print("=" * 90)
+        print("H15: CONDITIONING-BASED MUON PROBE IN AN ALTERNATING TOY MODEL")
+        print("=" * 90)
+        print(f"Script: {MODULE_PATH}")
+        print(f"Notebook counterpart: {NOTEBOOK_PATH}")
+        print(f"Architecture: 4 alternating layers (diag-matrix-diag-matrix), width={DIM}")
+        print(f"Steps: {NUM_STEPS}, Seeds: {NUM_SEEDS}")
+        print("Observable: per-layer condition number kappa(W)")
+        print("Caveat: matrix-layer kappa is a conditioning diagnostic, not a direct gauge observable.")
+        print()
 
-    if layer_types[li] == 'diag':
-        diag_ratios.append(ratio)
+    all_sgd_kappas = []
+    all_muon_kappas = []
+    all_sgd_losses = []
+    all_muon_losses = []
+    divergence = {"sgd": [], "muon": []}
+
+    for run_seed in seeds:
+        rng = np.random.RandomState(run_seed)
+        if verbose:
+            print(f"--- Seed {run_seed} ---")
+
+        X = rng.randn(DIM, NUM_SAMPLES) * 0.3
+        Y = rng.randn(DIM, NUM_SAMPLES) * 0.3
+        layers_init = init_network(rng)
+
+        if verbose:
+            print("  Training with SGD...", flush=True)
+        sgd_run = train(layers_init, X, Y, optimizer="sgd")
+        all_sgd_losses.append(sgd_run["losses"])
+        all_sgd_kappas.append(sgd_run["kappas"])
+        divergence["sgd"].append(sgd_run["diverged"])
+
+        if verbose:
+            print("  Training with Muon...", flush=True)
+        muon_run = train(layers_init, X, Y, optimizer="muon")
+        all_muon_losses.append(muon_run["losses"])
+        all_muon_kappas.append(muon_run["kappas"])
+        divergence["muon"].append(muon_run["diverged"])
+
+        if verbose:
+            final_sgd = sgd_run["losses"][-1] if len(sgd_run["losses"]) > 0 else float("nan")
+            final_muon = muon_run["losses"][-1] if len(muon_run["losses"]) > 0 else float("nan")
+            print(f"  Last recorded loss: SGD={final_sgd:.4f}, Muon={final_muon:.4f}")
+            print()
+
+    sgd_losses_all = np.array(all_sgd_losses)
+    muon_losses_all = np.array(all_muon_losses)
+    sgd_kappas_all = np.array(all_sgd_kappas)
+    muon_kappas_all = np.array(all_muon_kappas)
+
+    sgd_losses_mean, sgd_losses_std = _mean_std(sgd_losses_all, axis=0)
+    muon_losses_mean, muon_losses_std = _mean_std(muon_losses_all, axis=0)
+    sgd_kappas_mean, sgd_kappas_std = _mean_std(sgd_kappas_all, axis=0)
+    muon_kappas_mean, muon_kappas_std = _mean_std(muon_kappas_all, axis=0)
+
+    last_recorded_step = min(NUM_STEPS - 1, sgd_kappas_all.shape[1] - 1)
+    snapshot_steps = _snapshot_steps_for(sgd_kappas_all.shape[1])
+
+    final_sgd_losses_by_seed = sgd_losses_all[:, last_recorded_step]
+    final_muon_losses_by_seed = muon_losses_all[:, last_recorded_step]
+
+    per_layer_final = []
+    final_ratio_by_seed_and_layer = sgd_kappas_all[:, last_recorded_step, :] / np.maximum(
+        muon_kappas_all[:, last_recorded_step, :],
+        1e-12,
+    )
+
+    diag_ratios = []
+    matrix_ratios = []
+    for li, (layer_name, layer_type) in enumerate(zip(LAYER_NAMES, LAYER_TYPES)):
+        k_sgd_seeds = sgd_kappas_all[:, last_recorded_step, li]
+        k_muon_seeds = muon_kappas_all[:, last_recorded_step, li]
+        k_sgd_mean = float(np.mean(k_sgd_seeds))
+        k_muon_mean = float(np.mean(k_muon_seeds))
+        k_sgd_std = float(np.std(k_sgd_seeds))
+        k_muon_std = float(np.std(k_muon_seeds))
+        ratio_of_means = float(_safe_ratio(k_sgd_mean, k_muon_mean))
+        per_seed_ratios = final_ratio_by_seed_and_layer[:, li]
+        ratio_stats = _describe_vector(per_seed_ratios)
+
+        summary_row = {
+            "layer_index": li,
+            "layer_name": layer_name,
+            "layer_type": layer_type,
+            "sgd_mean": k_sgd_mean,
+            "sgd_std": k_sgd_std,
+            "muon_mean": k_muon_mean,
+            "muon_std": k_muon_std,
+            "ratio_of_means": ratio_of_means,
+            "per_seed_ratio_mean": ratio_stats["mean"],
+            "per_seed_ratio_std": ratio_stats["std"],
+            "per_seed_ratio_sem": ratio_stats["sem"],
+            "per_seed_ratio_median": ratio_stats["median"],
+            "per_seed_ratio_min": ratio_stats["min"],
+            "per_seed_ratio_max": ratio_stats["max"],
+            "per_seed_ratios": per_seed_ratios,
+        }
+        per_layer_final.append(summary_row)
+
+        if layer_type == "diag":
+            diag_ratios.append(ratio_of_means)
+        else:
+            matrix_ratios.append(ratio_of_means)
+
+    sgd_diag_by_seed = np.mean(sgd_kappas_all[:, :, DIAG_INDICES], axis=2)
+    muon_diag_by_seed = np.mean(muon_kappas_all[:, :, DIAG_INDICES], axis=2)
+    sgd_matrix_by_seed = np.mean(sgd_kappas_all[:, :, MATRIX_INDICES], axis=2)
+    muon_matrix_by_seed = np.mean(muon_kappas_all[:, :, MATRIX_INDICES], axis=2)
+
+    def build_type_summary(name, sgd_by_seed, muon_by_seed, layer_ratio_mean, layer_ratio_std):
+        sgd_mean = float(np.mean(sgd_by_seed[:, last_recorded_step]))
+        sgd_std = float(np.std(sgd_by_seed[:, last_recorded_step]))
+        muon_mean = float(np.mean(muon_by_seed[:, last_recorded_step]))
+        muon_std = float(np.std(muon_by_seed[:, last_recorded_step]))
+        per_seed_ratios = sgd_by_seed[:, last_recorded_step] / np.maximum(
+            muon_by_seed[:, last_recorded_step],
+            1e-12,
+        )
+        ratio_stats = _describe_vector(per_seed_ratios)
+        return {
+            "layer_type": name,
+            "sgd_mean": sgd_mean,
+            "sgd_std": sgd_std,
+            "muon_mean": muon_mean,
+            "muon_std": muon_std,
+            "layer_ratio_mean": float(layer_ratio_mean),
+            "layer_ratio_std": float(layer_ratio_std),
+            "per_seed_ratio_mean": ratio_stats["mean"],
+            "per_seed_ratio_std": ratio_stats["std"],
+            "per_seed_ratio_sem": ratio_stats["sem"],
+            "per_seed_ratio_median": ratio_stats["median"],
+            "per_seed_ratio_min": ratio_stats["min"],
+            "per_seed_ratio_max": ratio_stats["max"],
+            "per_seed_ratios": per_seed_ratios,
+            "sgd_trajectory_by_seed": sgd_by_seed,
+            "muon_trajectory_by_seed": muon_by_seed,
+            "sgd_trajectory_mean": np.mean(sgd_by_seed, axis=0),
+            "sgd_trajectory_std": np.std(sgd_by_seed, axis=0),
+            "muon_trajectory_mean": np.mean(muon_by_seed, axis=0),
+            "muon_trajectory_std": np.std(muon_by_seed, axis=0),
+        }
+
+    avg_diag = float(np.mean(diag_ratios))
+    avg_matrix = float(np.mean(matrix_ratios))
+    matrix_over_diag_ratio = float(_safe_ratio(avg_matrix, avg_diag))
+
+    per_type_final = {
+        "diag": build_type_summary("diag", sgd_diag_by_seed, muon_diag_by_seed, avg_diag, np.std(diag_ratios)),
+        "matrix": build_type_summary(
+            "matrix",
+            sgd_matrix_by_seed,
+            muon_matrix_by_seed,
+            avg_matrix,
+            np.std(matrix_ratios),
+        ),
+    }
+
+    final_sgd_loss_mean = float(np.mean(final_sgd_losses_by_seed))
+    final_sgd_loss_std = float(np.std(final_sgd_losses_by_seed))
+    final_muon_loss_mean = float(np.mean(final_muon_losses_by_seed))
+    final_muon_loss_std = float(np.std(final_muon_losses_by_seed))
+    final_loss_gap_by_seed = final_sgd_losses_by_seed - final_muon_losses_by_seed
+    final_loss_ratio_by_seed = final_sgd_losses_by_seed / np.maximum(final_muon_losses_by_seed, 1e-12)
+    final_loss_gap_stats = _describe_vector(final_loss_gap_by_seed)
+    final_loss_ratio_stats = _describe_vector(final_loss_ratio_by_seed)
+
+    hypotheses = {
+        "H1": {
+            "description": "Diagonal-layer conditioning improvement lies in the heuristic 1-20x range.",
+            "criterion": "1.0 <= avg_diag <= 20.0",
+            "observed_value": avg_diag,
+            "passed": bool(1.0 <= avg_diag <= 20.0),
+        },
+        "H2": {
+            "description": "Matrix-layer conditioning improvement exceeds 5x.",
+            "criterion": "avg_matrix > 5.0",
+            "observed_value": avg_matrix,
+            "passed": bool(avg_matrix > 5.0),
+        },
+        "H3": {
+            "description": "Matrix-layer improvement exceeds 2x the diagonal-layer improvement.",
+            "criterion": "avg_matrix > 2.0 * avg_diag",
+            "observed_value": matrix_over_diag_ratio,
+            "passed": bool(avg_matrix > 2.0 * avg_diag),
+        },
+        "H4": {
+            "description": "Muon attains lower last-recorded mean loss than SGD.",
+            "criterion": "final_muon_loss_mean < final_sgd_loss_mean",
+            "observed_value": {
+                "sgd_mean": final_sgd_loss_mean,
+                "muon_mean": final_muon_loss_mean,
+                "sgd_over_muon": float(_safe_ratio(final_sgd_loss_mean, final_muon_loss_mean)),
+            },
+            "passed": bool(final_muon_loss_mean < final_sgd_loss_mean),
+        },
+    }
+    total_pass = int(sum(item["passed"] for item in hypotheses.values()))
+
+    results = {
+        "identity": {
+            "experiment_id": "H15_NORMALIZATION_GAUGE_DUALITY",
+            "title": "H15: Conditioning-based probe of Muon in an alternating diagonal/matrix toy model",
+            "pair_scope": "Notebook and script study the same conditioning-based toy probe without claiming a clean gauge decomposition.",
+        },
+        "paths": {
+            "script": str(MODULE_PATH),
+            "notebook": str(NOTEBOOK_PATH),
+        },
+        "config": config,
+        "seeds": seeds,
+        "layer_names": LAYER_NAMES,
+        "layer_types": LAYER_TYPES,
+        "measurement_notes": {
+            "loss_and_kappa_timing": "Loss and kappa are recorded before each parameter update; the last entry is the pre-update state at the final training step.",
+            "scope": "Matrix-layer kappa is used as a conditioning / spectral anisotropy diagnostic rather than a direct gauge observable.",
+            "ratio_caveat": "Matrix-vs-diagonal ratios are heuristic layer-type comparisons, not a clean causal decomposition.",
+            "snapshot_steps": snapshot_steps,
+            "last_recorded_step": last_recorded_step,
+        },
+        "raw": {
+            "sgd_losses": sgd_losses_all,
+            "muon_losses": muon_losses_all,
+            "sgd_kappas": sgd_kappas_all,
+            "muon_kappas": muon_kappas_all,
+            "final_ratio_by_seed_and_layer": final_ratio_by_seed_and_layer,
+        },
+        "aggregates": {
+            "sgd_losses_mean": sgd_losses_mean,
+            "sgd_losses_std": sgd_losses_std,
+            "muon_losses_mean": muon_losses_mean,
+            "muon_losses_std": muon_losses_std,
+            "sgd_kappas_mean": sgd_kappas_mean,
+            "sgd_kappas_std": sgd_kappas_std,
+            "muon_kappas_mean": muon_kappas_mean,
+            "muon_kappas_std": muon_kappas_std,
+            "per_layer_final": per_layer_final,
+            "per_type_final": per_type_final,
+            "divergence": divergence,
+            "paired_statistics": {
+                "final_loss_gap_sgd_minus_muon": final_loss_gap_stats,
+                "final_loss_ratio_sgd_over_muon": final_loss_ratio_stats,
+            },
+        },
+        "summary": {
+            "avg_diag_ratio": avg_diag,
+            "avg_matrix_ratio": avg_matrix,
+            "matrix_over_diag_ratio": matrix_over_diag_ratio,
+            "final_sgd_loss_mean": final_sgd_loss_mean,
+            "final_sgd_loss_std": final_sgd_loss_std,
+            "final_muon_loss_mean": final_muon_loss_mean,
+            "final_muon_loss_std": final_muon_loss_std,
+            "loss_ratio_sgd_over_muon": float(_safe_ratio(final_sgd_loss_mean, final_muon_loss_mean)),
+            "paired_final_loss_gap_mean": final_loss_gap_stats["mean"],
+            "paired_final_loss_gap_std": final_loss_gap_stats["std"],
+            "paired_final_loss_gap_sem": final_loss_gap_stats["sem"],
+            "paired_final_loss_ratio_mean": final_loss_ratio_stats["mean"],
+            "paired_final_loss_ratio_std": final_loss_ratio_stats["std"],
+            "paired_final_loss_ratio_sem": final_loss_ratio_stats["sem"],
+            "last_recorded_step": last_recorded_step,
+            "total_pass": total_pass,
+        },
+        "hypotheses": hypotheses,
+    }
+    return results
+
+
+
+def print_report(results):
+    """Pretty-print the structured results for CLI usage."""
+    config = results["config"]
+    aggregates = results["aggregates"]
+    summary = results["summary"]
+    hypotheses = results["hypotheses"]
+    measurement_notes = results["measurement_notes"]
+    paired_stats = aggregates["paired_statistics"]
+
+    print("=" * 90)
+    print("H15 REPORT: CONDITIONING-BASED TOY PROBE")
+    print("=" * 90)
+    print(f"Script: {results['paths']['script']}")
+    print(f"Notebook counterpart: {results['paths']['notebook']}")
+    print(f"Seeds: {results['seeds']}")
+    print(
+        f"Config: dim={config['dim']}, steps={config['num_steps']}, samples={config['num_samples']}, "
+        f"lr_sgd={config['lr_sgd']}, lr_muon={config['lr_muon']}, momentum={config['momentum']}"
+    )
+    print("Observable: per-layer condition number kappa(W)")
+    print(f"Measurement note: {measurement_notes['loss_and_kappa_timing']}")
+    print(f"Scope note: {measurement_notes['scope']}")
+    print(f"Caveat: {measurement_notes['ratio_caveat']}")
+
+    print(f"\n{'=' * 90}")
+    print("CONDITION NUMBER SNAPSHOTS (mean over seeds)")
+    print(f"{'=' * 90}")
+    for li, layer_name in enumerate(results["layer_names"]):
+        print(f"\n{layer_name}:")
+        print(f"{'Step':>6}  {'SGD kappa':>12}  {'Muon kappa':>12}  {'SGD/Muon':>12}")
+        print("-" * 50)
+        for step in measurement_notes["snapshot_steps"]:
+            k_sgd = aggregates["sgd_kappas_mean"][step, li]
+            k_muon = aggregates["muon_kappas_mean"][step, li]
+            ratio = _safe_ratio(k_sgd, k_muon)
+            print(f"{step:>6}  {k_sgd:>12.2f}  {k_muon:>12.2f}  {ratio:>12.2f}")
+
+    print(f"\n{'=' * 90}")
+    print(f"FINAL CONDITIONING SUMMARY (last recorded step = {summary['last_recorded_step']})")
+    print(f"{'=' * 90}")
+    print(f"{'Layer':>12}  {'Type':>8}  {'SGD kappa':>17}  {'Muon kappa':>17}  {'Ratio':>10}")
+    print("-" * 75)
+    for row in aggregates["per_layer_final"]:
+        print(
+            f"{row['layer_name']:>12}  {row['layer_type']:>8}  "
+            f"{row['sgd_mean']:>8.1f}+/-{row['sgd_std']:<5.1f}  "
+            f"{row['muon_mean']:>8.1f}+/-{row['muon_std']:<5.1f}  "
+            f"{row['ratio_of_means']:>8.2f}x"
+        )
+
+    print(f"\n{'=' * 90}")
+    print("TYPE-AVERAGED FINAL SUMMARY")
+    print(f"{'=' * 90}")
+    for layer_type in ["diag", "matrix"]:
+        row = aggregates["per_type_final"][layer_type]
+        print(
+            f"{layer_type:>6}: "
+            f"SGD={row['sgd_mean']:.2f}+/-{row['sgd_std']:.2f}, "
+            f"Muon={row['muon_mean']:.2f}+/-{row['muon_std']:.2f}, "
+            f"layer-ratio mean={row['layer_ratio_mean']:.2f}x, "
+            f"paired type-ratio={row['per_seed_ratio_mean']:.2f}x+/-{row['per_seed_ratio_std']:.2f}x "
+            f"(SEM {row['per_seed_ratio_sem']:.2f}x)"
+        )
+    print(
+        f"Matrix-over-diagonal improvement ratio (heuristic only): "
+        f"{summary['matrix_over_diag_ratio']:.3f}x"
+    )
+
+    print(f"\n{'=' * 90}")
+    print("LOSS SUMMARY")
+    print(f"{'=' * 90}")
+    print(
+        f"SGD last-recorded mean loss:  {summary['final_sgd_loss_mean']:.6f} +/- {summary['final_sgd_loss_std']:.6f}"
+    )
+    print(
+        f"Muon last-recorded mean loss: {summary['final_muon_loss_mean']:.6f} +/- {summary['final_muon_loss_std']:.6f}"
+    )
+    print(f"SGD/Muon loss ratio:          {summary['loss_ratio_sgd_over_muon']:.3f}x")
+    print(
+        f"Paired seedwise loss gap (SGD-Muon): {summary['paired_final_loss_gap_mean']:.6f} +/- {summary['paired_final_loss_gap_std']:.6f} "
+        f"(SEM {summary['paired_final_loss_gap_sem']:.6f})"
+    )
+    print(
+        f"Paired seedwise loss ratio (SGD/Muon): {summary['paired_final_loss_ratio_mean']:.3f}x +/- {summary['paired_final_loss_ratio_std']:.3f}x "
+        f"(SEM {summary['paired_final_loss_ratio_sem']:.3f}x)"
+    )
+
+    print(f"\n{'=' * 90}")
+    print("H1-H4 HEURISTIC CHECKS (DESCRIPTIVE, NOT FORMAL SIGNIFICANCE TESTS)")
+    print(f"{'=' * 90}")
+    for key in ["H1", "H2", "H3", "H4"]:
+        item = hypotheses[key]
+        print(f"\n{key}: {item['description']}")
+        print(f"  Criterion: {item['criterion']}")
+        if key == "H4":
+            obs = item["observed_value"]
+            print(
+                f"  Observed: SGD={obs['sgd_mean']:.6f}, Muon={obs['muon_mean']:.6f}, "
+                f"SGD/Muon={obs['sgd_over_muon']:.3f}x"
+            )
+        else:
+            print(f"  Observed: {item['observed_value']:.6f}")
+        print(f"  Verdict: {'PASS' if item['passed'] else 'FAIL'}")
+
+    print(f"\n{'=' * 90}")
+    print("CALIBRATED CONCLUSION")
+    print(f"{'=' * 90}")
+    print(f"Heuristic checks passed: {summary['total_pass']}/4")
+    print(
+        f"Muon substantially lowers last-recorded mean loss "
+        f"({summary['final_sgd_loss_mean']:.4f} -> {summary['final_muon_loss_mean']:.4f})."
+    )
+    if summary["avg_matrix_ratio"] > summary["avg_diag_ratio"]:
+        print(
+            "Matrix layers show larger final conditioning gains than diagonal layers on this metric, "
+            "but the observable still does not isolate a direct gauge effect."
+        )
     else:
-        matrix_ratios.append(ratio)
-
-    print(f"{layer_names[li]:>12}  {layer_types[li]:>8}  "
-          f"{k_sgd_mean:>8.1f}+/-{k_sgd_std:<4.1f}  "
-          f"{k_muon_mean:>8.1f}+/-{k_muon_std:<4.1f}  "
-          f"{ratio:>8.1f}x  "
-          f"{'normalization' if layer_types[li]=='diag' else 'norm+gauge'}")
-
-
-# =============================================================================
-# PER-LAYER-TYPE AVERAGES
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("AVERAGE CONDITIONING IMPROVEMENT BY LAYER TYPE")
-print(f"{'=' * 90}")
-
-avg_diag = np.mean(diag_ratios)
-avg_matrix = np.mean(matrix_ratios)
-
-print(f"\n  Diagonal layers (normalization only):       {avg_diag:.1f}x improvement")
-print(f"  Matrix layers   (normalization + gauge):     {avg_matrix:.1f}x improvement")
-print(f"  Gauge-specific contribution (matrix/diag):   {avg_matrix/max(avg_diag,1e-12):.1f}x")
+        print(
+            "The default run does not show the originally intended matrix-layer conditioning advantage "
+            "over diagonal layers."
+        )
+    print(
+        "This pair should therefore be read as a conditioning-based toy probe whose current default run "
+        "shows strong loss improvement but does not support a strong gauge-decomposition story."
+    )
 
 
-# =============================================================================
-# KAPPA TRAJECTORY: averaged over seeds, for diag and matrix separately
-# =============================================================================
 
-print(f"\n\n{'=' * 90}")
-print("AVERAGE KAPPA TRAJECTORY BY TYPE")
-print(f"{'=' * 90}")
-
-diag_indices = [0, 2]
-matrix_indices = [1, 3]
-
-print(f"\n{'Step':>6}  {'SGD diag':>10}  {'Muon diag':>10}  {'SGD matrix':>11}  {'Muon matrix':>12}  {'Ratio diag':>11}  {'Ratio matrix':>13}")
-print("-" * 85)
-
-for s in snapshot_steps:
-    if s >= sgd_kappas_mean.shape[0]:
-        continue
-    sgd_diag = np.mean([sgd_kappas_mean[s, i] for i in diag_indices])
-    muon_diag = np.mean([muon_kappas_mean[s, i] for i in diag_indices])
-    sgd_mat = np.mean([sgd_kappas_mean[s, i] for i in matrix_indices])
-    muon_mat = np.mean([muon_kappas_mean[s, i] for i in matrix_indices])
-    r_diag = sgd_diag / max(muon_diag, 1e-12)
-    r_mat = sgd_mat / max(muon_mat, 1e-12)
-    print(f"{s:>6}  {sgd_diag:>10.2f}  {muon_diag:>10.2f}  {sgd_mat:>11.2f}  {muon_mat:>12.2f}  {r_diag:>11.2f}  {r_mat:>13.2f}")
+def main():
+    results = run_experiment(verbose=True)
+    print_report(results)
 
 
-# =============================================================================
-# LOSS COMPARISON
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("LOSS TRAJECTORY (mean over seeds)")
-print(f"{'=' * 90}")
-
-print(f"\n{'Step':>6}  {'SGD loss':>12}  {'Muon loss':>12}  {'Ratio SGD/Muon':>16}")
-print("-" * 50)
-for s in snapshot_steps:
-    if s < len(sgd_losses_mean) and s < len(muon_losses_mean):
-        ls = sgd_losses_mean[s]
-        lm = muon_losses_mean[s]
-        r = ls / max(lm, 1e-12)
-        print(f"{s:>6}  {ls:>12.4f}  {lm:>12.4f}  {r:>16.2f}")
-
-
-# =============================================================================
-# HYPOTHESIS TESTS
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("HYPOTHESIS TESTS")
-print(f"{'=' * 90}")
-
-# H1: Diagonal layers have modest kappa improvement (1-10x)
-h1 = 1.0 <= avg_diag <= 20.0
-print(f"\nH1: Diagonal kappa improvement in 1-20x range (normalization only)?")
-print(f"    Measured: {avg_diag:.1f}x")
-print(f"    --> {'PASS' if h1 else 'FAIL'}")
-
-# H2: Matrix layers have much larger kappa improvement (>5x)
-h2 = avg_matrix > 5.0
-print(f"\nH2: Matrix kappa improvement > 5x (normalization + gauge)?")
-print(f"    Measured: {avg_matrix:.1f}x")
-print(f"    --> {'PASS' if h2 else 'FAIL'}")
-
-# H3: Matrix improvement >> diagonal improvement (gauge contribution)
-h3 = avg_matrix > 2.0 * avg_diag
-print(f"\nH3: Matrix improvement > 2x diagonal improvement (gauge contribution)?")
-print(f"    Matrix: {avg_matrix:.1f}x, Diagonal: {avg_diag:.1f}x, Ratio: {avg_matrix/max(avg_diag,1e-12):.1f}x")
-print(f"    --> {'PASS' if h3 else 'FAIL'}")
-
-# H4: Muon achieves lower final loss
-final_sgd = sgd_losses_mean[-1]
-final_muon = muon_losses_mean[-1]
-h4 = final_muon < final_sgd
-print(f"\nH4: Muon achieves lower final loss?")
-print(f"    SGD: {final_sgd:.4f}, Muon: {final_muon:.4f}")
-print(f"    --> {'PASS' if h4 else 'FAIL'}")
-
-total_pass = sum([h1, h2, h3, h4])
-
-
-# =============================================================================
-# FINAL VERDICT
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("FINAL VERDICT: H15 NORMALIZATION-GAUGE DUALITY")
-print(f"{'=' * 90}")
-print(f"""
-  Diagonal layers (normalization only):     {avg_diag:.1f}x kappa improvement
-  Matrix layers (normalization + gauge):    {avg_matrix:.1f}x kappa improvement
-  Gauge-specific contribution:              {avg_matrix/max(avg_diag,1e-12):.1f}x additional
-
-  Tests passed: {total_pass}/4
-""")
-
-if avg_matrix > 3.0 * avg_diag:
-    print("  STRONG DUALITY: Matrix layers benefit FAR more than diagonal.")
-    print("  This confirms gauge-fixing provides benefit BEYOND normalization.")
-elif avg_matrix > 1.5 * avg_diag:
-    print("  MODERATE DUALITY: Matrix layers benefit more than diagonal.")
-    print("  Gauge-fixing contributes meaningfully on top of normalization.")
-else:
-    print("  WEAK/NO DUALITY: Matrix and diagonal benefit similarly.")
-    print("  Muon's advantage may be mostly normalization, not gauge-fixing.")
-
-print(f"\n{'=' * 90}")
+if __name__ == "__main__":
+    main()

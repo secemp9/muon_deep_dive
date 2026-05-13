@@ -1,918 +1,1279 @@
 #!/usr/bin/env python3
 """
-1.3b-i-A: Feedback Measure -- sigma_1(W) Growth Rate Under Each Optimizer
-=========================================================================
+1.3b-i-A: sigma_1(W) Growth Under SGD vs Muon
+=============================================
 
-PREDICTION (from anisotropy cascade / RG gauge-fixing model):
-  SGD with momentum accumulates updates along the dominant singular direction
-  of the weight matrix, creating a positive feedback loop:
-    large sigma_1(W) -> gradient aligns with top direction -> update amplifies
-    sigma_1(W) further -> exponential growth of sigma_1(W).
+First completion-pass scope
+---------------------------
+This file keeps the original deterministic deep-linear toy study but tightens
+its execution model and claim discipline.
 
-  Muon's Newton-Schulz orthogonalization projects the gradient onto the
-  orthogonal manifold, meaning every singular value of the update is 1.
-  This breaks the feedback loop: the step size in every spectral direction
-  is the same, so sigma_1(W) can only grow linearly (bounded step per
-  iteration), not exponentially.
+What is measured
+- Per-state sigma_1(W), sigma_n(W), condition numbers, and losses.
+- Final singular-value spectra for every layer.
+- Two fit families for log(sigma_1(W)):
+    * exponential proxy: log(sigma_1) = a * t + b
+    * polynomial/power-law proxy: log(sigma_1) = a * log(t) + b
+- A retained legacy scalar coupling proxy:
+    corr( sigma_1(raw gradient used for the update into W_t), sigma_1(W_t) )
+- A small direct directional diagnostic:
+    mean absolute overlap of the top left/right singular vectors of W with the
+    raw gradient and with the actual momentum update.
 
-HYPOTHESIS:
-  - SGD: log(sigma_1) grows LINEARLY in t  (i.e. sigma_1 ~ exp(a*t))
-  - Muon: log(sigma_1) grows SUB-LINEARLY in t  (i.e. sigma_1 ~ t^a or bounded)
-  - The correlation corr(sigma_1(G_i), sigma_1(W_i)) should be HIGH for SGD
-    (gradient tracks weight anisotropy = feedback loop active) and LOWER for Muon
-    (orthogonalization decorrelates gradient spectrum from weight spectrum).
-
-CRITICAL CONTEXT:
-  - 1.2b-i showed Muon is MORE chaotic (higher Lyapunov) -- but direction is better
-  - 1.3a-i showed per-layer erank stays higher for Muon (93.3% vs 89.5%)
-  - 1.3a-ii showed Muon's momentum has 2x the effective rank
-
-Setup: 4-layer deep linear net, 32x32, quadratic loss, 500 steps.
+Important limitations
+- The scalar correlation proxy is NOT a singular-vector alignment measure.
+  It only tracks co-variation of top singular-value magnitudes.
+- Muon has three distinct objects:
+    raw gradient -> orthogonalized gradient -> momentum update.
+  Only the orthogonalized gradient is approximately spectrum-flattened.
+  The actual momentum update is generally not orthogonal.
+- This is still a single-seed deterministic toy study, not a statistical claim.
+- Strong wording about “exponential self-amplification” is only justified when
+  the within-SGD exponential fit actually beats the polynomial alternative.
 """
 
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
 import numpy as np
-import os
 
-np.random.seed(42)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "seed": 42,
+    "dim": 32,
+    "num_layers": 4,
+    "num_steps": 500,
+    "batch_size": 64,
+    "lr_muon": 0.005,
+    "momentum": 0.9,
+    "ns_iters": 5,
+    "sgd_lr_candidates": [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001],
+    "lr_search_steps": 200,
+    "lr_search_divergence_factor": 50.0,
+    "corr_start_step": 10,
+    "report_steps": [0, 50, 100, 200, 300, 500],
+    "rolling_corr_window": 50,
+}
+
 
 # =============================================================================
-# CONFIGURATION
+# BASIC HELPERS
 # =============================================================================
 
-DIM = 32
-NUM_LAYERS = 4
-NUM_STEPS = 500
-BATCH_SIZE = 64
-LR_MUON = 0.005
-MOMENTUM = 0.9
-NS_ITERS = 5
 
-# Random target matrix (fixed)
-W_target = np.random.randn(DIM, DIM) * 0.5
+def merge_config(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Merge user config with defaults."""
+    merged = dict(DEFAULT_CONFIG)
+    if config:
+        merged.update(config)
+    merged["sgd_lr_candidates"] = list(merged["sgd_lr_candidates"])
+    merged["report_steps"] = list(merged["report_steps"])
+    return merged
 
-# Random input data (fixed batch)
-X_data = np.random.randn(DIM, BATCH_SIZE) * 0.3
 
-# Output directory
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+def safe_scalar_nanmean(values: np.ndarray | List[float]) -> float:
+    """Mean over finite values only; returns NaN if no finite values exist."""
+    arr = np.asarray(values, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    return float(arr.mean()) if arr.size else float("nan")
+
+
+def safe_columnwise_nanmean(values: np.ndarray) -> np.ndarray:
+    """Column-wise finite-only mean for 2D arrays."""
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError("safe_columnwise_nanmean expects a 2D array")
+    out = np.full(arr.shape[1], np.nan, dtype=float)
+    for col in range(arr.shape[1]):
+        finite = arr[:, col][np.isfinite(arr[:, col])]
+        if finite.size:
+            out[col] = finite.mean()
+    return out
+
+
+def summarize_finite_vector(values: np.ndarray | List[float]) -> Dict[str, Any]:
+    """Summary stats over finite values, including SEM and a normal-approx 95% CI."""
+    arr = np.asarray(values, dtype=float).ravel()
+    finite = arr[np.isfinite(arr)]
+    n_finite = int(finite.size)
+    if n_finite == 0:
+        return {
+            "n_finite": 0,
+            "mean": float("nan"),
+            "std": float("nan"),
+            "sem": float("nan"),
+            "median": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+            "ci95_low": float("nan"),
+            "ci95_high": float("nan"),
+        }
+
+    mean = float(np.mean(finite))
+    std = float(np.std(finite, ddof=1)) if n_finite > 1 else 0.0
+    sem = float(std / np.sqrt(n_finite)) if n_finite > 1 else 0.0
+    ci95_half_width = 1.96 * sem if n_finite > 1 else 0.0
+    return {
+        "n_finite": n_finite,
+        "mean": mean,
+        "std": std,
+        "sem": sem,
+        "median": float(np.median(finite)),
+        "min": float(np.min(finite)),
+        "max": float(np.max(finite)),
+        "ci95_low": mean - ci95_half_width,
+        "ci95_high": mean + ci95_half_width,
+    }
+
+
+def safe_corrcoef(x: np.ndarray, y: np.ndarray) -> float:
+    """Pearson correlation guarded against NaN / constant inputs."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if np.sum(mask) < 3:
+        return float("nan")
+    x = x[mask]
+    y = y[mask]
+    if np.std(x) < 1e-12 or np.std(y) < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def to_serializable(obj: Any) -> Any:
+    """Convert numpy / Path heavy structures into JSON-safe Python objects."""
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_serializable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
+# =============================================================================
+# PROBLEM SETUP
+# =============================================================================
+
+
+def build_problem(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Create the fixed target matrix and fixed batch used by the toy study."""
+    rng = np.random.RandomState(config["seed"])
+    dim = config["dim"]
+    batch_size = config["batch_size"]
+
+    w_target = rng.randn(dim, dim) * 0.5
+    x_data = rng.randn(dim, batch_size) * 0.3
+    target_spectrum = np.linalg.svd(w_target, compute_uv=False)
+
+    return {
+        "W_target": w_target,
+        "X_data": x_data,
+        "target_spectrum": target_spectrum,
+        "target_fro_norm": float(np.linalg.norm(w_target, ord="fro")),
+        "target_condition_number": float(target_spectrum[0] / max(target_spectrum[-1], 1e-30)),
+        "input_mean_abs": float(np.mean(np.abs(x_data))),
+        "input_std": float(np.std(x_data)),
+    }
 
 
 # =============================================================================
 # CORE FUNCTIONS
 # =============================================================================
 
-def init_weights(num_layers, seed=42):
-    """Initialize layers near identity for stability."""
+
+def init_weights(num_layers: int, dim: int, seed: int = 42) -> List[np.ndarray]:
+    """Initialize each layer near identity for stable deep-linear dynamics."""
     rng = np.random.RandomState(seed)
     weights = []
     for _ in range(num_layers):
-        W = np.eye(DIM) + rng.randn(DIM, DIM) * 0.1
-        weights.append(W.copy())
+        weights.append(np.eye(dim) + rng.randn(dim, dim) * 0.1)
     return weights
 
 
-def forward(weights, X):
-    """Forward pass: W_L @ ... @ W_1 @ X."""
-    out = X.copy()
-    for W in weights:
-        out = W @ out
+def forward(weights: List[np.ndarray], x_data: np.ndarray) -> np.ndarray:
+    """Forward pass through the deep linear network."""
+    out = x_data.copy()
+    for weight in weights:
+        out = weight @ out
     return out
 
 
-def compute_loss(weights, X, target):
-    """Loss = 0.5 * ||W_product @ X - T @ X||^2 / N."""
-    pred = forward(weights, X)
-    target_out = target @ X
+def compute_loss(weights: List[np.ndarray], x_data: np.ndarray, target: np.ndarray) -> float:
+    """Quadratic loss between network output and target-transformed data."""
+    pred = forward(weights, x_data)
+    target_out = target @ x_data
     diff = pred - target_out
-    return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
+    return float(0.5 * np.mean(np.sum(diff ** 2, axis=0)))
 
 
-def compute_gradients(weights, X, target):
-    """Backprop through deep linear net."""
+def compute_gradients(weights: List[np.ndarray], x_data: np.ndarray, target: np.ndarray) -> List[np.ndarray]:
+    """Exact backpropagation through the deep linear network."""
     num_layers = len(weights)
-    N = X.shape[1]
+    n_samples = x_data.shape[1]
 
-    # Forward pass storing activations
-    activations = [X.copy()]
-    out = X.copy()
-    for W in weights:
-        out = W @ out
+    activations = [x_data.copy()]
+    out = x_data.copy()
+    for weight in weights:
+        out = weight @ out
         activations.append(out.copy())
 
-    # Backward pass
-    target_out = target @ X
-    delta = (activations[-1] - target_out) / N
+    target_out = target @ x_data
+    delta = (activations[-1] - target_out) / n_samples
 
-    grads = []
-    for i in range(num_layers - 1, -1, -1):
-        G = delta @ activations[i].T
-        grads.insert(0, G)
-        if i > 0:
-            delta = weights[i].T @ delta
+    grads: List[np.ndarray] = []
+    for layer in range(num_layers - 1, -1, -1):
+        grad = delta @ activations[layer].T
+        grads.insert(0, grad)
+        if layer > 0:
+            delta = weights[layer].T @ delta
 
     return grads
 
 
-def newton_schulz_orthogonalize(G, num_iters=NS_ITERS):
-    """
-    Newton-Schulz iteration to approximate the orthogonal polar factor.
-    Returns closest orthogonal matrix to G (i.e., U @ V^T from SVD).
-    """
-    norm = np.linalg.norm(G, ord='fro')
+def newton_schulz_orthogonalize(grad: np.ndarray, num_iters: int) -> np.ndarray:
+    """Approximate the orthogonal polar factor of grad via Newton-Schulz."""
+    norm = np.linalg.norm(grad, ord="fro")
     if norm < 1e-12:
-        return G
-    X = G / norm
+        return grad.copy()
 
+    x = grad / norm
     for _ in range(num_iters):
-        A = X.T @ X
-        X = 1.5 * X - 0.5 * X @ A
+        a = x.T @ x
+        x = 1.5 * x - 0.5 * x @ a
+    return x
 
-    return X
 
-
-def gini_coefficient(values):
-    """
-    Compute the Gini coefficient of a 1D array.
-    0 = perfect equality, 1 = perfect inequality.
-    """
-    values = np.sort(np.abs(values))
+def gini_coefficient(values: np.ndarray) -> float:
+    """Gini coefficient of a 1D array of magnitudes."""
+    values = np.sort(np.abs(np.asarray(values, dtype=float)))
     n = len(values)
-    if n == 0 or np.sum(values) < 1e-30:
+    total = np.sum(values)
+    if n == 0 or total < 1e-30:
         return 0.0
     index = np.arange(1, n + 1)
-    return (2.0 * np.sum(index * values) / (n * np.sum(values))) - (n + 1.0) / n
+    gini = (2.0 * np.sum(index * values) / (n * total)) - (n + 1.0) / n
+    return float(gini)
+
+
+def top_singular_vector_overlap(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Mean absolute overlap of top left/right singular vectors.
+
+    This is a small direct directional diagnostic. It is still a low-dimensional
+    summary, but unlike the scalar sigma_1 correlation proxy it actually uses
+    singular-vector information.
+    """
+    norm_a = np.linalg.norm(a, ord="fro")
+    norm_b = np.linalg.norm(b, ord="fro")
+    if norm_a < 1e-12 or norm_b < 1e-12:
+        return float("nan")
+
+    ua, _, vha = np.linalg.svd(a, full_matrices=False)
+    ub, _, vhb = np.linalg.svd(b, full_matrices=False)
+    left_overlap = abs(float(np.dot(ua[:, 0], ub[:, 0])))
+    right_overlap = abs(float(np.dot(vha[0, :], vhb[0, :])))
+    return 0.5 * (left_overlap + right_overlap)
 
 
 # =============================================================================
-# OPTIMIZER STEP FUNCTIONS
+# OPTIMIZER HELPERS
 # =============================================================================
 
-def find_stable_lr_sgd():
-    """Find maximum stable SGD learning rate."""
-    candidates = [0.05, 0.03, 0.02, 0.015, 0.01, 0.007, 0.005, 0.003, 0.001]
-    for lr in candidates:
-        np.random.seed(42)
-        weights = init_weights(NUM_LAYERS)
-        velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
-        initial_loss = compute_loss(weights, X_data, W_target)
+
+def find_stable_lr_sgd(config: Dict[str, Any], x_data: np.ndarray, w_target: np.ndarray) -> float:
+    """Find the largest stable SGD learning rate from the configured candidate list."""
+    dim = config["dim"]
+    num_layers = config["num_layers"]
+    seed = config["seed"]
+    momentum = config["momentum"]
+
+    for lr in config["sgd_lr_candidates"]:
+        weights = init_weights(num_layers, dim, seed=seed)
+        velocities = [np.zeros((dim, dim)) for _ in range(num_layers)]
+        initial_loss = compute_loss(weights, x_data, w_target)
         stable = True
-        for step in range(200):
-            grads = compute_gradients(weights, X_data, W_target)
-            for i in range(NUM_LAYERS):
-                velocities[i] = MOMENTUM * velocities[i] + grads[i]
-                weights[i] -= lr * velocities[i]
-            loss = compute_loss(weights, X_data, W_target)
-            if np.isnan(loss) or loss > initial_loss * 50:
+
+        for _ in range(config["lr_search_steps"]):
+            grads = compute_gradients(weights, x_data, w_target)
+            for layer in range(num_layers):
+                velocities[layer] = momentum * velocities[layer] + grads[layer]
+                weights[layer] = weights[layer] - lr * velocities[layer]
+            loss = compute_loss(weights, x_data, w_target)
+            if np.isnan(loss) or loss > initial_loss * config["lr_search_divergence_factor"]:
                 stable = False
                 break
+
         if stable:
-            return lr
-    return 0.001
+            return float(lr)
+
+    return float(config["sgd_lr_candidates"][-1])
 
 
-def sgd_step(weights, velocities, lr):
-    """One step of SGD with momentum. Returns (weights, velocities, raw_grads)."""
-    grads = compute_gradients(weights, X_data, W_target)
-    for i in range(len(weights)):
-        velocities[i] = MOMENTUM * velocities[i] + grads[i]
-        weights[i] = weights[i] - lr * velocities[i]
-    return weights, velocities, grads
+def compute_optimizer_diagnostics(
+    optimizer_name: str,
+    weights: List[np.ndarray],
+    velocities: List[np.ndarray],
+    x_data: np.ndarray,
+    w_target: np.ndarray,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compute raw-grad, transformed-grad, and actual-update diagnostics at one state."""
+    num_layers = config["num_layers"]
+    momentum = config["momentum"]
 
+    grads = compute_gradients(weights, x_data, w_target)
+    transformed_grads: List[np.ndarray] = []
+    updates: List[np.ndarray] = []
 
-def muon_step(weights, velocities, lr):
-    """One step of Muon with momentum. Returns (weights, velocities, raw_grads)."""
-    grads = compute_gradients(weights, X_data, W_target)
-    for i in range(len(weights)):
-        ortho_grad = newton_schulz_orthogonalize(grads[i])
-        velocities[i] = MOMENTUM * velocities[i] + ortho_grad
-        weights[i] = weights[i] - lr * velocities[i]
-    return weights, velocities, grads
+    raw_grad_sigma1 = np.zeros(num_layers, dtype=float)
+    transformed_grad_sigma1 = np.zeros(num_layers, dtype=float)
+    update_sigma1 = np.zeros(num_layers, dtype=float)
+    weight_raw_grad_alignment = np.zeros(num_layers, dtype=float)
+    weight_update_alignment = np.zeros(num_layers, dtype=float)
+
+    for layer in range(num_layers):
+        raw_grad = grads[layer]
+        if optimizer_name == "SGD":
+            transformed_grad = raw_grad.copy()
+        elif optimizer_name == "Muon":
+            transformed_grad = newton_schulz_orthogonalize(raw_grad, num_iters=config["ns_iters"])
+        else:
+            raise ValueError(f"Unknown optimizer_name={optimizer_name!r}")
+
+        update = momentum * velocities[layer] + transformed_grad
+        transformed_grads.append(transformed_grad)
+        updates.append(update)
+
+        raw_grad_sigma1[layer] = np.linalg.svd(raw_grad, compute_uv=False)[0]
+        transformed_grad_sigma1[layer] = np.linalg.svd(transformed_grad, compute_uv=False)[0]
+        update_sigma1[layer] = np.linalg.svd(update, compute_uv=False)[0]
+        weight_raw_grad_alignment[layer] = top_singular_vector_overlap(weights[layer], raw_grad)
+        weight_update_alignment[layer] = top_singular_vector_overlap(weights[layer], update)
+
+    return {
+        "raw_grads": grads,
+        "transformed_grads": transformed_grads,
+        "updates": updates,
+        "raw_grad_sigma1": raw_grad_sigma1,
+        "transformed_grad_sigma1": transformed_grad_sigma1,
+        "update_sigma1": update_sigma1,
+        "weight_raw_grad_alignment": weight_raw_grad_alignment,
+        "weight_update_alignment": weight_update_alignment,
+    }
 
 
 # =============================================================================
 # MEASUREMENT ENGINE
 # =============================================================================
 
-def run_and_measure(optimizer_name, optimizer_fn, lr, num_steps):
-    """
-    Run optimizer for num_steps and measure at EVERY step:
-      - sigma_1(W_i) for each layer (top singular value)
-      - sigma_n(W_i) for each layer (bottom singular value)
-      - full SV spectrum at selected steps
-      - sigma_1(G_i) for each layer (gradient top SV)
-      - correlation between sigma_1(G_i) and sigma_1(W_i)
-      - loss
-    """
-    np.random.seed(42)
-    weights = init_weights(NUM_LAYERS)
-    velocities = [np.zeros((DIM, DIM)) for _ in range(NUM_LAYERS)]
 
-    # Storage: per step, per layer
-    sigma1_W = np.zeros((num_steps + 1, NUM_LAYERS))  # top SV of weight
-    sigman_W = np.zeros((num_steps + 1, NUM_LAYERS))   # bottom SV of weight
-    sigma1_G = np.zeros((num_steps + 1, NUM_LAYERS))   # top SV of gradient
-    losses = np.zeros(num_steps + 1)
-    # Full SV spectrum at final step
-    final_sv_spectrum = []
-
-    # Measure at step 0
-    for i in range(NUM_LAYERS):
-        sv = np.linalg.svd(weights[i], compute_uv=False)
-        sigma1_W[0, i] = sv[0]
-        sigman_W[0, i] = sv[-1]
-    losses[0] = compute_loss(weights, X_data, W_target)
-
-    # Compute initial gradients for sigma1_G at step 0
-    grads_init = compute_gradients(weights, X_data, W_target)
-    for i in range(NUM_LAYERS):
-        sv_g = np.linalg.svd(grads_init[i], compute_uv=False)
-        sigma1_G[0, i] = sv_g[0]
-
-    for step in range(1, num_steps + 1):
-        weights, velocities, grads = optimizer_fn(weights, velocities, lr)
-
-        # Measure
-        for i in range(NUM_LAYERS):
-            sv = np.linalg.svd(weights[i], compute_uv=False)
-            sigma1_W[step, i] = sv[0]
-            sigman_W[step, i] = sv[-1]
-
-            sv_g = np.linalg.svd(grads[i], compute_uv=False)
-            sigma1_G[step, i] = sv_g[0]
-
-        loss = compute_loss(weights, X_data, W_target)
-        losses[step] = loss
-
-        # Check for divergence
-        if np.isnan(loss) or loss > 1e10:
-            print(f"    WARNING: {optimizer_name} diverged at step {step}!")
-            # Fill remaining with NaN
-            sigma1_W[step + 1:] = np.nan
-            sigman_W[step + 1:] = np.nan
-            sigma1_G[step + 1:] = np.nan
-            losses[step + 1:] = np.nan
-            break
-
-    # Record final SV spectrum
-    for i in range(NUM_LAYERS):
-        sv = np.linalg.svd(weights[i], compute_uv=False)
-        final_sv_spectrum.append(sv)
-
-    return {
-        'sigma1_W': sigma1_W,
-        'sigman_W': sigman_W,
-        'sigma1_G': sigma1_G,
-        'losses': losses,
-        'final_sv_spectrum': final_sv_spectrum,
-    }
-
-
-# =============================================================================
-# GROWTH MODEL FITTING
-# =============================================================================
-
-def fit_exponential(steps, log_sigma1):
-    """
-    Fit log(sigma_1) = a*t + b  (exponential growth model).
-    Returns (a, b, R^2).
-    """
-    # Filter out NaN/Inf
+def fit_exponential(steps: np.ndarray, log_sigma1: np.ndarray) -> tuple[float, float, float]:
+    """Fit log(sigma_1) = a * t + b."""
+    steps = np.asarray(steps, dtype=float)
+    log_sigma1 = np.asarray(log_sigma1, dtype=float)
     mask = np.isfinite(log_sigma1)
-    t = steps[mask].astype(float)
+    t = steps[mask]
     y = log_sigma1[mask]
     if len(t) < 3:
         return 0.0, 0.0, 0.0
 
-    # Linear regression: y = a*t + b
-    A = np.vstack([t, np.ones(len(t))]).T
-    result = np.linalg.lstsq(A, y, rcond=None)
-    coeffs = result[0]
-    a, b = coeffs[0], coeffs[1]
-
+    design = np.vstack([t, np.ones(len(t))]).T
+    coeffs, *_ = np.linalg.lstsq(design, y, rcond=None)
+    a, b = float(coeffs[0]), float(coeffs[1])
     y_pred = a * t + b
     ss_res = np.sum((y - y_pred) ** 2)
     ss_tot = np.sum((y - np.mean(y)) ** 2)
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-30 else 0.0
+    return a, b, float(r2)
 
-    return a, b, r2
 
-
-def fit_polynomial(steps, log_sigma1):
-    """
-    Fit log(sigma_1) = a*log(t) + b  (polynomial/power-law growth model).
-    Returns (a, b, R^2).
-    Only uses steps > 0 (since log(0) is undefined).
-    """
+def fit_polynomial(steps: np.ndarray, log_sigma1: np.ndarray) -> tuple[float, float, float]:
+    """Fit log(sigma_1) = a * log(t) + b."""
+    steps = np.asarray(steps, dtype=float)
+    log_sigma1 = np.asarray(log_sigma1, dtype=float)
     mask = np.isfinite(log_sigma1) & (steps > 0)
-    t = steps[mask].astype(float)
+    t = steps[mask]
     y = log_sigma1[mask]
     if len(t) < 3:
         return 0.0, 0.0, 0.0
 
     log_t = np.log(t)
-
-    # Linear regression: y = a*log(t) + b
-    A = np.vstack([log_t, np.ones(len(log_t))]).T
-    result = np.linalg.lstsq(A, y, rcond=None)
-    coeffs = result[0]
-    a, b = coeffs[0], coeffs[1]
-
+    design = np.vstack([log_t, np.ones(len(log_t))]).T
+    coeffs, *_ = np.linalg.lstsq(design, y, rcond=None)
+    a, b = float(coeffs[0]), float(coeffs[1])
     y_pred = a * log_t + b
     ss_res = np.sum((y - y_pred) ** 2)
     ss_tot = np.sum((y - np.mean(y)) ** 2)
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-30 else 0.0
-
-    return a, b, r2
-
-
-# =============================================================================
-# MAIN EXPERIMENT
-# =============================================================================
-
-print("=" * 100)
-print("1.3b-i-A: FEEDBACK MEASURE -- sigma_1(W) GROWTH RATE UNDER EACH OPTIMIZER")
-print("=" * 100)
-print(f"Setup: {NUM_LAYERS}-layer deep linear net (dim={DIM}), quadratic loss, {NUM_STEPS} steps")
-print(f"Track: log(sigma_1(W)) vs step for each layer, for SGD and Muon")
-print(f"Fit: exponential model log(s1) = a*t + b  vs  polynomial model log(s1) = a*log(t) + b")
-print(f"Also: condition number sigma_1/sigma_n, Gini coefficient, corr(sigma_1(G), sigma_1(W))")
-print(f"LR_Muon={LR_MUON}, Momentum={MOMENTUM}")
-print("=" * 100)
-
-# Find stable SGD learning rate
-lr_sgd = find_stable_lr_sgd()
-print(f"\nSGD learning rate (max stable): {lr_sgd}")
-print(f"Muon learning rate (fixed):     {LR_MUON}")
-
-# Initial loss
-np.random.seed(42)
-w_test = init_weights(NUM_LAYERS)
-loss_init = compute_loss(w_test, X_data, W_target)
-print(f"Initial loss: {loss_init:.6e}")
-
-# Run both optimizers
-print(f"\n{'=' * 100}")
-print("RUNNING OPTIMIZERS AND TRACKING sigma_1 EVOLUTION")
-print("=" * 100)
-
-print("\n  Running SGD...", flush=True)
-results_sgd = run_and_measure('SGD', sgd_step, lr_sgd, NUM_STEPS)
-print(f"    SGD final loss: {results_sgd['losses'][-1]:.6e}")
-
-print("\n  Running Muon...", flush=True)
-results_muon = run_and_measure('Muon', muon_step, LR_MUON, NUM_STEPS)
-print(f"    Muon final loss: {results_muon['losses'][-1]:.6e}")
-
-steps = np.arange(NUM_STEPS + 1)
+    return a, b, float(r2)
 
 
-# =============================================================================
-# ANALYSIS 1: Growth Model Fitting for Each Layer
-# =============================================================================
+def measure_optimizer_run(
+    optimizer_name: str,
+    lr: float,
+    config: Dict[str, Any],
+    x_data: np.ndarray,
+    w_target: np.ndarray,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """Run one optimizer and record per-state spectral diagnostics."""
+    dim = config["dim"]
+    num_layers = config["num_layers"]
+    num_steps = config["num_steps"]
+    seed = config["seed"]
 
-print(f"\n\n{'=' * 100}")
-print("TABLE 1: sigma_1(W) GROWTH MODEL FITS PER LAYER")
-print("  Exponential model: log(sigma_1) = a*t + b   => sigma_1 ~ exp(a*t)")
-print("  Polynomial model:  log(sigma_1) = a*log(t) + b  => sigma_1 ~ t^a")
-print("  Better fit = higher R^2")
-print("=" * 100)
+    weights = init_weights(num_layers, dim, seed=seed)
+    velocities = [np.zeros((dim, dim)) for _ in range(num_layers)]
 
-print(f"\n{'':>3} {'Layer':>5} | {'Exp a':>10} {'Exp R2':>8} | {'Poly a':>10} {'Poly R2':>8} | {'Best Fit':>10}")
-print("-" * 75)
+    sigma1_w = np.full((num_steps + 1, num_layers), np.nan, dtype=float)
+    sigman_w = np.full((num_steps + 1, num_layers), np.nan, dtype=float)
+    losses = np.full(num_steps + 1, np.nan, dtype=float)
 
-sgd_exp_r2_all = []
-sgd_poly_r2_all = []
-muon_exp_r2_all = []
-muon_poly_r2_all = []
+    raw_grad_sigma1 = np.full((num_steps + 1, num_layers), np.nan, dtype=float)
+    transformed_grad_sigma1 = np.full((num_steps + 1, num_layers), np.nan, dtype=float)
+    update_sigma1 = np.full((num_steps + 1, num_layers), np.nan, dtype=float)
+    weight_raw_grad_alignment = np.full((num_steps + 1, num_layers), np.nan, dtype=float)
+    weight_update_alignment = np.full((num_steps + 1, num_layers), np.nan, dtype=float)
 
-print("\n  SGD:")
-for layer in range(NUM_LAYERS):
-    log_s1 = np.log(results_sgd['sigma1_W'][:, layer] + 1e-30)
-    a_exp, b_exp, r2_exp = fit_exponential(steps, log_s1)
-    a_poly, b_poly, r2_poly = fit_polynomial(steps, log_s1)
-    best = "EXPONENTIAL" if r2_exp > r2_poly else "POLYNOMIAL"
-    sgd_exp_r2_all.append(r2_exp)
-    sgd_poly_r2_all.append(r2_poly)
-    print(f"  {'SGD':>3} {layer:5d} | {a_exp:10.6f} {r2_exp:8.4f} | {a_poly:10.6f} {r2_poly:8.4f} | {best:>10}")
+    diverged_at_step = None
 
-print("\n  Muon:")
-for layer in range(NUM_LAYERS):
-    log_s1 = np.log(results_muon['sigma1_W'][:, layer] + 1e-30)
-    a_exp, b_exp, r2_exp = fit_exponential(steps, log_s1)
-    a_poly, b_poly, r2_poly = fit_polynomial(steps, log_s1)
-    best = "EXPONENTIAL" if r2_exp > r2_poly else "POLYNOMIAL"
-    muon_exp_r2_all.append(r2_exp)
-    muon_poly_r2_all.append(r2_poly)
-    print(f"  {'Muon':>4} {layer:5d} | {a_exp:10.6f} {r2_exp:8.4f} | {a_poly:10.6f} {r2_poly:8.4f} | {best:>10}")
+    def record_weight_state(state_idx: int) -> None:
+        for layer, weight in enumerate(weights):
+            sv = np.linalg.svd(weight, compute_uv=False)
+            sigma1_w[state_idx, layer] = sv[0]
+            sigman_w[state_idx, layer] = sv[-1]
+        losses[state_idx] = compute_loss(weights, x_data, w_target)
 
-sgd_mean_exp_r2 = np.mean(sgd_exp_r2_all)
-sgd_mean_poly_r2 = np.mean(sgd_poly_r2_all)
-muon_mean_exp_r2 = np.mean(muon_exp_r2_all)
-muon_mean_poly_r2 = np.mean(muon_poly_r2_all)
+    record_weight_state(0)
 
-print(f"\n  SUMMARY:")
-print(f"    SGD  mean R^2:  exponential={sgd_mean_exp_r2:.4f}   polynomial={sgd_mean_poly_r2:.4f}   "
-      f"=> {'EXPONENTIAL' if sgd_mean_exp_r2 > sgd_mean_poly_r2 else 'POLYNOMIAL'} fits better")
-print(f"    Muon mean R^2:  exponential={muon_mean_exp_r2:.4f}   polynomial={muon_mean_poly_r2:.4f}   "
-      f"=> {'EXPONENTIAL' if muon_mean_exp_r2 > muon_mean_poly_r2 else 'POLYNOMIAL'} fits better")
+    for state_idx in range(num_steps):
+        diagnostics = compute_optimizer_diagnostics(
+            optimizer_name=optimizer_name,
+            weights=weights,
+            velocities=velocities,
+            x_data=x_data,
+            w_target=w_target,
+            config=config,
+        )
+        raw_grad_sigma1[state_idx] = diagnostics["raw_grad_sigma1"]
+        transformed_grad_sigma1[state_idx] = diagnostics["transformed_grad_sigma1"]
+        update_sigma1[state_idx] = diagnostics["update_sigma1"]
+        weight_raw_grad_alignment[state_idx] = diagnostics["weight_raw_grad_alignment"]
+        weight_update_alignment[state_idx] = diagnostics["weight_update_alignment"]
 
+        velocities = [update.copy() for update in diagnostics["updates"]]
+        weights = [weight - lr * update for weight, update in zip(weights, velocities)]
+        record_weight_state(state_idx + 1)
 
-# =============================================================================
-# ANALYSIS 2: Condition Number (sigma_1 / sigma_n) Over Training
-# =============================================================================
+        if np.isnan(losses[state_idx + 1]) or losses[state_idx + 1] > 1e10:
+            diverged_at_step = state_idx + 1
+            if verbose:
+                print(f"    WARNING: {optimizer_name} diverged at state {diverged_at_step}")
+            break
 
-print(f"\n\n{'=' * 100}")
-print("TABLE 2: CONDITION NUMBER sigma_1/sigma_n PER LAYER AT KEY STEPS")
-print("=" * 100)
+    final_state_index = num_steps if diverged_at_step is None else diverged_at_step
+    final_diagnostics = compute_optimizer_diagnostics(
+        optimizer_name=optimizer_name,
+        weights=weights,
+        velocities=velocities,
+        x_data=x_data,
+        w_target=w_target,
+        config=config,
+    )
+    raw_grad_sigma1[final_state_index] = final_diagnostics["raw_grad_sigma1"]
+    transformed_grad_sigma1[final_state_index] = final_diagnostics["transformed_grad_sigma1"]
+    update_sigma1[final_state_index] = final_diagnostics["update_sigma1"]
+    weight_raw_grad_alignment[final_state_index] = final_diagnostics["weight_raw_grad_alignment"]
+    weight_update_alignment[final_state_index] = final_diagnostics["weight_update_alignment"]
 
-report_steps = [0, 50, 100, 200, 300, 500]
+    final_sv_spectrum = np.stack([np.linalg.svd(weight, compute_uv=False) for weight in weights], axis=0)
 
-print(f"\n  {'Step':>6} | ", end="")
-for layer in range(NUM_LAYERS):
-    print(f"{'SGD L' + str(layer):>10} {'Muon L' + str(layer):>10} | ", end="")
-print()
-print("  " + "-" * (8 + (22 + 3) * NUM_LAYERS))
-
-for step in report_steps:
-    if step > NUM_STEPS:
-        continue
-    print(f"  {step:6d} | ", end="")
-    for layer in range(NUM_LAYERS):
-        s1_sgd = results_sgd['sigma1_W'][step, layer]
-        sn_sgd = results_sgd['sigman_W'][step, layer]
-        kappa_sgd = s1_sgd / sn_sgd if sn_sgd > 1e-15 else np.inf
-
-        s1_muon = results_muon['sigma1_W'][step, layer]
-        sn_muon = results_muon['sigman_W'][step, layer]
-        kappa_muon = s1_muon / sn_muon if sn_muon > 1e-15 else np.inf
-
-        k_sgd_str = f"{kappa_sgd:10.2f}" if np.isfinite(kappa_sgd) else f"{'inf':>10}"
-        k_muon_str = f"{kappa_muon:10.2f}" if np.isfinite(kappa_muon) else f"{'inf':>10}"
-        print(f"{k_sgd_str} {k_muon_str} | ", end="")
-    print()
+    return {
+        "optimizer_name": optimizer_name,
+        "lr": float(lr),
+        "sigma1_W": sigma1_w,
+        "sigman_W": sigman_w,
+        "losses": losses,
+        "raw_grad_sigma1": raw_grad_sigma1,
+        "transformed_grad_sigma1": transformed_grad_sigma1,
+        "update_sigma1": update_sigma1,
+        "weight_raw_grad_alignment": weight_raw_grad_alignment,
+        "weight_update_alignment": weight_update_alignment,
+        "final_sv_spectrum": final_sv_spectrum,
+        "diverged_at_step": diverged_at_step,
+        "metric_notes": {
+            "sigma1_W": "Top singular value of the layer weight at state t (after t updates).",
+            "sigman_W": "Bottom singular value of the layer weight at state t (after t updates).",
+            "raw_grad_sigma1": "Top singular value of the raw backprop gradient evaluated at the same state t.",
+            "transformed_grad_sigma1": (
+                "Top singular value of the optimizer-transformed gradient evaluated at the same state t. "
+                "For SGD this equals the raw gradient; for Muon it is the Newton-Schulz orthogonalized gradient."
+            ),
+            "update_sigma1": (
+                "Top singular value of the actual momentum update v_t = m v_{t-1} + transformed_grad_t, "
+                "evaluated at the same state t before applying the next parameter update."
+            ),
+            "weight_raw_grad_alignment": (
+                "Mean absolute overlap of the top left/right singular vectors of W and the raw gradient at the same state t."
+            ),
+            "weight_update_alignment": (
+                "Mean absolute overlap of the top left/right singular vectors of W and the actual momentum update at the same state t."
+            ),
+        },
+    }
 
 
 # =============================================================================
-# ANALYSIS 3: Gini Coefficient of SV Spectrum at Step 500
+# SUMMARY ANALYSIS
 # =============================================================================
 
-print(f"\n\n{'=' * 100}")
-print("TABLE 3: GINI COEFFICIENT OF SINGULAR VALUE SPECTRUM AT STEP 500")
-print("  Gini = 0: all SVs equal (isotropic). Gini -> 1: one SV dominates (anisotropic).")
-print("=" * 100)
 
-print(f"\n  {'Layer':>6} | {'SGD Gini':>10} | {'Muon Gini':>11} | {'SGD-Muon':>10}")
-print("  " + "-" * 50)
+def build_optimizer_summary(
+    optimizer_results: Dict[str, Any],
+    steps: np.ndarray,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compute fits, Gini summaries, scalar proxy summaries, and alignment summaries."""
+    num_layers = config["num_layers"]
+    corr_start_step = config["corr_start_step"]
+    report_steps = [step for step in config["report_steps"] if step <= config["num_steps"]]
 
-sgd_gini_all = []
-muon_gini_all = []
+    fit_by_layer = []
+    exp_r2_all = []
+    poly_r2_all = []
+    exp_slope_all = []
+    poly_exponent_all = []
+    fit_r2_gap_all = []
 
-for layer in range(NUM_LAYERS):
-    sgd_gini = gini_coefficient(results_sgd['final_sv_spectrum'][layer])
-    muon_gini = gini_coefficient(results_muon['final_sv_spectrum'][layer])
-    sgd_gini_all.append(sgd_gini)
-    muon_gini_all.append(muon_gini)
-    print(f"  {layer:6d} | {sgd_gini:10.4f} | {muon_gini:11.4f} | {sgd_gini - muon_gini:+10.4f}")
+    for layer in range(num_layers):
+        log_sigma1 = np.log(optimizer_results["sigma1_W"][:, layer] + 1e-30)
+        exp_a, exp_b, exp_r2 = fit_exponential(steps, log_sigma1)
+        poly_a, poly_b, poly_r2 = fit_polynomial(steps, log_sigma1)
+        r2_gap = float(exp_r2 - poly_r2)
+        exp_r2_all.append(exp_r2)
+        poly_r2_all.append(poly_r2)
+        exp_slope_all.append(exp_a)
+        poly_exponent_all.append(poly_a)
+        fit_r2_gap_all.append(r2_gap)
+        fit_by_layer.append({
+            "layer": layer,
+            "exp_a": exp_a,
+            "exp_b": exp_b,
+            "exp_r2": exp_r2,
+            "poly_a": poly_a,
+            "poly_b": poly_b,
+            "poly_r2": poly_r2,
+            "r2_gap_exp_minus_poly": r2_gap,
+            "best_fit": "exponential" if exp_r2 > poly_r2 else "polynomial",
+        })
 
-sgd_mean_gini = np.mean(sgd_gini_all)
-muon_mean_gini = np.mean(muon_gini_all)
-print("  " + "-" * 50)
-print(f"  {'MEAN':>6} | {sgd_mean_gini:10.4f} | {muon_mean_gini:11.4f} | {sgd_mean_gini - muon_mean_gini:+10.4f}")
+    gini_by_layer = [
+        gini_coefficient(optimizer_results["final_sv_spectrum"][layer])
+        for layer in range(num_layers)
+    ]
+
+    lagged_proxy_sigma1 = np.full_like(optimizer_results["raw_grad_sigma1"], np.nan)
+    lagged_proxy_sigma1[0] = optimizer_results["raw_grad_sigma1"][0]
+    lagged_proxy_sigma1[1:] = optimizer_results["raw_grad_sigma1"][:-1]
+    lagged_corr_proxy_by_layer = []
+    for layer in range(num_layers):
+        corr_value = safe_corrcoef(
+            optimizer_results["sigma1_W"][corr_start_step:, layer],
+            lagged_proxy_sigma1[corr_start_step:, layer],
+        )
+        lagged_corr_proxy_by_layer.append(corr_value)
+
+    same_state_raw_grad_corr_by_layer = []
+    for layer in range(num_layers):
+        corr_value = safe_corrcoef(
+            optimizer_results["sigma1_W"][corr_start_step:, layer],
+            optimizer_results["raw_grad_sigma1"][corr_start_step:, layer],
+        )
+        same_state_raw_grad_corr_by_layer.append(corr_value)
+
+    raw_grad_alignment_by_layer = safe_columnwise_nanmean(
+        optimizer_results["weight_raw_grad_alignment"][corr_start_step:]
+    )
+    update_alignment_by_layer = safe_columnwise_nanmean(
+        optimizer_results["weight_update_alignment"][corr_start_step:]
+    )
+    update_minus_raw_alignment_by_layer = update_alignment_by_layer - raw_grad_alignment_by_layer
+
+    sigma1_key_steps = {
+        str(step): optimizer_results["sigma1_W"][step].tolist() for step in report_steps
+    }
+    condition_number_key_steps = {
+        str(step): (
+            optimizer_results["sigma1_W"][step] / np.maximum(optimizer_results["sigman_W"][step], 1e-15)
+        ).tolist()
+        for step in report_steps
+    }
+
+    exp_r2_stats = summarize_finite_vector(np.asarray(exp_r2_all))
+    poly_r2_stats = summarize_finite_vector(np.asarray(poly_r2_all))
+    exp_slope_stats = summarize_finite_vector(np.asarray(exp_slope_all))
+    poly_exponent_stats = summarize_finite_vector(np.asarray(poly_exponent_all))
+    fit_r2_gap_stats = summarize_finite_vector(np.asarray(fit_r2_gap_all))
+    raw_grad_alignment_stats = summarize_finite_vector(raw_grad_alignment_by_layer)
+    update_alignment_stats = summarize_finite_vector(update_alignment_by_layer)
+    update_minus_raw_alignment_stats = summarize_finite_vector(update_minus_raw_alignment_by_layer)
+
+    fit_means = {
+        "exp_r2_mean": exp_r2_stats["mean"],
+        "poly_r2_mean": poly_r2_stats["mean"],
+        "exp_slope_mean": exp_slope_stats["mean"],
+        "poly_exponent_mean": poly_exponent_stats["mean"],
+        "r2_gap_exp_minus_poly_mean": fit_r2_gap_stats["mean"],
+        "best_fit_by_mean": "exponential"
+        if exp_r2_stats["mean"] > poly_r2_stats["mean"]
+        else "polynomial",
+    }
+    fit_uncertainty = {
+        "exp_r2": exp_r2_stats,
+        "poly_r2": poly_r2_stats,
+        "exp_slope": exp_slope_stats,
+        "poly_exponent": poly_exponent_stats,
+        "r2_gap_exp_minus_poly": fit_r2_gap_stats,
+        "layers_preferring_exponential": int(sum(row["best_fit"] == "exponential" for row in fit_by_layer)),
+        "layers_preferring_polynomial": int(sum(row["best_fit"] == "polynomial" for row in fit_by_layer)),
+    }
+    alignment_uncertainty = {
+        "weight_raw_grad_alignment": raw_grad_alignment_stats,
+        "weight_update_alignment": update_alignment_stats,
+        "weight_update_minus_raw_alignment": update_minus_raw_alignment_stats,
+    }
+
+    return {
+        "fit_by_layer": fit_by_layer,
+        "fit_means": fit_means,
+        "fit_uncertainty": fit_uncertainty,
+        "alignment_uncertainty": alignment_uncertainty,
+        "gini_by_layer": gini_by_layer,
+        "gini_mean": safe_scalar_nanmean(np.asarray(gini_by_layer)),
+        "lagged_corr_proxy_by_layer": lagged_corr_proxy_by_layer,
+        "lagged_corr_proxy_mean": safe_scalar_nanmean(np.asarray(lagged_corr_proxy_by_layer)),
+        "same_state_raw_grad_corr_by_layer": same_state_raw_grad_corr_by_layer,
+        "same_state_raw_grad_corr_mean": safe_scalar_nanmean(np.asarray(same_state_raw_grad_corr_by_layer)),
+        "weight_raw_grad_alignment_by_layer_mean": raw_grad_alignment_by_layer.tolist(),
+        "weight_raw_grad_alignment_mean": safe_scalar_nanmean(raw_grad_alignment_by_layer),
+        "weight_update_alignment_by_layer_mean": update_alignment_by_layer.tolist(),
+        "weight_update_alignment_mean": safe_scalar_nanmean(update_alignment_by_layer),
+        "weight_update_minus_raw_alignment_by_layer_mean": update_minus_raw_alignment_by_layer.tolist(),
+        "weight_update_minus_raw_alignment_mean": safe_scalar_nanmean(update_minus_raw_alignment_by_layer),
+        "loss_initial": float(optimizer_results["losses"][0]),
+        "loss_final": float(optimizer_results["losses"][-1]),
+        "sigma1_key_steps": sigma1_key_steps,
+        "condition_number_key_steps": condition_number_key_steps,
+    }
 
 
-# =============================================================================
-# ANALYSIS 4: Correlation between sigma_1(G_i) and sigma_1(W_i)
-# =============================================================================
+def build_summary(results: Dict[str, Any]) -> Dict[str, Any]:
+    """Create optimizer summaries and calibrated verdict components."""
+    config = results["config"]
+    steps = results["steps"]
 
-print(f"\n\n{'=' * 100}")
-print("TABLE 4: CORRELATION corr(sigma_1(G), sigma_1(W)) PER LAYER")
-print("  High correlation = gradient top direction tracks weight top direction = feedback loop ACTIVE")
-print("  Low correlation = gradient spectrum decorrelated from weight spectrum = feedback loop BROKEN")
-print("=" * 100)
+    optimizer_summaries = {
+        name: build_optimizer_summary(opt_results, steps, config)
+        for name, opt_results in results["optimizers"].items()
+    }
 
-# Compute Pearson correlation over the training trajectory for each layer
-# Use steps 10..500 to avoid initialization transients
-start_step = 10
+    sgd = optimizer_summaries["SGD"]
+    muon = optimizer_summaries["Muon"]
 
-print(f"\n  {'Layer':>6} | {'SGD corr':>10} | {'Muon corr':>11} | {'SGD-Muon':>10}")
-print("  " + "-" * 50)
+    test1 = sgd["fit_means"]["exp_r2_mean"] > muon["fit_means"]["exp_r2_mean"]
+    test2 = muon["fit_means"]["poly_r2_mean"] > muon["fit_means"]["exp_r2_mean"]
+    test2b = 0.0 <= muon["fit_means"]["poly_exponent_mean"] < 1.0
+    test3 = sgd["fit_means"]["exp_r2_mean"] > sgd["fit_means"]["poly_r2_mean"]
+    test4 = sgd["lagged_corr_proxy_mean"] > muon["lagged_corr_proxy_mean"]
+    test5 = sgd["gini_mean"] > muon["gini_mean"]
+    direct_alignment_advantage = (
+        sgd["weight_update_alignment_mean"] > muon["weight_update_alignment_mean"]
+    )
+    slope_advantage = sgd["fit_means"]["exp_slope_mean"] > muon["fit_means"]["exp_slope_mean"]
 
-sgd_corr_all = []
-muon_corr_all = []
+    strong_story_supported = bool(test1 and test2 and test2b and test3)
+    weaker_sgd_growth_story_supported = bool(slope_advantage and test5)
 
-for layer in range(NUM_LAYERS):
-    # SGD
-    s1_w_sgd = results_sgd['sigma1_W'][start_step:, layer]
-    s1_g_sgd = results_sgd['sigma1_G'][start_step:, layer]
-    mask_sgd = np.isfinite(s1_w_sgd) & np.isfinite(s1_g_sgd)
-    if np.sum(mask_sgd) > 2:
-        corr_sgd = np.corrcoef(s1_w_sgd[mask_sgd], s1_g_sgd[mask_sgd])[0, 1]
+    sgd_fit_gap_stats = sgd["fit_uncertainty"]["r2_gap_exp_minus_poly"]
+    muon_fit_gap_stats = muon["fit_uncertainty"]["r2_gap_exp_minus_poly"]
+    t3_margin = float(sgd["fit_means"]["exp_r2_mean"] - sgd["fit_means"]["poly_r2_mean"])
+    t3_layer_votes = {
+        "layers_preferring_exponential": sgd["fit_uncertainty"]["layers_preferring_exponential"],
+        "layers_preferring_polynomial": sgd["fit_uncertainty"]["layers_preferring_polynomial"],
+    }
+    t3_diagnostic = {
+        "pass": bool(test3),
+        "mean_r2_gap_exp_minus_poly": t3_margin,
+        "mean_r2_gap_direction": "exponential_better" if t3_margin > 0 else "polynomial_better_or_tied",
+        "layer_vote_counts": t3_layer_votes,
+        "layerwise_r2_gap_summary": sgd_fit_gap_stats,
+        "layerwise_r2_gap_values": [row["r2_gap_exp_minus_poly"] for row in sgd["fit_by_layer"]],
+        "interpretation": (
+            "T3 asks whether SGD's exponential proxy beats its polynomial proxy on mean R^2. "
+            "Negative mean gap means the current run favors the polynomial family instead."
+        ),
+    }
+    alignment_diagnostic = {
+        "SGD": {
+            "weight_raw_grad_alignment": sgd["weight_raw_grad_alignment_mean"],
+            "weight_update_alignment": sgd["weight_update_alignment_mean"],
+            "weight_update_minus_raw_alignment": sgd["weight_update_minus_raw_alignment_mean"],
+            "weight_raw_grad_alignment_summary": sgd["alignment_uncertainty"]["weight_raw_grad_alignment"],
+            "weight_update_alignment_summary": sgd["alignment_uncertainty"]["weight_update_alignment"],
+            "weight_update_minus_raw_alignment_summary": sgd["alignment_uncertainty"]["weight_update_minus_raw_alignment"],
+        },
+        "Muon": {
+            "weight_raw_grad_alignment": muon["weight_raw_grad_alignment_mean"],
+            "weight_update_alignment": muon["weight_update_alignment_mean"],
+            "weight_update_minus_raw_alignment": muon["weight_update_minus_raw_alignment_mean"],
+            "weight_raw_grad_alignment_summary": muon["alignment_uncertainty"]["weight_raw_grad_alignment"],
+            "weight_update_alignment_summary": muon["alignment_uncertainty"]["weight_update_alignment"],
+            "weight_update_minus_raw_alignment_summary": muon["alignment_uncertainty"]["weight_update_minus_raw_alignment"],
+        },
+        "comparison": {
+            "optimizer_with_larger_raw_grad_alignment_mean": (
+                "SGD" if sgd["weight_raw_grad_alignment_mean"] > muon["weight_raw_grad_alignment_mean"] else "Muon"
+            ),
+            "optimizer_with_larger_update_alignment_mean": (
+                "SGD" if sgd["weight_update_alignment_mean"] > muon["weight_update_alignment_mean"] else "Muon"
+            ),
+            "interpretation": (
+                "Direct top-vector overlaps should be read separately from the scalar sigma1 correlation proxies. "
+                "Comparing raw-gradient overlap to update overlap also helps show how momentum and Muon's gradient transformation alter the actual update direction."
+            ),
+        },
+    }
+
+    notes = []
+    if not test3:
+        notes.append(
+            "Within SGD, the polynomial fit beats the exponential fit on mean R^2, so this run does not justify calling SGD sigma_1(W) growth exponential."
+        )
+        if (
+            sgd_fit_gap_stats["ci95_high"] < 0
+            and t3_layer_votes["layers_preferring_exponential"] == 0
+        ):
+            notes.append(
+                "The layerwise SGD T3 diagnostic is uniformly unfavorable to the exponential story in this run: all layers prefer the polynomial family and the descriptive layer-level 95% interval for the SGD R^2 gap stays below zero."
+            )
+    if test2 and not test2b:
+        notes.append(
+            "Muon looks better fit by the polynomial family than the exponential family, but the fitted power-law exponent does not independently justify the word 'sub-linear'."
+        )
+    notes.append(
+        "The retained scalar correlation proxy tracks top-singular-value magnitudes only; it is not a singular-vector alignment metric."
+    )
+    if not direct_alignment_advantage:
+        notes.append(
+            "The small direct W/update top-vector overlap diagnostic does not favor SGD in this run, so the scalar proxy advantage should not be read as directional-alignment evidence."
+        )
+    notes.append(
+        "For Muon, the orthogonalized gradient and the actual momentum update are distinct objects; only the former is approximately spectrum-flattened."
+    )
+
+    if strong_story_supported:
+        overall_label = "toy-scale support for an exponential-vs-slower-growth separation"
+    elif weaker_sgd_growth_story_supported:
+        overall_label = "weaker support only: SGD grows faster / ends more anisotropic, but the strong exponential-self-amplification story is not established"
     else:
-        corr_sgd = np.nan
-    sgd_corr_all.append(corr_sgd)
+        overall_label = "mixed evidence in this deterministic toy setup"
 
-    # Muon
-    s1_w_muon = results_muon['sigma1_W'][start_step:, layer]
-    s1_g_muon = results_muon['sigma1_G'][start_step:, layer]
-    mask_muon = np.isfinite(s1_w_muon) & np.isfinite(s1_g_muon)
-    if np.sum(mask_muon) > 2:
-        corr_muon = np.corrcoef(s1_w_muon[mask_muon], s1_g_muon[mask_muon])[0, 1]
-    else:
-        corr_muon = np.nan
-    muon_corr_all.append(corr_muon)
+    verdict_components = {
+        "T1_sgd_exp_r2_gt_muon_exp_r2": {
+            "pass": bool(test1),
+            "description": "SGD has the larger mean exponential-fit R^2.",
+            "sgd_exp_r2_mean": sgd["fit_means"]["exp_r2_mean"],
+            "muon_exp_r2_mean": muon["fit_means"]["exp_r2_mean"],
+        },
+        "T2_muon_poly_r2_gt_muon_exp_r2": {
+            "pass": bool(test2),
+            "description": "Muon is better fit by the polynomial/power-law family than by the exponential family.",
+            "muon_poly_r2_mean": muon["fit_means"]["poly_r2_mean"],
+            "muon_exp_r2_mean": muon["fit_means"]["exp_r2_mean"],
+        },
+        "T2b_muon_poly_exponent_in_[0,1)": {
+            "pass": bool(test2b),
+            "description": "Muon's mean fitted power-law exponent is in the sub-linear range [0, 1).",
+            "muon_poly_exponent_mean": muon["fit_means"]["poly_exponent_mean"],
+        },
+        "T3_sgd_exp_r2_gt_sgd_poly_r2": {
+            "pass": bool(test3),
+            "description": "Within SGD, the exponential family beats the polynomial family on mean R^2.",
+            "sgd_exp_r2_mean": sgd["fit_means"]["exp_r2_mean"],
+            "sgd_poly_r2_mean": sgd["fit_means"]["poly_r2_mean"],
+            "sgd_r2_gap_exp_minus_poly_mean": sgd["fit_means"]["r2_gap_exp_minus_poly_mean"],
+            "sgd_layers_preferring_exponential": sgd["fit_uncertainty"]["layers_preferring_exponential"],
+            "sgd_layers_preferring_polynomial": sgd["fit_uncertainty"]["layers_preferring_polynomial"],
+        },
+        "T4_sgd_lagged_scalar_proxy_corr_gt_muon": {
+            "pass": bool(test4),
+            "description": "SGD has the larger retained lagged scalar proxy corr(sigma1(raw grad used for step t), sigma1(W_t)).",
+            "sgd_lagged_corr_proxy_mean": sgd["lagged_corr_proxy_mean"],
+            "muon_lagged_corr_proxy_mean": muon["lagged_corr_proxy_mean"],
+        },
+        "T5_sgd_final_gini_gt_muon": {
+            "pass": bool(test5),
+            "description": "SGD ends with the more unequal final singular-value spectrum on average.",
+            "sgd_gini_mean": sgd["gini_mean"],
+            "muon_gini_mean": muon["gini_mean"],
+        },
+        "D1_sgd_update_alignment_gt_muon": {
+            "pass": bool(direct_alignment_advantage),
+            "description": "Small direct directional diagnostic: SGD has the larger mean top-singular-vector overlap between W and the actual momentum update.",
+            "sgd_weight_update_alignment_mean": sgd["weight_update_alignment_mean"],
+            "muon_weight_update_alignment_mean": muon["weight_update_alignment_mean"],
+        },
+        "D2_sgd_exp_slope_gt_muon": {
+            "pass": bool(slope_advantage),
+            "description": "SGD has the larger mean slope in the exponential proxy fit log(sigma1) = a t + b.",
+            "sgd_exp_slope_mean": sgd["fit_means"]["exp_slope_mean"],
+            "muon_exp_slope_mean": muon["fit_means"]["exp_slope_mean"],
+        },
+    }
 
-    print(f"  {layer:6d} | {corr_sgd:10.4f} | {corr_muon:11.4f} | {corr_sgd - corr_muon:+10.4f}")
+    assessment = {
+        "overall_label": overall_label,
+        "supports_weaker_sgd_growth_story": weaker_sgd_growth_story_supported,
+        "supports_strong_exponential_self_amplification_story": strong_story_supported,
+        "notes": notes,
+    }
 
-sgd_mean_corr = np.nanmean(sgd_corr_all)
-muon_mean_corr = np.nanmean(muon_corr_all)
-print("  " + "-" * 50)
-print(f"  {'MEAN':>6} | {sgd_mean_corr:10.4f} | {muon_mean_corr:11.4f} | {sgd_mean_corr - muon_mean_corr:+10.4f}")
+    comparative_fit_summary = {
+        "SGD": {
+            "exp_r2": sgd["fit_uncertainty"]["exp_r2"],
+            "poly_r2": sgd["fit_uncertainty"]["poly_r2"],
+            "r2_gap_exp_minus_poly": sgd_fit_gap_stats,
+        },
+        "Muon": {
+            "exp_r2": muon["fit_uncertainty"]["exp_r2"],
+            "poly_r2": muon["fit_uncertainty"]["poly_r2"],
+            "r2_gap_exp_minus_poly": muon_fit_gap_stats,
+        },
+    }
+
+    return {
+        "optimizer_summaries": optimizer_summaries,
+        "verdict_components": verdict_components,
+        "assessment": assessment,
+        "comparative_fit_summary": comparative_fit_summary,
+        "t3_diagnostic": t3_diagnostic,
+        "alignment_diagnostic": alignment_diagnostic,
+        "metric_caveats": {
+            "lagged_scalar_proxy": (
+                "corr( sigma1(raw gradient used for the update into W_t), sigma1(W_t) ). This is retained for continuity with the original script but is not a singular-vector alignment measure."
+            ),
+            "same_state_raw_grad_corr": (
+                "corr( sigma1(raw gradient at state t), sigma1(W_t) ). This is a same-state scalar magnitude proxy, still not a direction measure."
+            ),
+            "direct_alignment": (
+                "Mean absolute overlap of top left/right singular vectors between W and either the raw gradient or the actual momentum update at the same state."
+            ),
+        },
+    }
 
 
 # =============================================================================
-# ANALYSIS 5: sigma_1 Trajectory Summary
+# PUBLIC RUN FUNCTION
 # =============================================================================
 
-print(f"\n\n{'=' * 100}")
-print("TABLE 5: sigma_1(W) VALUES AT KEY STEPS")
-print("=" * 100)
 
-print(f"\n  {'Step':>6} | ", end="")
-for layer in range(NUM_LAYERS):
-    print(f"{'SGD L' + str(layer):>8} {'Muon L' + str(layer):>8} | ", end="")
-print()
-print("  " + "-" * (8 + (18 + 3) * NUM_LAYERS))
+def run_experiment(config: Dict[str, Any] | None = None, *, verbose: bool = True) -> Dict[str, Any]:
+    """Run the full default toy experiment and return structured results."""
+    merged_config = merge_config(config)
+    start_time = time.time()
 
-for step in report_steps:
-    if step > NUM_STEPS:
-        continue
-    print(f"  {step:6d} | ", end="")
-    for layer in range(NUM_LAYERS):
-        s1_sgd = results_sgd['sigma1_W'][step, layer]
-        s1_muon = results_muon['sigma1_W'][step, layer]
-        print(f"{s1_sgd:8.3f} {s1_muon:8.3f} | ", end="")
-    print()
+    if verbose:
+        print("=" * 100)
+        print("1.3b-i-A: sigma_1(W) GROWTH UNDER SGD VS MUON")
+        print("=" * 100)
+        print("Scope: deterministic single-seed deep-linear toy study.")
+        print("Caveat: scalar sigma_1 correlation proxies are not singular-vector alignment measures.")
+        print(
+            f"Config: dim={merged_config['dim']}, layers={merged_config['num_layers']}, "
+            f"steps={merged_config['num_steps']}, batch={merged_config['batch_size']}, seed={merged_config['seed']}"
+        )
+
+    problem = build_problem(merged_config)
+    lr_sgd = find_stable_lr_sgd(merged_config, problem["X_data"], problem["W_target"])
+    lr_muon = float(merged_config["lr_muon"])
+
+    if verbose:
+        print(f"Chosen learning rates: SGD={lr_sgd}, Muon={lr_muon}")
+        print(f"Initial target condition number: {problem['target_condition_number']:.4f}")
+        print("Running SGD...")
+
+    results_sgd = measure_optimizer_run(
+        optimizer_name="SGD",
+        lr=lr_sgd,
+        config=merged_config,
+        x_data=problem["X_data"],
+        w_target=problem["W_target"],
+        verbose=verbose,
+    )
+
+    if verbose:
+        print("Running Muon...")
+
+    results_muon = measure_optimizer_run(
+        optimizer_name="Muon",
+        lr=lr_muon,
+        config=merged_config,
+        x_data=problem["X_data"],
+        w_target=problem["W_target"],
+        verbose=verbose,
+    )
+
+    results = {
+        "config": merged_config,
+        "steps": np.arange(merged_config["num_steps"] + 1),
+        "problem": {
+            "target_spectrum": problem["target_spectrum"],
+            "target_fro_norm": problem["target_fro_norm"],
+            "target_condition_number": problem["target_condition_number"],
+            "input_mean_abs": problem["input_mean_abs"],
+            "input_std": problem["input_std"],
+            "W_target": problem["W_target"],
+            "X_data": problem["X_data"],
+        },
+        "learning_rates": {"SGD": lr_sgd, "Muon": lr_muon},
+        "optimizers": {"SGD": results_sgd, "Muon": results_muon},
+    }
+    results["summary"] = build_summary(results)
+    results["runtime_seconds"] = float(time.time() - start_time)
+    return results
 
 
 # =============================================================================
-# ANALYSIS 6: log(sigma_1) growth rate (slope of log(s1) vs t)
+# PLOTTING / SAVING / REPORTING
 # =============================================================================
 
-print(f"\n\n{'=' * 100}")
-print("TABLE 6: GROWTH RATE d(log sigma_1)/dt  (exponential fit slope)")
-print("  Positive = sigma_1 growing. Larger magnitude = faster growth.")
-print("=" * 100)
 
-print(f"\n  {'Layer':>6} | {'SGD slope':>12} | {'Muon slope':>12} | {'Ratio SGD/Muon':>15}")
-print("  " + "-" * 55)
-
-sgd_slopes = []
-muon_slopes = []
-
-for layer in range(NUM_LAYERS):
-    log_s1_sgd = np.log(results_sgd['sigma1_W'][:, layer] + 1e-30)
-    a_sgd, _, _ = fit_exponential(steps, log_s1_sgd)
-    sgd_slopes.append(a_sgd)
-
-    log_s1_muon = np.log(results_muon['sigma1_W'][:, layer] + 1e-30)
-    a_muon, _, _ = fit_exponential(steps, log_s1_muon)
-    muon_slopes.append(a_muon)
-
-    ratio = a_sgd / a_muon if abs(a_muon) > 1e-10 else np.inf
-    ratio_str = f"{ratio:15.2f}" if np.isfinite(ratio) else f"{'N/A':>15}"
-    print(f"  {layer:6d} | {a_sgd:12.6f} | {a_muon:12.6f} | {ratio_str}")
-
-sgd_mean_slope = np.mean(sgd_slopes)
-muon_mean_slope = np.mean(muon_slopes)
-ratio_mean = sgd_mean_slope / muon_mean_slope if abs(muon_mean_slope) > 1e-10 else np.inf
-ratio_str = f"{ratio_mean:15.2f}" if np.isfinite(ratio_mean) else f"{'N/A':>15}"
-print("  " + "-" * 55)
-print(f"  {'MEAN':>6} | {sgd_mean_slope:12.6f} | {muon_mean_slope:12.6f} | {ratio_str}")
+def rolling_corr_series(x: np.ndarray, y: np.ndarray, window: int) -> np.ndarray:
+    """Rolling correlation series with NaN where undefined."""
+    if len(x) != len(y):
+        raise ValueError("rolling_corr_series expects arrays with the same length")
+    out = np.full(len(x) - window + 1, np.nan, dtype=float)
+    for idx in range(window - 1, len(x)):
+        x_slice = x[idx - window + 1: idx + 1]
+        y_slice = y[idx - window + 1: idx + 1]
+        out[idx - window + 1] = safe_corrcoef(x_slice, y_slice)
+    return out
 
 
-# =============================================================================
-# PLOT: log(sigma_1) vs step
-# =============================================================================
+def make_plots(
+    results: Dict[str, Any],
+    output_dir: Path | str | None = None,
+    filename: str = "sigma1_growth_rate.png",
+    *,
+    show: bool = False,
+):
+    """Generate a summary figure. Returns (fig, save_path_or_None)."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None, None
 
-print(f"\n\n{'=' * 100}")
-print("GENERATING PLOTS")
-print("=" * 100)
+    config = results["config"]
+    steps = results["steps"]
+    sgd = results["optimizers"]["SGD"]
+    muon = results["optimizers"]["Muon"]
 
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    proxy_sgd = np.full_like(sgd["raw_grad_sigma1"], np.nan)
+    proxy_muon = np.full_like(muon["raw_grad_sigma1"], np.nan)
+    proxy_sgd[0] = sgd["raw_grad_sigma1"][0]
+    proxy_muon[0] = muon["raw_grad_sigma1"][0]
+    proxy_sgd[1:] = sgd["raw_grad_sigma1"][:-1]
+    proxy_muon[1:] = muon["raw_grad_sigma1"][:-1]
 
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-    fig.suptitle('1.3b-i-A: Feedback Measure -- sigma_1(W) Growth Rate\n'
-                 f'{NUM_LAYERS}-layer linear net, dim={DIM}, {NUM_STEPS} steps',
-                 fontsize=14, fontweight='bold')
+    fig, axes = plt.subplots(2, 3, figsize=(20, 11))
+    fig.suptitle(
+        "1.3b-i-A: sigma_1(W) growth under SGD vs Muon\n"
+        "Deterministic deep-linear toy study; scalar correlation panel is a magnitude proxy, not vector alignment",
+        fontsize=13,
+        fontweight="bold",
+    )
 
-    colors_sgd = ['#1f77b4', '#4a9fd4', '#7ec7f0', '#a8d8f8']
-    colors_muon = ['#d62728', '#e74c3c', '#f08080', '#f4a6a6']
+    colors = {"SGD": "#1f77b4", "Muon": "#d62728"}
 
-    # --- Panel (a): log(sigma_1) vs step ---
+    # (a) log sigma1(W)
     ax = axes[0, 0]
-    ax.set_title('(a) log(sigma_1(W)) vs Step')
-    for layer in range(NUM_LAYERS):
-        log_s1_sgd = np.log(results_sgd['sigma1_W'][:, layer] + 1e-30)
-        log_s1_muon = np.log(results_muon['sigma1_W'][:, layer] + 1e-30)
-        ax.plot(steps, log_s1_sgd, color=colors_sgd[layer % len(colors_sgd)],
-                linewidth=1.5, label=f'SGD L{layer}' if layer == 0 else None, alpha=0.7)
-        ax.plot(steps, log_s1_muon, color=colors_muon[layer % len(colors_muon)],
-                linewidth=1.5, label=f'Muon L{layer}' if layer == 0 else None,
-                linestyle='--', alpha=0.7)
-    # Plot mean with bold lines
-    sgd_mean_log_s1 = np.mean(np.log(results_sgd['sigma1_W'] + 1e-30), axis=1)
-    muon_mean_log_s1 = np.mean(np.log(results_muon['sigma1_W'] + 1e-30), axis=1)
-    ax.plot(steps, sgd_mean_log_s1, 'b-', linewidth=3, label='SGD (mean)')
-    ax.plot(steps, muon_mean_log_s1, 'r--', linewidth=3, label='Muon (mean)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('log(sigma_1)')
+    ax.set_title("(a) log sigma_1(W) trajectories")
+    for layer in range(config["num_layers"]):
+        ax.plot(steps, np.log(sgd["sigma1_W"][:, layer] + 1e-30), color=colors["SGD"], alpha=0.25)
+        ax.plot(steps, np.log(muon["sigma1_W"][:, layer] + 1e-30), color=colors["Muon"], alpha=0.25, linestyle="--")
+    ax.plot(steps, np.mean(np.log(sgd["sigma1_W"] + 1e-30), axis=1), color=colors["SGD"], linewidth=3, label="SGD mean")
+    ax.plot(steps, np.mean(np.log(muon["sigma1_W"] + 1e-30), axis=1), color=colors["Muon"], linewidth=3, linestyle="--", label="Muon mean")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("log(sigma_1)")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (b): sigma_1(W) vs step (linear scale) ---
+    # (b) sigma1(W)
     ax = axes[0, 1]
-    ax.set_title('(b) sigma_1(W) vs Step (linear scale)')
-    for layer in range(NUM_LAYERS):
-        ax.plot(steps, results_sgd['sigma1_W'][:, layer],
-                color=colors_sgd[layer % len(colors_sgd)], linewidth=1.2, alpha=0.7)
-        ax.plot(steps, results_muon['sigma1_W'][:, layer],
-                color=colors_muon[layer % len(colors_muon)], linewidth=1.2, alpha=0.7,
-                linestyle='--')
-    sgd_mean_s1 = np.mean(results_sgd['sigma1_W'], axis=1)
-    muon_mean_s1 = np.mean(results_muon['sigma1_W'], axis=1)
-    ax.plot(steps, sgd_mean_s1, 'b-', linewidth=3, label='SGD (mean)')
-    ax.plot(steps, muon_mean_s1, 'r--', linewidth=3, label='Muon (mean)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('sigma_1(W)')
-    ax.legend(fontsize=9)
+    ax.set_title("(b) sigma_1(W) trajectories")
+    for layer in range(config["num_layers"]):
+        ax.plot(steps, sgd["sigma1_W"][:, layer], color=colors["SGD"], alpha=0.25)
+        ax.plot(steps, muon["sigma1_W"][:, layer], color=colors["Muon"], alpha=0.25, linestyle="--")
+    ax.plot(steps, np.mean(sgd["sigma1_W"], axis=1), color=colors["SGD"], linewidth=3, label="SGD mean")
+    ax.plot(steps, np.mean(muon["sigma1_W"], axis=1), color=colors["Muon"], linewidth=3, linestyle="--", label="Muon mean")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("sigma_1(W)")
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (c): Condition number over time ---
+    # (c) condition number
     ax = axes[0, 2]
-    ax.set_title('(c) Condition Number sigma_1/sigma_n vs Step')
-    for layer in range(NUM_LAYERS):
-        kappa_sgd = results_sgd['sigma1_W'][:, layer] / np.maximum(results_sgd['sigman_W'][:, layer], 1e-15)
-        kappa_muon = results_muon['sigma1_W'][:, layer] / np.maximum(results_muon['sigman_W'][:, layer], 1e-15)
-        ax.semilogy(steps, kappa_sgd, color=colors_sgd[layer % len(colors_sgd)],
-                     linewidth=1.2, alpha=0.7)
-        ax.semilogy(steps, kappa_muon, color=colors_muon[layer % len(colors_muon)],
-                     linewidth=1.2, alpha=0.7, linestyle='--')
-    # Mean condition number
-    kappa_sgd_mean = np.mean(
-        results_sgd['sigma1_W'] / np.maximum(results_sgd['sigman_W'], 1e-15), axis=1)
-    kappa_muon_mean = np.mean(
-        results_muon['sigma1_W'] / np.maximum(results_muon['sigman_W'], 1e-15), axis=1)
-    ax.semilogy(steps, kappa_sgd_mean, 'b-', linewidth=3, label='SGD (mean)')
-    ax.semilogy(steps, kappa_muon_mean, 'r--', linewidth=3, label='Muon (mean)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('Condition Number')
-    ax.legend(fontsize=9)
+    ax.set_title("(c) Mean condition number sigma_1 / sigma_n")
+    kappa_sgd = sgd["sigma1_W"] / np.maximum(sgd["sigman_W"], 1e-15)
+    kappa_muon = muon["sigma1_W"] / np.maximum(muon["sigman_W"], 1e-15)
+    ax.semilogy(steps, np.mean(kappa_sgd, axis=1), color=colors["SGD"], linewidth=3, label="SGD mean")
+    ax.semilogy(steps, np.mean(kappa_muon, axis=1), color=colors["Muon"], linewidth=3, linestyle="--", label="Muon mean")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Condition number")
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (d): corr(sigma_1(G), sigma_1(W)) rolling window ---
+    # (d) rolling lagged scalar proxy
     ax = axes[1, 0]
-    ax.set_title('(d) Rolling corr(sigma_1(G), sigma_1(W))\nwindow=50 steps')
-    window = 50
-    for layer in range(NUM_LAYERS):
-        rolling_corr_sgd = []
-        rolling_corr_muon = []
-        for t in range(window, NUM_STEPS + 1):
-            s1w = results_sgd['sigma1_W'][t - window:t, layer]
-            s1g = results_sgd['sigma1_G'][t - window:t, layer]
-            if np.std(s1w) > 1e-12 and np.std(s1g) > 1e-12:
-                rolling_corr_sgd.append(np.corrcoef(s1w, s1g)[0, 1])
-            else:
-                rolling_corr_sgd.append(0)
-
-            s1w_m = results_muon['sigma1_W'][t - window:t, layer]
-            s1g_m = results_muon['sigma1_G'][t - window:t, layer]
-            if np.std(s1w_m) > 1e-12 and np.std(s1g_m) > 1e-12:
-                rolling_corr_muon.append(np.corrcoef(s1w_m, s1g_m)[0, 1])
-            else:
-                rolling_corr_muon.append(0)
-
-        t_axis = np.arange(window, NUM_STEPS + 1)
-        ax.plot(t_axis, rolling_corr_sgd,
-                color=colors_sgd[layer % len(colors_sgd)], linewidth=1, alpha=0.5)
-        ax.plot(t_axis, rolling_corr_muon,
-                color=colors_muon[layer % len(colors_muon)], linewidth=1, alpha=0.5,
-                linestyle='--')
-
-    # Compute mean rolling corr
-    all_rc_sgd = np.zeros(NUM_STEPS + 1 - window)
-    all_rc_muon = np.zeros(NUM_STEPS + 1 - window)
-    for layer in range(NUM_LAYERS):
-        for idx, t in enumerate(range(window, NUM_STEPS + 1)):
-            s1w = results_sgd['sigma1_W'][t - window:t, layer]
-            s1g = results_sgd['sigma1_G'][t - window:t, layer]
-            if np.std(s1w) > 1e-12 and np.std(s1g) > 1e-12:
-                all_rc_sgd[idx] += np.corrcoef(s1w, s1g)[0, 1]
-            s1w_m = results_muon['sigma1_W'][t - window:t, layer]
-            s1g_m = results_muon['sigma1_G'][t - window:t, layer]
-            if np.std(s1w_m) > 1e-12 and np.std(s1g_m) > 1e-12:
-                all_rc_muon[idx] += np.corrcoef(s1w_m, s1g_m)[0, 1]
-    all_rc_sgd /= NUM_LAYERS
-    all_rc_muon /= NUM_LAYERS
-    t_axis = np.arange(window, NUM_STEPS + 1)
-    ax.plot(t_axis, all_rc_sgd, 'b-', linewidth=3, label='SGD (mean)')
-    ax.plot(t_axis, all_rc_muon, 'r--', linewidth=3, label='Muon (mean)')
-    ax.set_xlabel('Step')
-    ax.set_ylabel('Pearson Correlation')
-    ax.set_ylim(-1.1, 1.1)
-    ax.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
-    ax.legend(fontsize=9)
+    ax.set_title("(d) Rolling lagged scalar proxy corr\nraw grad used for step t vs sigma_1(W_t)")
+    window = min(config["rolling_corr_window"], len(steps))
+    corr_axis = steps[window - 1:]
+    sgd_rolls = []
+    muon_rolls = []
+    for layer in range(config["num_layers"]):
+        sgd_roll = rolling_corr_series(sgd["sigma1_W"][:, layer], proxy_sgd[:, layer], window)
+        muon_roll = rolling_corr_series(muon["sigma1_W"][:, layer], proxy_muon[:, layer], window)
+        sgd_rolls.append(sgd_roll)
+        muon_rolls.append(muon_roll)
+        ax.plot(corr_axis, sgd_roll, color=colors["SGD"], alpha=0.20)
+        ax.plot(corr_axis, muon_roll, color=colors["Muon"], alpha=0.20, linestyle="--")
+    ax.plot(corr_axis, np.nanmean(np.vstack(sgd_rolls), axis=0), color=colors["SGD"], linewidth=3, label="SGD mean")
+    ax.plot(corr_axis, np.nanmean(np.vstack(muon_rolls), axis=0), color=colors["Muon"], linewidth=3, linestyle="--", label="Muon mean")
+    ax.axhline(0.0, color="gray", linestyle=":", alpha=0.6)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Rolling corr")
+    ax.set_ylim(-1.05, 1.05)
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # --- Panel (e): Gini coefficient over time ---
+    # (e) loss
     ax = axes[1, 1]
-    ax.set_title('(e) Gini Coefficient of SV Spectrum vs Step')
-    # Compute Gini at every 10 steps
-    gini_steps = np.arange(0, NUM_STEPS + 1, 10)
-    sgd_gini_ts = np.zeros((len(gini_steps), NUM_LAYERS))
-    muon_gini_ts = np.zeros((len(gini_steps), NUM_LAYERS))
+    ax.set_title("(e) Loss vs step")
+    ax.semilogy(steps, sgd["losses"], color=colors["SGD"], linewidth=2.5, label="SGD")
+    ax.semilogy(steps, muon["losses"], color=colors["Muon"], linewidth=2.5, linestyle="--", label="Muon")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
-    # We need to re-run to get full SV spectra at intermediate steps
-    # Instead, approximate Gini from sigma1/sigman ratio
-    # Actually, we only stored sigma1 and sigman, not full spectrum at each step.
-    # We can compute Gini from just sigma1 and sigman as an approximation,
-    # or we use the tracked data more cleverly.
-    # For a cleaner approach: plot sigma1/mean_sigma as a measure of anisotropy
-    # which is related to Gini. We have sigma1 and sigman tracked.
-    # Let's just plot sigma1/sigman (condition number) which captures the spread.
-    # But we already did that in panel (c). Instead let's plot the loss curves.
-    ax_loss = ax
-    ax_loss.set_title('(e) Loss vs Step')
-    ax_loss.semilogy(steps, results_sgd['losses'], 'b-', linewidth=2.5, label='SGD')
-    ax_loss.semilogy(steps, results_muon['losses'], 'r--', linewidth=2.5, label='Muon')
-    ax_loss.set_xlabel('Step')
-    ax_loss.set_ylabel('Loss')
-    ax_loss.legend(fontsize=9)
-    ax_loss.grid(True, alpha=0.3)
-
-    # --- Panel (f): Final SV spectrum bar chart ---
+    # (f) final singular spectra
     ax = axes[1, 2]
-    ax.set_title(f'(f) Final SV Spectrum (Layer 0, step {NUM_STEPS})')
-    sv_sgd_l0 = results_sgd['final_sv_spectrum'][0]
-    sv_muon_l0 = results_muon['final_sv_spectrum'][0]
-    x_idx = np.arange(DIM)
-    width = 0.35
-    ax.bar(x_idx - width / 2, sv_sgd_l0, width, color='blue', alpha=0.6, label='SGD')
-    ax.bar(x_idx + width / 2, sv_muon_l0, width, color='red', alpha=0.6, label='Muon')
-    ax.set_xlabel('Singular Value Index')
-    ax.set_ylabel('Singular Value')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_title("(f) Final singular-value spectra\nmean across layers")
+    sv_idx = np.arange(1, config["dim"] + 1)
+    ax.plot(sv_idx, np.mean(sgd["final_sv_spectrum"], axis=0), color=colors["SGD"], linewidth=2.5, marker="o", markersize=3, label="SGD mean spectrum")
+    ax.plot(sv_idx, np.mean(muon["final_sv_spectrum"], axis=0), color=colors["Muon"], linewidth=2.5, linestyle="--", marker="s", markersize=3, label="Muon mean spectrum")
+    ax.set_xlabel("Singular value index")
+    ax.set_ylabel("Singular value")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plot_path = os.path.join(SCRIPT_DIR, 'sigma1_growth_rate.png')
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\n  Plot saved to: {plot_path}")
 
-except ImportError:
-    print("\n  WARNING: matplotlib not available, skipping plots.")
-    plot_path = None
+    save_path = None
+    if output_dir is not None:
+        save_dir = Path(output_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_path = save_dir / filename
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
+    if show:
+        plt.show()
+
+    return fig, save_path
+
+
+def save_results_artifacts(
+    results: Dict[str, Any],
+    output_dir: Path | str,
+    plot_path: Path | None = None,
+) -> Dict[str, Any]:
+    """Save structured summary JSON and compressed raw-array NPZ artifacts."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_json_path = output_dir / "sigma1_growth_rate_summary.json"
+    raw_npz_path = output_dir / "sigma1_growth_rate_raw.npz"
+
+    summary_payload = {
+        "config": results["config"],
+        "learning_rates": results["learning_rates"],
+        "runtime_seconds": results["runtime_seconds"],
+        "problem": {
+            "target_spectrum": results["problem"]["target_spectrum"],
+            "target_fro_norm": results["problem"]["target_fro_norm"],
+            "target_condition_number": results["problem"]["target_condition_number"],
+            "input_mean_abs": results["problem"]["input_mean_abs"],
+            "input_std": results["problem"]["input_std"],
+        },
+        "summary": results["summary"],
+        "artifact_paths": {
+            "plot": plot_path,
+            "summary_json": summary_json_path,
+            "raw_npz": raw_npz_path,
+        },
+    }
+    summary_json_path.write_text(json.dumps(to_serializable(summary_payload), indent=2))
+
+    npz_payload: Dict[str, Any] = {
+        "steps": results["steps"],
+        "W_target": results["problem"]["W_target"],
+        "X_data": results["problem"]["X_data"],
+        "target_spectrum": results["problem"]["target_spectrum"],
+    }
+    for name, optimizer_results in results["optimizers"].items():
+        prefix = name.lower()
+        npz_payload[f"{prefix}_sigma1_W"] = optimizer_results["sigma1_W"]
+        npz_payload[f"{prefix}_sigman_W"] = optimizer_results["sigman_W"]
+        npz_payload[f"{prefix}_losses"] = optimizer_results["losses"]
+        npz_payload[f"{prefix}_raw_grad_sigma1"] = optimizer_results["raw_grad_sigma1"]
+        npz_payload[f"{prefix}_transformed_grad_sigma1"] = optimizer_results["transformed_grad_sigma1"]
+        npz_payload[f"{prefix}_update_sigma1"] = optimizer_results["update_sigma1"]
+        npz_payload[f"{prefix}_weight_raw_grad_alignment"] = optimizer_results["weight_raw_grad_alignment"]
+        npz_payload[f"{prefix}_weight_update_alignment"] = optimizer_results["weight_update_alignment"]
+        npz_payload[f"{prefix}_final_sv_spectrum"] = optimizer_results["final_sv_spectrum"]
+    np.savez_compressed(raw_npz_path, **npz_payload)
+
+    return {
+        "plot": plot_path,
+        "summary_json": summary_json_path,
+        "raw_npz": raw_npz_path,
+    }
+
+
+def print_report(results: Dict[str, Any]) -> None:
+    """Print a concise calibrated text report for normal script usage."""
+    summary = results["summary"]
+    config = results["config"]
+    sgd = summary["optimizer_summaries"]["SGD"]
+    muon = summary["optimizer_summaries"]["Muon"]
+    t3 = summary["t3_diagnostic"]
+
+    print("\n" + "=" * 100)
+    print("CALIBRATED SUMMARY REPORT")
+    print("=" * 100)
+    print(
+        f"Runtime: {results['runtime_seconds']:.2f}s | Seed: {config['seed']} | "
+        f"LRs: SGD={results['learning_rates']['SGD']}, Muon={results['learning_rates']['Muon']}"
+    )
+    print(
+        f"Initial / final loss: SGD {sgd['loss_initial']:.6e} -> {sgd['loss_final']:.6e} | "
+        f"Muon {muon['loss_initial']:.6e} -> {muon['loss_final']:.6e}"
+    )
+    print("\nFit means (higher R^2 = better within-family fit):")
+    print(
+        f"  SGD : exp R^2={sgd['fit_means']['exp_r2_mean']:.4f}, poly R^2={sgd['fit_means']['poly_r2_mean']:.4f}, "
+        f"gap(exp-poly)={sgd['fit_means']['r2_gap_exp_minus_poly_mean']:.4f}, "
+        f"exp slope={sgd['fit_means']['exp_slope_mean']:.6f}, poly exponent={sgd['fit_means']['poly_exponent_mean']:.4f}"
+    )
+    print(
+        f"  Muon: exp R^2={muon['fit_means']['exp_r2_mean']:.4f}, poly R^2={muon['fit_means']['poly_r2_mean']:.4f}, "
+        f"gap(exp-poly)={muon['fit_means']['r2_gap_exp_minus_poly_mean']:.4f}, "
+        f"exp slope={muon['fit_means']['exp_slope_mean']:.6f}, poly exponent={muon['fit_means']['poly_exponent_mean']:.4f}"
+    )
+    print("\nLayer-level uncertainty summaries (n = layers):")
+    print(
+        f"  SGD exp R^2  mean±95%CI ≈ {sgd['fit_uncertainty']['exp_r2']['mean']:.4f} "
+        f"[{sgd['fit_uncertainty']['exp_r2']['ci95_low']:.4f}, {sgd['fit_uncertainty']['exp_r2']['ci95_high']:.4f}]"
+    )
+    print(
+        f"  SGD poly R^2 mean±95%CI ≈ {sgd['fit_uncertainty']['poly_r2']['mean']:.4f} "
+        f"[{sgd['fit_uncertainty']['poly_r2']['ci95_low']:.4f}, {sgd['fit_uncertainty']['poly_r2']['ci95_high']:.4f}]"
+    )
+    print(
+        f"  Muon exp R^2  mean±95%CI ≈ {muon['fit_uncertainty']['exp_r2']['mean']:.4f} "
+        f"[{muon['fit_uncertainty']['exp_r2']['ci95_low']:.4f}, {muon['fit_uncertainty']['exp_r2']['ci95_high']:.4f}]"
+    )
+    print(
+        f"  Muon poly R^2 mean±95%CI ≈ {muon['fit_uncertainty']['poly_r2']['mean']:.4f} "
+        f"[{muon['fit_uncertainty']['poly_r2']['ci95_low']:.4f}, {muon['fit_uncertainty']['poly_r2']['ci95_high']:.4f}]"
+    )
+    print("\nT3 diagnostic (the key honesty check for strong exponential wording):")
+    print(
+        f"  pass={t3['pass']} | mean R^2 gap exp-poly={t3['mean_r2_gap_exp_minus_poly']:.4f} | "
+        f"layer votes exp/poly={t3['layer_vote_counts']['layers_preferring_exponential']}/"
+        f"{t3['layer_vote_counts']['layers_preferring_polynomial']}"
+    )
+    print(
+        f"  descriptive layer-level 95% CI for SGD gap: "
+        f"[{t3['layerwise_r2_gap_summary']['ci95_low']:.4f}, {t3['layerwise_r2_gap_summary']['ci95_high']:.4f}]"
+    )
+    print(
+        "  SGD layerwise R^2 gaps exp-poly: "
+        + ", ".join(f"{value:.4f}" for value in t3["layerwise_r2_gap_values"])
+    )
+
+    print("\nFinal-spectrum / proxy / alignment summaries:")
+    print(
+        f"  Final Gini mean: SGD={sgd['gini_mean']:.4f}, Muon={muon['gini_mean']:.4f}"
+    )
+    print(
+        f"  Lagged scalar proxy corr mean: SGD={sgd['lagged_corr_proxy_mean']:.4f}, Muon={muon['lagged_corr_proxy_mean']:.4f}"
+    )
+    print(
+        f"  Same-state raw-grad corr mean: SGD={sgd['same_state_raw_grad_corr_mean']:.4f}, Muon={muon['same_state_raw_grad_corr_mean']:.4f}"
+    )
+    print(
+        f"  Direct W/raw-grad top-vector overlap mean: SGD={sgd['weight_raw_grad_alignment_mean']:.4f}, Muon={muon['weight_raw_grad_alignment_mean']:.4f}"
+    )
+    print(
+        f"  Direct W/update top-vector overlap mean: SGD={sgd['weight_update_alignment_mean']:.4f}, Muon={muon['weight_update_alignment_mean']:.4f}"
+    )
+    print(
+        f"  Update-minus-raw overlap shift mean: SGD={sgd['weight_update_minus_raw_alignment_mean']:.4f}, Muon={muon['weight_update_minus_raw_alignment_mean']:.4f}"
+    )
+
+    print("\nVerdict components:")
+    for name, info in summary["verdict_components"].items():
+        status = "PASS" if info["pass"] else "FAIL"
+        print(f"  - {name}: {status} -- {info['description']}")
+
+    print("\nAssessment:")
+    print(f"  {summary['assessment']['overall_label']}")
+    for note in summary["assessment"]["notes"]:
+        print(f"    * {note}")
+    print("=" * 100)
 
 
 # =============================================================================
-# FINAL VERDICT
+# MAIN ENTRYPOINT
 # =============================================================================
 
-print(f"\n\n{'=' * 100}")
-print("FINAL VERDICT: sigma_1(W) GROWTH RATE FEEDBACK LOOP")
-print("=" * 100)
 
-# Test 1: SGD exponential fit R^2 > Muon exponential fit R^2
-# (SGD growth is better described by exponential)
-test1_pass = sgd_mean_exp_r2 > muon_mean_exp_r2
+def main() -> None:
+    """Run experiment, save figure/artifacts, and print calibrated report."""
+    results = run_experiment(verbose=True)
+    _, plot_path = make_plots(results, output_dir=SCRIPT_DIR, filename="sigma1_growth_rate.png", show=False)
+    artifact_paths = save_results_artifacts(results, output_dir=SCRIPT_DIR, plot_path=plot_path)
+    results["artifact_paths"] = artifact_paths
 
-# Test 2: Muon polynomial fit R^2 > Muon exponential fit R^2
-# (Muon growth is better described by sub-linear/polynomial)
-test2_pass = muon_mean_poly_r2 > muon_mean_exp_r2
+    if plot_path is not None:
+        print(f"Saved plot: {plot_path}")
+    print(f"Saved summary JSON: {artifact_paths['summary_json']}")
+    print(f"Saved raw NPZ: {artifact_paths['raw_npz']}")
 
-# Test 3: SGD exponential fit R^2 > SGD polynomial fit R^2
-# (SGD growth IS exponential, not polynomial)
-test3_pass = sgd_mean_exp_r2 > sgd_mean_poly_r2
+    print_report(results)
 
-# Test 4: SGD corr(sigma1_G, sigma1_W) > Muon corr(sigma1_G, sigma1_W)
-# (feedback loop is active for SGD, broken for Muon)
-test4_pass = sgd_mean_corr > muon_mean_corr
 
-# Test 5: SGD Gini > Muon Gini at final step
-# (SGD has more anisotropic spectrum)
-test5_pass = sgd_mean_gini > muon_mean_gini
-
-# Composite: SGD exponential > Muon sub-linear
-# This is the key claim: R2_exp(SGD) > R2_exp(Muon) AND R2_poly(Muon) > R2_exp(Muon)
-composite_pass = test1_pass and test2_pass
-
-tests = [test1_pass, test2_pass, test3_pass, test4_pass, test5_pass]
-tests_passed = sum(tests)
-tests_total = 5
-
-print(f"""
-  MEASURED QUANTITIES:
-  ---------------------------------------------------------------
-  Growth Model Fit (mean R^2 across layers):
-    SGD:   exponential R^2 = {sgd_mean_exp_r2:.4f}   polynomial R^2 = {sgd_mean_poly_r2:.4f}
-    Muon:  exponential R^2 = {muon_mean_exp_r2:.4f}   polynomial R^2 = {muon_mean_poly_r2:.4f}
-
-  Feedback Loop Correlation corr(sigma_1(G), sigma_1(W)):
-    SGD:   {sgd_mean_corr:.4f}
-    Muon:  {muon_mean_corr:.4f}
-
-  Gini Coefficient of SV Spectrum at step {NUM_STEPS}:
-    SGD:   {sgd_mean_gini:.4f}
-    Muon:  {muon_mean_gini:.4f}
-
-  sigma_1 exponential growth rate (slope of log(s1) vs t):
-    SGD:   {sgd_mean_slope:.6f} per step
-    Muon:  {muon_mean_slope:.6f} per step
-  ---------------------------------------------------------------
-
-  HYPOTHESIS CHECKS:
-  ---------------------------------------------------------------
-  T1: SGD exp-R^2 > Muon exp-R^2 (SGD growth is more exponential)
-      SGD: {sgd_mean_exp_r2:.4f} vs Muon: {muon_mean_exp_r2:.4f}
-      -> {"CONFIRMED" if test1_pass else "REJECTED"}
-
-  T2: Muon poly-R^2 > Muon exp-R^2 (Muon growth is sub-linear)
-      poly: {muon_mean_poly_r2:.4f} vs exp: {muon_mean_exp_r2:.4f}
-      -> {"CONFIRMED" if test2_pass else "REJECTED"}
-
-  T3: SGD exp-R^2 > SGD poly-R^2 (SGD growth IS exponential)
-      exp: {sgd_mean_exp_r2:.4f} vs poly: {sgd_mean_poly_r2:.4f}
-      -> {"CONFIRMED" if test3_pass else "REJECTED"}
-
-  T4: SGD corr > Muon corr (feedback loop active for SGD, broken for Muon)
-      SGD: {sgd_mean_corr:.4f} vs Muon: {muon_mean_corr:.4f}
-      -> {"CONFIRMED" if test4_pass else "REJECTED"}
-
-  T5: SGD Gini > Muon Gini (SGD has more anisotropic spectrum)
-      SGD: {sgd_mean_gini:.4f} vs Muon: {muon_mean_gini:.4f}
-      -> {"CONFIRMED" if test5_pass else "REJECTED"}
-
-  COMPOSITE: SGD exponential > Muon sub-linear
-      (T1 AND T2): {"CONFIRMED" if composite_pass else "REJECTED"}
-  ---------------------------------------------------------------
-""")
-
-if tests_passed >= 4 and composite_pass:
-    overall = "PASS"
-    detail = (
-        f"  {tests_passed}/5 tests pass + composite confirmed.\n"
-        "  SGD sigma_1 growth is exponential (positive feedback loop).\n"
-        "  Muon sigma_1 growth is sub-linear (bounded step size breaks feedback).\n"
-        "  Gradient-weight spectral correlation confirms: SGD feedback loop active,\n"
-        "  Muon feedback loop broken by orthogonalization."
-    )
-elif tests_passed >= 3:
-    overall = "PARTIAL PASS"
-    detail = (
-        f"  {tests_passed}/5 tests pass, composite={'PASS' if composite_pass else 'FAIL'}.\n"
-        f"  T1 (SGD exp > Muon exp):    {'PASS' if test1_pass else 'FAIL'}\n"
-        f"  T2 (Muon poly > Muon exp):  {'PASS' if test2_pass else 'FAIL'}\n"
-        f"  T3 (SGD exp > SGD poly):    {'PASS' if test3_pass else 'FAIL'}\n"
-        f"  T4 (SGD corr > Muon corr):  {'PASS' if test4_pass else 'FAIL'}\n"
-        f"  T5 (SGD Gini > Muon Gini):  {'PASS' if test5_pass else 'FAIL'}"
-    )
-elif tests_passed >= 2:
-    overall = "WEAK SIGNAL"
-    detail = (
-        f"  {tests_passed}/5 tests pass, composite={'PASS' if composite_pass else 'FAIL'}.\n"
-        f"  T1 (SGD exp > Muon exp):    {'PASS' if test1_pass else 'FAIL'}\n"
-        f"  T2 (Muon poly > Muon exp):  {'PASS' if test2_pass else 'FAIL'}\n"
-        f"  T3 (SGD exp > SGD poly):    {'PASS' if test3_pass else 'FAIL'}\n"
-        f"  T4 (SGD corr > Muon corr):  {'PASS' if test4_pass else 'FAIL'}\n"
-        f"  T5 (SGD Gini > Muon Gini):  {'PASS' if test5_pass else 'FAIL'}"
-    )
-else:
-    overall = "FAIL"
-    detail = (
-        f"  Only {tests_passed}/5 tests pass, composite={'PASS' if composite_pass else 'FAIL'}.\n"
-        f"  T1 (SGD exp > Muon exp):    {'PASS' if test1_pass else 'FAIL'}\n"
-        f"  T2 (Muon poly > Muon exp):  {'PASS' if test2_pass else 'FAIL'}\n"
-        f"  T3 (SGD exp > SGD poly):    {'PASS' if test3_pass else 'FAIL'}\n"
-        f"  T4 (SGD corr > Muon corr):  {'PASS' if test4_pass else 'FAIL'}\n"
-        f"  T5 (SGD Gini > Muon Gini):  {'PASS' if test5_pass else 'FAIL'}"
-    )
-
-print(f"""
-  +========================================================================+
-  |  VERDICT: {overall:<63}|
-  +========================================================================+
-  |                                                                        |""")
-for line in detail.split('\n'):
-    print(f"  |  {line:<70}|")
-print(f"""  |                                                                        |
-  +========================================================================+
-""")
-
-print("=" * 100)
-print(f"  Tests passed: {tests_passed}/{tests_total}")
-print(f"  Composite (SGD exponential > Muon sub-linear): {'PASS' if composite_pass else 'FAIL'}")
-print(f"  Overall: {overall}")
-print("=" * 100)
+if __name__ == "__main__":
+    main()

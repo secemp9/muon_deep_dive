@@ -1,75 +1,115 @@
 #!/usr/bin/env python3
 """
-H11: Gauge Fraction vs Dead Neuron Fraction
-=============================================
+H11: Gauge fraction vs batch-dead neuron fraction (toy probe)
+=================================================================
 
-6-layer ReLU MLP, width 32. Vary bias initialization to control dead neuron fraction.
-bias_init in {+2, +1, 0, -1, -2, -3, -5}
-  Positive bias -> more neurons alive (ReLU threshold shifted left)
-  Negative bias -> more neurons dead
+This experiment trains a 6-layer width-32 ReLU MLP on synthetic regression data.
+It sweeps a constant bias initialization value to change how many hidden units are
+batch-dead on the sampled training inputs X. At the final checkpoint it measures:
 
-At step 100, measure:
-  (a) Fraction of dead neurons per layer
-  (b) Gradient gauge fraction per layer (Stiefel normal-space decomposition)
+  1) hidden-layer batch-dead fraction
+  2) per-layer gauge fraction of the weight gradient via Stiefel normal projection
 
-KEY QUESTION: Is the gauge fraction a LOCAL tangent-space property (constant ~53%
-regardless of dead fraction) or does it depend on GLOBAL symmetry (drops with dead
-fraction)?
-
-If gauge fraction is constant: gauge is local tangent structure
-If gauge fraction drops with dead neurons: gauge is global symmetry that ReLU breaks
-
-Uses the same gauge decomposition as the KILL experiment.
-
-IMPORTANT: When ALL neurons in a layer are dead, the gradient is exactly zero,
-so gauge_fraction = 0/0 -> we report NaN and exclude from analysis.
-We only analyze layers that have non-trivial gradients (||G||_F > threshold).
+Important scope / limitations
+-----------------------------
+- "Dead" means dead on the sampled batch X, not globally over input space.
+- The primary dead-vs-gauge analysis uses hidden layers only.
+- The last layer has no ReLU and is reported separately as a control.
+- If ||G||_F^2 < GRAD_NORM_THRESHOLD, gauge fraction is reported as NaN.
+- This script does not run Muon and does not measure Muon benefit directly.
 """
 
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import numpy as np
-import os
+
 
 # =============================================================================
-# CONFIGURATION
+# DEFAULT CONFIGURATION
 # =============================================================================
+
+EXPERIMENT_NAME = "H11_GAUGE_VS_DEAD_NEURONS"
+SCRIPT_PATH = Path(__file__).resolve()
+SCRIPT_DIR = SCRIPT_PATH.parent
 
 DIM = 32
 NUM_LAYERS = 6
 NUM_SAMPLES = 100
-NUM_STEPS = 100   # measure at step 100
+NUM_STEPS = 100
 LR = 0.003
 MOMENTUM = 0.9
 NUM_SEEDS = 5
 BASE_SEED = 42
-NS_ITERS = 5
-
+SEED_STRIDE = 31
 BIAS_INITS = [+2.0, +1.0, 0.0, -1.0, -2.0, -3.0, -5.0]
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Gradient norm threshold: below this, gauge decomposition is unreliable
 GRAD_NORM_THRESHOLD = 1e-10
+LOSS_BLOWUP_THRESHOLD = 1e10
+
+LAYER_NAMES = [f"L{i+1}" for i in range(NUM_LAYERS)]
+HIDDEN_LAYER_NAMES = LAYER_NAMES[:-1]
+LAST_LAYER_NAME = LAYER_NAMES[-1]
+DEFAULT_DEAD_GAUGE_BINS = [(0, 10), (10, 30), (30, 50), (50, 70), (70, 90), (90, 100)]
+
+
+def get_default_config() -> Dict[str, Any]:
+    """Return a fresh default config dict."""
+    return {
+        "dim": DIM,
+        "num_layers": NUM_LAYERS,
+        "num_samples": NUM_SAMPLES,
+        "num_steps": NUM_STEPS,
+        "lr": LR,
+        "momentum": MOMENTUM,
+        "num_seeds": NUM_SEEDS,
+        "base_seed": BASE_SEED,
+        "seed_stride": SEED_STRIDE,
+        "bias_inits": list(BIAS_INITS),
+        "grad_norm_threshold": GRAD_NORM_THRESHOLD,
+        "loss_blowup_threshold": LOSS_BLOWUP_THRESHOLD,
+        "input_scale": 0.3,
+        "target_scale": 0.3,
+        "dead_gauge_bins": list(DEFAULT_DEAD_GAUGE_BINS),
+    }
+
+
+def prepare_config(config_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Merge user overrides into the default config."""
+    config = get_default_config()
+    if config_overrides:
+        config.update(config_overrides)
+    config["bias_inits"] = list(config["bias_inits"])
+    config["dead_gauge_bins"] = [tuple(x) for x in config["dead_gauge_bins"]]
+    return config
+
+
+def build_seed_list(config: Dict[str, Any]) -> List[int]:
+    return [config["base_seed"] + idx * config["seed_stride"] for idx in range(config["num_seeds"])]
 
 
 # =============================================================================
-# ReLU MLP WITH BIASES
+# RELU MLP WITH BIASES
 # =============================================================================
 
-def init_weights(rng, bias_init_val):
-    """Initialize 6-layer MLP with biases set to bias_init_val."""
-    weights = []
-    biases = []
-    for i in range(NUM_LAYERS):
-        std = np.sqrt(2.0 / DIM)
-        W = rng.randn(DIM, DIM) * std
-        b = np.full(DIM, bias_init_val)
+
+def init_weights(rng: np.random.RandomState, bias_init_val: float, dim: int = DIM,
+                 num_layers: int = NUM_LAYERS) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Initialize an MLP with He-initialized weights and constant biases."""
+    weights: List[np.ndarray] = []
+    biases: List[np.ndarray] = []
+    for _ in range(num_layers):
+        std = np.sqrt(2.0 / dim)
+        W = rng.randn(dim, dim) * std
+        b = np.full(dim, bias_init_val)
         weights.append(W.copy())
         biases.append(b.copy())
     return weights, biases
 
 
-def forward(weights, biases, X):
-    """Forward pass with biases. ReLU on all but last layer."""
+def forward(weights: List[np.ndarray], biases: List[np.ndarray], X: np.ndarray):
+    """Forward pass with ReLU on all but the last layer."""
     out = X.copy()
     pre_acts = []
     post_acts = [X.copy()]
@@ -90,13 +130,15 @@ def forward(weights, biases, X):
     return out, pre_acts, post_acts, relu_masks
 
 
-def compute_loss(weights, biases, X, Y):
+def compute_loss(weights: List[np.ndarray], biases: List[np.ndarray], X: np.ndarray,
+                 Y: np.ndarray) -> float:
     pred, _, _, _ = forward(weights, biases, X)
     diff = pred - Y
-    return 0.5 * np.mean(np.sum(diff ** 2, axis=0))
+    return float(0.5 * np.mean(np.sum(diff ** 2, axis=0)))
 
 
-def compute_gradients(weights, biases, X, Y):
+def compute_gradients(weights: List[np.ndarray], biases: List[np.ndarray], X: np.ndarray,
+                      Y: np.ndarray):
     """Backprop through biased ReLU MLP. Returns weight grads and bias grads."""
     num_layers = len(weights)
     N = X.shape[1]
@@ -118,51 +160,57 @@ def compute_gradients(weights, biases, X, Y):
 
 
 # =============================================================================
-# GAUGE DECOMPOSITION (from KILL experiment)
+# GAUGE DECOMPOSITION
 # =============================================================================
 
-def compute_polar_factor(W):
-    U, S, Vt = np.linalg.svd(W, full_matrices=True)
+
+def compute_polar_factor(W: np.ndarray) -> np.ndarray:
+    U, _, Vt = np.linalg.svd(W, full_matrices=True)
     return U @ Vt
 
 
-def gauge_decomposition(G, W):
+def gauge_decomposition(G: np.ndarray, W: np.ndarray,
+                        grad_norm_threshold: float = GRAD_NORM_THRESHOLD) -> float:
     """
-    Decompose gradient G into tangent (physical) and normal (gauge) at Stiefel
-    manifold point Q = ortho(W).
-    G_normal = Q @ sym(Q^T @ G)
-    gauge_fraction = ||G_normal||^2 / ||G||^2
+    Decompose gradient G into tangent and normal components at Q = polar(W).
 
-    Returns NaN if gradient norm is below threshold.
+    Returns NaN if the squared Frobenius norm of G is below threshold or non-finite.
     """
-    G_norm_sq = np.sum(G ** 2)
-    if G_norm_sq < GRAD_NORM_THRESHOLD:
-        return np.nan  # unreliable
+    G_norm_sq = float(np.sum(G ** 2))
+    if (not np.isfinite(G_norm_sq)) or G_norm_sq < grad_norm_threshold:
+        return float("nan")
+
+    if not np.all(np.isfinite(W)) or not np.all(np.isfinite(G)):
+        return float("nan")
 
     Q = compute_polar_factor(W)
     QtG = Q.T @ G
     sym_QtG = 0.5 * (QtG + QtG.T)
     G_normal = Q @ sym_QtG
-    G_normal_norm_sq = np.sum(G_normal ** 2)
+    G_normal_norm_sq = float(np.sum(G_normal ** 2))
     return G_normal_norm_sq / G_norm_sq
 
 
 # =============================================================================
-# DEAD NEURON MEASUREMENT
+# DEAD-NEURON MEASUREMENT
 # =============================================================================
 
-def measure_dead_fraction(weights, biases, X):
+
+def measure_dead_fraction(weights: List[np.ndarray], biases: List[np.ndarray],
+                          X: np.ndarray) -> list[float]:
     """
-    A neuron is 'dead' if it outputs 0 for ALL samples in X.
-    Returns per-layer dead fractions (for layers 0..NUM_LAYERS-2, i.e., ReLU layers).
+    Measure hidden-layer batch-dead fraction on the sampled inputs X.
+
+    A hidden neuron is counted as dead if its pre-activation is <= 0 for every
+    sample in X, equivalently its ReLU output is zero on the whole sampled batch.
     """
     _, pre_acts, _, _ = forward(weights, biases, X)
     dead_fractions = []
-    for l in range(NUM_LAYERS - 1):
+    for l in range(len(weights) - 1):
         activations = pre_acts[l]
         alive_mask = np.any(activations > 0, axis=1)
         dead_frac = 1.0 - np.mean(alive_mask)
-        dead_fractions.append(dead_frac)
+        dead_fractions.append(float(dead_frac))
     return dead_fractions
 
 
@@ -170,390 +218,699 @@ def measure_dead_fraction(weights, biases, X):
 # TRAINING LOOP
 # =============================================================================
 
-def train_and_measure(weights_init, biases_init, X, Y, n_steps=NUM_STEPS):
+
+def train_and_measure(weights_init: List[np.ndarray], biases_init: List[np.ndarray],
+                      X: np.ndarray, Y: np.ndarray, n_steps: int = NUM_STEPS,
+                      lr: float = LR, momentum: float = MOMENTUM,
+                      grad_norm_threshold: float = GRAD_NORM_THRESHOLD,
+                      loss_blowup_threshold: float = LOSS_BLOWUP_THRESHOLD) -> Dict[str, Any]:
     """
-    Train with SGD for n_steps. At the final step, measure:
-      - dead neuron fraction per layer
-      - gauge fraction per layer (for weight gradients)
+    Train with full-batch momentum SGD and measure at the final checkpoint.
+
+    Returned fields include hidden batch-dead fractions, per-layer gauge fractions,
+    final loss, and early-stop diagnostics.
     """
     weights = [w.copy() for w in weights_init]
     biases = [b.copy() for b in biases_init]
     w_vel = [np.zeros_like(w) for w in weights]
     b_vel = [np.zeros_like(b) for b in biases]
 
+    stopped_early = False
+    break_reason = None
+    steps_completed = 0
+    last_pre_update_loss = None
+
     for step in range(n_steps):
         loss = compute_loss(weights, biases, X, Y)
-        if np.isnan(loss) or loss > 1e10:
+        last_pre_update_loss = float(loss)
+        if np.isnan(loss):
+            stopped_early = True
+            break_reason = "loss_nan"
+            break
+        if loss > loss_blowup_threshold:
+            stopped_early = True
+            break_reason = "loss_blowup"
             break
 
         w_grads, b_grads = compute_gradients(weights, biases, X, Y)
 
-        for i in range(NUM_LAYERS):
-            w_vel[i] = MOMENTUM * w_vel[i] + w_grads[i]
-            b_vel[i] = MOMENTUM * b_vel[i] + b_grads[i]
-            weights[i] = weights[i] - LR * w_vel[i]
-            biases[i] = biases[i] - LR * b_vel[i]
+        for i in range(len(weights)):
+            w_vel[i] = momentum * w_vel[i] + w_grads[i]
+            b_vel[i] = momentum * b_vel[i] + b_grads[i]
+            weights[i] = weights[i] - lr * w_vel[i]
+            biases[i] = biases[i] - lr * b_vel[i]
 
-    # Measure at final step
+        steps_completed = step + 1
+
     dead_fracs = measure_dead_fraction(weights, biases, X)
-
-    # Gauge fraction: need gradients at current weights
     w_grads, _ = compute_gradients(weights, biases, X, Y)
-    gauge_fracs = []
-    for l in range(NUM_LAYERS):
-        gf = gauge_decomposition(w_grads[l], weights[l])
-        gauge_fracs.append(gf)
-
+    gauge_fracs = [
+        gauge_decomposition(G=w_grads[l], W=weights[l], grad_norm_threshold=grad_norm_threshold)
+        for l in range(len(weights))
+    ]
     final_loss = compute_loss(weights, biases, X, Y)
 
-    return dead_fracs, gauge_fracs, final_loss
-
-
-# =============================================================================
-# MAIN EXPERIMENT
-# =============================================================================
-
-print("=" * 90)
-print("H11: GAUGE FRACTION vs DEAD NEURON FRACTION")
-print("=" * 90)
-print(f"Architecture: {NUM_LAYERS}-layer ReLU MLP, width={DIM}")
-print(f"Bias init values: {BIAS_INITS}")
-print(f"Steps: {NUM_STEPS}, Seeds: {NUM_SEEDS}")
-print()
-print("KEY QUESTION: Does gauge fraction depend on dead neuron fraction?")
-print("  If constant (~50%): gauge is local tangent structure")
-print("  If drops with dead neurons: gauge is global symmetry")
-print("  NaN = gradient too small for reliable decomposition")
-print("=" * 90)
-
-# Results storage
-results = {}
-
-for bias_val in BIAS_INITS:
-    dead_all = []
-    gauge_all = []
-    loss_all = []
-
-    for seed_idx in range(NUM_SEEDS):
-        run_seed = BASE_SEED + seed_idx * 31
-        rng = np.random.RandomState(run_seed)
-
-        X = rng.randn(DIM, NUM_SAMPLES) * 0.3
-        Y = rng.randn(DIM, NUM_SAMPLES) * 0.3
-
-        weights_init, biases_init = init_weights(rng, bias_val)
-        dead_fracs, gauge_fracs, final_loss = train_and_measure(
-            weights_init, biases_init, X, Y)
-
-        dead_all.append(dead_fracs)
-        gauge_all.append(gauge_fracs)
-        loss_all.append(final_loss)
-
-    results[bias_val] = {
-        'dead': np.array(dead_all),     # (seeds, NUM_LAYERS-1)
-        'gauge': np.array(gauge_all),   # (seeds, NUM_LAYERS)
-        'loss': np.array(loss_all),     # (seeds,)
+    return {
+        "dead_fractions": np.array(dead_fracs, dtype=float),
+        "gauge_fractions": np.array(gauge_fracs, dtype=float),
+        "final_loss": float(final_loss),
+        "steps_completed": int(steps_completed),
+        "stopped_early": bool(stopped_early),
+        "break_reason": break_reason,
+        "last_pre_update_loss": None if last_pre_update_loss is None else float(last_pre_update_loss),
     }
 
-    mean_dead = np.mean(dead_all)
-    gauge_valid = np.array(gauge_all)
-    gauge_valid_flat = gauge_valid[~np.isnan(gauge_valid)]
-    if len(gauge_valid_flat) > 0:
-        mean_gauge = np.mean(gauge_valid_flat)
-        n_nan = np.sum(np.isnan(gauge_valid))
+
+# =============================================================================
+# EXPERIMENT EXECUTION
+# =============================================================================
+
+
+def _format_percent(value: float) -> str:
+    if value is None or np.isnan(value):
+        return "NaN"
+    return f"{value:.1f}%"
+
+
+def _safe_nanmean(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    valid = values[~np.isnan(values)]
+    if valid.size == 0:
+        return float("nan")
+    return float(np.mean(valid))
+
+
+def _safe_nanstd(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    valid = values[~np.isnan(values)]
+    if valid.size == 0:
+        return float("nan")
+    return float(np.std(valid))
+
+
+def _to_float_list(values: np.ndarray) -> list[float]:
+    return [float(v) for v in np.asarray(values, dtype=float).tolist()]
+
+
+def run_experiment(config_overrides: Optional[Dict[str, Any]] = None,
+                   verbose: bool = False) -> Dict[str, Any]:
+    """Run the H11 toy probe and return structured raw results."""
+    config = prepare_config(config_overrides)
+    seeds = build_seed_list(config)
+    layer_names = [f"L{i+1}" for i in range(config["num_layers"])]
+    hidden_layer_names = layer_names[:-1]
+
+    if verbose:
+        print("=" * 90)
+        print("H11: GAUGE FRACTION vs BATCH-DEAD HIDDEN FRACTION (toy probe)")
+        print("=" * 90)
+        print(f"Architecture: {config['num_layers']}-layer ReLU MLP, width={config['dim']}")
+        print(f"Bias init values: {config['bias_inits']}")
+        print(f"Steps: {config['num_steps']}, Seeds: {len(seeds)}")
+        print("Primary summary uses hidden layers only; last layer reported separately as control.")
+        print("NaN gauge = squared gradient Frobenius norm below threshold or non-finite.")
+        print("=" * 90)
+
+    condition_results = []
+    results_by_bias = {}
+    run_records = []
+
+    for bias_val in config["bias_inits"]:
+        dead_all = []
+        gauge_all = []
+        loss_all = []
+        steps_all = []
+        stopped_all = []
+        break_reasons = []
+        last_pre_update_losses = []
+        per_seed_records = []
+
+        for run_seed in seeds:
+            rng = np.random.RandomState(run_seed)
+            X = rng.randn(config["dim"], config["num_samples"]) * config["input_scale"]
+            Y = rng.randn(config["dim"], config["num_samples"]) * config["target_scale"]
+
+            weights_init, biases_init = init_weights(
+                rng=rng,
+                bias_init_val=bias_val,
+                dim=config["dim"],
+                num_layers=config["num_layers"],
+            )
+            run_result = train_and_measure(
+                weights_init=weights_init,
+                biases_init=biases_init,
+                X=X,
+                Y=Y,
+                n_steps=config["num_steps"],
+                lr=config["lr"],
+                momentum=config["momentum"],
+                grad_norm_threshold=config["grad_norm_threshold"],
+                loss_blowup_threshold=config["loss_blowup_threshold"],
+            )
+
+            dead_fracs = run_result["dead_fractions"]
+            gauge_fracs = run_result["gauge_fractions"]
+            hidden_gauge_fracs = gauge_fracs[:-1]
+            last_layer_gauge = gauge_fracs[-1]
+            seed_mean_hidden_dead = float(np.mean(dead_fracs))
+            seed_mean_hidden_gauge = _safe_nanmean(hidden_gauge_fracs)
+
+            seed_record = {
+                "bias_init": float(bias_val),
+                "seed": int(run_seed),
+                "hidden_dead_fractions": _to_float_list(dead_fracs),
+                "hidden_gauge_fractions": _to_float_list(hidden_gauge_fracs),
+                "all_layer_gauge_fractions": _to_float_list(gauge_fracs),
+                "last_layer_gauge_fraction": float(last_layer_gauge),
+                "mean_hidden_dead_fraction": float(seed_mean_hidden_dead),
+                "mean_hidden_gauge_fraction": float(seed_mean_hidden_gauge),
+                "final_loss": float(run_result["final_loss"]),
+                "steps_completed": int(run_result["steps_completed"]),
+                "stopped_early": bool(run_result["stopped_early"]),
+                "break_reason": run_result["break_reason"],
+                "last_pre_update_loss": run_result["last_pre_update_loss"],
+                "valid_hidden_gauge_count": int(np.sum(~np.isnan(hidden_gauge_fracs))),
+                "nan_hidden_gauge_count": int(np.sum(np.isnan(hidden_gauge_fracs))),
+                "valid_total_gauge_count": int(np.sum(~np.isnan(gauge_fracs))),
+                "nan_total_gauge_count": int(np.sum(np.isnan(gauge_fracs))),
+            }
+
+            dead_all.append(dead_fracs)
+            gauge_all.append(gauge_fracs)
+            loss_all.append(run_result["final_loss"])
+            steps_all.append(run_result["steps_completed"])
+            stopped_all.append(run_result["stopped_early"])
+            break_reasons.append(run_result["break_reason"])
+            last_pre_update_losses.append(run_result["last_pre_update_loss"])
+            per_seed_records.append(seed_record)
+            run_records.append(seed_record)
+
+        dead_arr = np.array(dead_all, dtype=float)
+        gauge_arr = np.array(gauge_all, dtype=float)
+        hidden_gauge_arr = gauge_arr[:, :-1]
+        last_layer_arr = gauge_arr[:, -1]
+
+        condition_result = {
+            "bias_init": float(bias_val),
+            "seeds": list(seeds),
+            "dead": dead_arr,
+            "gauge": gauge_arr,
+            "hidden_gauge": hidden_gauge_arr,
+            "last_layer_gauge": last_layer_arr,
+            "loss": np.array(loss_all, dtype=float),
+            "steps_completed": np.array(steps_all, dtype=int),
+            "stopped_early": np.array(stopped_all, dtype=bool),
+            "break_reasons": list(break_reasons),
+            "last_pre_update_loss": np.array([
+                np.nan if value is None else value for value in last_pre_update_losses
+            ], dtype=float),
+            "per_seed": per_seed_records,
+        }
+        condition_results.append(condition_result)
+        results_by_bias[float(bias_val)] = condition_result
+
+        if verbose:
+            hidden_dead_mean = float(np.mean(dead_arr) * 100)
+            hidden_gauge_mean = _safe_nanmean(hidden_gauge_arr) * 100
+            hidden_nan_count = int(np.sum(np.isnan(hidden_gauge_arr)))
+            print(
+                f"  bias_init={bias_val:+.0f}: "
+                f"hidden_dead={hidden_dead_mean:.1f}%, "
+                f"hidden_gauge={_format_percent(hidden_gauge_mean)}, "
+                f"hidden_NaNs={hidden_nan_count}, "
+                f"L6={_format_percent(_safe_nanmean(last_layer_arr) * 100)}, "
+                f"loss={np.mean(loss_all):.4f}, "
+                f"early_stops={int(np.sum(stopped_all))}/{len(stopped_all)}"
+            )
+
+    return {
+        "experiment_name": EXPERIMENT_NAME,
+        "script_path": str(SCRIPT_PATH),
+        "script_dir": str(SCRIPT_DIR),
+        "config": config,
+        "seeds": seeds,
+        "layer_names": layer_names,
+        "hidden_layer_names": hidden_layer_names,
+        "last_layer_name": layer_names[-1],
+        "condition_results": condition_results,
+        "per_bias_results": condition_results,
+        "conditions": condition_results,
+        "results_by_bias": results_by_bias,
+        "run_records": run_records,
+    }
+
+
+# =============================================================================
+# ANALYSIS
+# =============================================================================
+
+
+def _compute_condition_level_correlation(dead_arr: np.ndarray, gauge_arr: np.ndarray) -> Dict[str, Any]:
+    valid_mask = ~np.isnan(gauge_arr)
+    dead_valid = dead_arr[valid_mask]
+    gauge_valid = gauge_arr[valid_mask]
+
+    result = {
+        "valid_condition_count": int(len(dead_valid)),
+        "total_condition_count": int(len(dead_arr)),
+        "dead_valid_percent": _to_float_list(dead_valid),
+        "gauge_valid_percent": _to_float_list(gauge_valid),
+        "pearson_r": float("nan"),
+        "slope": float("nan"),
+        "status": "NO_VALID_CONDITIONS",
+        "descriptive_only": True,
+    }
+
+    if len(dead_valid) < 2:
+        result["status"] = "INSUFFICIENT_POINTS"
+        return result
+
+    if np.std(dead_valid) <= 1e-10 or np.std(gauge_valid) <= 1e-10:
+        result["status"] = "INSUFFICIENT_VARIANCE"
+        return result
+
+    result["pearson_r"] = float(np.corrcoef(dead_valid, gauge_valid)[0, 1])
+    result["slope"] = float(np.polyfit(dead_valid, gauge_valid, 1)[0])
+    if len(dead_valid) < 3:
+        result["status"] = "DESCRIPTIVE_ONLY"
+        result["descriptive_only"] = True
     else:
-        mean_gauge = float('nan')
-        n_nan = gauge_valid.size
-    print(f"  bias_init={bias_val:+.0f}: dead={mean_dead*100:.1f}%, "
-          f"gauge={mean_gauge*100:.1f}% ({n_nan} NaN layers), "
-          f"loss={np.mean(loss_all):.4f}")
+        result["status"] = "OK"
+        result["descriptive_only"] = False
+    return result
 
 
-# =============================================================================
-# SUMMARY TABLE
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("SUMMARY TABLE: Gauge Fraction vs Dead Neuron Fraction")
-print(f"{'=' * 90}")
-
-print(f"\n{'Bias':>6}  {'Dead %':>8}  {'Gauge %':>9}  {'NaN layers':>11}  {'Valid layers':>13}  {'Loss':>10}")
-print("-" * 68)
-
-summary_dead = []
-summary_gauge = []
-summary_valid_gauge = []
-
-for bias_val in BIAS_INITS:
-    r = results[bias_val]
-    mean_dead = np.mean(r['dead']) * 100
-    gauge_flat = r['gauge'].flatten()
-    valid = gauge_flat[~np.isnan(gauge_flat)]
-    n_nan = np.sum(np.isnan(gauge_flat))
-    n_valid = len(valid)
-
-    if n_valid > 0:
-        mean_gauge = np.mean(valid) * 100
-    else:
-        mean_gauge = float('nan')
-
-    summary_dead.append(mean_dead)
-    summary_gauge.append(mean_gauge)
-    summary_valid_gauge.append((mean_gauge, n_valid))
-
-    print(f"{bias_val:>+6.0f}  {mean_dead:>8.1f}  {mean_gauge:>9.1f}  "
-          f"{n_nan:>11}  {n_valid:>13}  {np.mean(r['loss']):>10.4f}")
-
-
-# =============================================================================
-# PER-LAYER GAUGE FRACTION TABLE
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("PER-LAYER GAUGE FRACTION (%, mean over seeds, NaN = zero gradient)")
-print(f"{'=' * 90}")
-
-print(f"\n{'Bias':>6}", end="")
-for l in range(NUM_LAYERS):
-    print(f"  {'L'+str(l+1):>8}", end="")
-print(f"  {'Mean':>8}")
-print("-" * (8 + 10 * (NUM_LAYERS + 1)))
-
-for bias_val in BIAS_INITS:
-    r = results[bias_val]
-    print(f"{bias_val:>+6.0f}", end="")
-    all_layer_means = []
-    for l in range(NUM_LAYERS):
-        col = r['gauge'][:, l]
-        valid = col[~np.isnan(col)]
-        if len(valid) > 0:
-            m = np.mean(valid) * 100
-            all_layer_means.append(m)
-            print(f"  {m:>8.1f}", end="")
+def _build_bin_summary(all_dead_points: np.ndarray, all_gauge_points: np.ndarray,
+                       bins: List[tuple[int, int]]) -> List[Dict[str, Any]]:
+    bin_summary = []
+    for lo, hi in bins:
+        if hi >= 100:
+            mask = (all_dead_points >= lo) & (all_dead_points <= hi)
         else:
-            print(f"  {'NaN':>8}", end="")
-    if all_layer_means:
-        print(f"  {np.mean(all_layer_means):>8.1f}")
-    else:
-        print(f"  {'NaN':>8}")
+            mask = (all_dead_points >= lo) & (all_dead_points < hi)
+        n = int(np.sum(mask))
+        if n > 0:
+            mean_gauge = float(np.mean(all_gauge_points[mask]))
+            std_gauge = float(np.std(all_gauge_points[mask]))
+        else:
+            mean_gauge = float("nan")
+            std_gauge = float("nan")
+        bin_summary.append({
+            "dead_bin": (int(lo), int(hi)),
+            "dead_bin_label": f"{lo}-{hi}%",
+            "n_points": n,
+            "mean_gauge_percent": mean_gauge,
+            "std_gauge_percent": std_gauge,
+        })
+    return bin_summary
 
 
-# =============================================================================
-# PER-LAYER DEAD FRACTION
-# =============================================================================
+def analyze_results(experiment_results: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute summary tables, pooled analyses, and H1-H4 outcomes."""
+    config = experiment_results["config"]
+    condition_results = experiment_results["condition_results"]
+    num_hidden_layers = config["num_layers"] - 1
 
-print(f"\n\n{'=' * 90}")
-print("PER-LAYER DEAD NEURON FRACTION (%, mean over seeds)")
-print(f"{'=' * 90}")
+    condition_summaries = []
+    per_layer_dead_table = []
+    per_layer_gauge_table = []
+    pooled_hidden_points = []
 
-print(f"\n{'Bias':>6}", end="")
-for l in range(NUM_LAYERS - 1):
-    print(f"  {'L'+str(l+1):>8}", end="")
-print(f"  {'Mean':>8}")
-print("-" * (8 + 10 * NUM_LAYERS))
+    for condition in condition_results:
+        bias_val = float(condition["bias_init"])
+        dead = np.asarray(condition["dead"], dtype=float)
+        gauge = np.asarray(condition["gauge"], dtype=float)
+        hidden_gauge = np.asarray(condition["hidden_gauge"], dtype=float)
+        last_layer_gauge = np.asarray(condition["last_layer_gauge"], dtype=float)
+        loss = np.asarray(condition["loss"], dtype=float)
+        steps_completed = np.asarray(condition["steps_completed"], dtype=int)
+        stopped_early = np.asarray(condition["stopped_early"], dtype=bool)
+        per_seed = condition["per_seed"]
 
-for bias_val in BIAS_INITS:
-    r = results[bias_val]
-    print(f"{bias_val:>+6.0f}", end="")
-    layer_means = np.mean(r['dead'], axis=0) * 100
-    for l in range(NUM_LAYERS - 1):
-        print(f"  {layer_means[l]:>8.1f}", end="")
-    print(f"  {np.mean(layer_means):>8.1f}")
+        mean_hidden_dead_per_seed = np.mean(dead, axis=1) * 100
+        mean_hidden_gauge_per_seed = np.array([
+            _safe_nanmean(hidden_gauge[seed_idx]) * 100 for seed_idx in range(hidden_gauge.shape[0])
+        ], dtype=float)
+        valid_hidden = hidden_gauge[~np.isnan(hidden_gauge)]
+        valid_last = last_layer_gauge[~np.isnan(last_layer_gauge)]
 
+        summary = {
+            "bias_init": bias_val,
+            "mean_hidden_dead_percent": float(np.mean(dead) * 100),
+            "seed_mean_hidden_dead_percent": _to_float_list(mean_hidden_dead_per_seed),
+            "mean_hidden_gauge_percent": _safe_nanmean(hidden_gauge) * 100,
+            "seed_mean_hidden_gauge_percent": _to_float_list(mean_hidden_gauge_per_seed),
+            "valid_hidden_gauge_count": int(np.sum(~np.isnan(hidden_gauge))),
+            "nan_hidden_gauge_count": int(np.sum(np.isnan(hidden_gauge))),
+            "mean_last_layer_gauge_percent": _safe_nanmean(last_layer_gauge) * 100,
+            "seed_last_layer_gauge_percent": _to_float_list(last_layer_gauge * 100),
+            "valid_last_layer_count": int(np.sum(~np.isnan(last_layer_gauge))),
+            "nan_last_layer_count": int(np.sum(np.isnan(last_layer_gauge))),
+            "mean_loss": float(np.mean(loss)),
+            "std_loss": float(np.std(loss)),
+            "mean_steps_completed": float(np.mean(steps_completed)),
+            "num_stopped_early": int(np.sum(stopped_early)),
+            "stopped_early_seeds": [record["seed"] for record in per_seed if record["stopped_early"]],
+        }
+        condition_summaries.append(summary)
 
-# =============================================================================
-# CORRELATION ANALYSIS (only using valid gauge data)
-# =============================================================================
+        per_layer_dead_table.append({
+            "bias_init": bias_val,
+            "layer_dead_percent": _to_float_list(np.mean(dead, axis=0) * 100),
+            "mean_hidden_dead_percent": float(np.mean(dead) * 100),
+        })
 
-print(f"\n\n{'=' * 90}")
-print("CORRELATION ANALYSIS")
-print(f"{'=' * 90}")
+        per_layer_gauge_means = []
+        for layer_idx in range(config["num_layers"]):
+            layer_values = gauge[:, layer_idx]
+            per_layer_gauge_means.append(_safe_nanmean(layer_values) * 100)
+        per_layer_gauge_table.append({
+            "bias_init": bias_val,
+            "layer_gauge_percent": per_layer_gauge_means,
+            "mean_hidden_gauge_percent": _safe_nanmean(hidden_gauge) * 100,
+            "mean_last_layer_gauge_percent": _safe_nanmean(last_layer_gauge) * 100,
+        })
 
-# Use only conditions where gauge fraction is not NaN
-dead_arr = np.array(summary_dead)
-gauge_arr = np.array(summary_gauge)
-valid_mask = ~np.isnan(gauge_arr)
+        for seed_idx, seed in enumerate(condition["seeds"]):
+            for layer_idx in range(num_hidden_layers):
+                gauge_value = hidden_gauge[seed_idx, layer_idx]
+                if np.isnan(gauge_value):
+                    continue
+                pooled_hidden_points.append({
+                    "bias_init": bias_val,
+                    "seed": int(seed),
+                    "layer_index": int(layer_idx),
+                    "layer_name": experiment_results["hidden_layer_names"][layer_idx],
+                    "dead_percent": float(dead[seed_idx, layer_idx] * 100),
+                    "gauge_percent": float(gauge_value * 100),
+                })
 
-dead_valid = dead_arr[valid_mask]
-gauge_valid = gauge_arr[valid_mask]
+    summary_dead = np.array([item["mean_hidden_dead_percent"] for item in condition_summaries], dtype=float)
+    summary_gauge = np.array([item["mean_hidden_gauge_percent"] for item in condition_summaries], dtype=float)
+    condition_level = _compute_condition_level_correlation(summary_dead, summary_gauge)
 
-if len(dead_valid) >= 2 and np.std(dead_valid) > 1e-10 and np.std(gauge_valid) > 1e-10:
-    correlation = np.corrcoef(dead_valid, gauge_valid)[0, 1]
-    slope = np.polyfit(dead_valid, gauge_valid, 1)[0]
-    print(f"\n  Valid conditions: {len(dead_valid)}/{len(dead_arr)}")
-    print(f"  Pearson correlation (dead % vs gauge %): r = {correlation:.4f}")
-    print(f"  Dead fraction range:  {dead_valid.min():.1f}% to {dead_valid.max():.1f}%")
-    print(f"  Gauge fraction range: {gauge_valid.min():.1f}% to {gauge_valid.max():.1f}%")
-    print(f"  Linear fit slope: {slope:.4f} (gauge% per dead%)")
-elif len(dead_valid) >= 2:
-    correlation = 0.0
-    print(f"\n  Valid conditions: {len(dead_valid)}/{len(dead_arr)}")
-    print(f"  Insufficient variance for correlation")
-else:
-    correlation = float('nan')
-    print(f"\n  Only {len(dead_valid)} valid condition(s) -- cannot compute correlation")
+    all_dead_points = np.array([item["dead_percent"] for item in pooled_hidden_points], dtype=float)
+    all_gauge_points = np.array([item["gauge_percent"] for item in pooled_hidden_points], dtype=float)
 
+    pooled_summary = {
+        "n_points": int(len(all_dead_points)),
+        "pearson_r": float("nan"),
+        "status": "INSUFFICIENT_POINTS",
+        "dead_points_percent": _to_float_list(all_dead_points),
+        "gauge_points_percent": _to_float_list(all_gauge_points),
+        "points": pooled_hidden_points,
+        "bin_summary": _build_bin_summary(all_dead_points, all_gauge_points, config["dead_gauge_bins"]),
+    }
+    if len(all_dead_points) >= 2 and np.std(all_dead_points) > 1e-10 and np.std(all_gauge_points) > 1e-10:
+        pooled_summary["pearson_r"] = float(np.corrcoef(all_dead_points, all_gauge_points)[0, 1])
+        pooled_summary["status"] = "OK"
+    elif len(all_dead_points) >= 2:
+        pooled_summary["status"] = "INSUFFICIENT_VARIANCE"
 
-# =============================================================================
-# FINE-GRAINED: per-layer data points
-# =============================================================================
+    last_layer_control = []
+    for summary in condition_summaries:
+        last_layer_control.append({
+            "bias_init": summary["bias_init"],
+            "mean_last_layer_gauge_percent": summary["mean_last_layer_gauge_percent"],
+            "valid_last_layer_count": summary["valid_last_layer_count"],
+            "nan_last_layer_count": summary["nan_last_layer_count"],
+        })
 
-print(f"\n\n{'=' * 90}")
-print("FINE-GRAINED: Per-layer dead vs gauge (pooled over all conditions)")
-print(f"{'=' * 90}")
+    valid_hidden_gauges = [item["mean_hidden_gauge_percent"] for item in condition_summaries
+                           if not np.isnan(item["mean_hidden_gauge_percent"])]
 
-# For layers 0..4 that have ReLU: pair dead_frac with gauge_frac
-all_dead_points = []
-all_gauge_points = []
+    h1_result = len(valid_hidden_gauges) > 0 and all(g > 30.0 for g in valid_hidden_gauges)
+    h2_result = None
+    h2_spread = float("nan")
+    if len(valid_hidden_gauges) >= 3:
+        gauge_valid_arr = np.array(valid_hidden_gauges, dtype=float)
+        h2_spread = float(gauge_valid_arr.max() - gauge_valid_arr.min())
+        h2_result = bool(h2_spread < 15.0)
 
-for bias_val in BIAS_INITS:
-    r = results[bias_val]
-    for seed_idx in range(NUM_SEEDS):
-        for l in range(NUM_LAYERS - 1):
-            dead_frac = r['dead'][seed_idx, l] * 100
-            gauge_frac = r['gauge'][seed_idx, l]
-            if not np.isnan(gauge_frac):
-                all_dead_points.append(dead_frac)
-                all_gauge_points.append(gauge_frac * 100)
-
-all_dead_points = np.array(all_dead_points)
-all_gauge_points = np.array(all_gauge_points)
-
-if len(all_dead_points) >= 2 and np.std(all_dead_points) > 1e-10 and np.std(all_gauge_points) > 1e-10:
-    fine_corr = np.corrcoef(all_dead_points, all_gauge_points)[0, 1]
-    print(f"\n  Valid data points: {len(all_dead_points)}")
-    print(f"  Per-layer correlation (dead vs gauge): r = {fine_corr:.4f}")
-else:
-    fine_corr = 0.0
-    print(f"\n  Valid data points: {len(all_dead_points)}")
-    print(f"  Insufficient variance for per-layer correlation")
-
-# Bin by dead fraction
-bins = [(0, 10), (10, 30), (30, 50), (50, 70), (70, 90), (90, 100)]
-print(f"\n  {'Dead % bin':>12}  {'N':>4}  {'Mean gauge %':>13}  {'Std gauge %':>12}")
-print(f"  {'-'*50}")
-
-for lo, hi in bins:
-    mask = (all_dead_points >= lo) & (all_dead_points < hi)
-    n = np.sum(mask)
-    if n > 0:
-        mg = np.mean(all_gauge_points[mask])
-        sg = np.std(all_gauge_points[mask])
-        print(f"  {lo:>4}-{hi:<4}%     {n:>4}  {mg:>13.1f}  {sg:>12.1f}")
-    else:
-        print(f"  {lo:>4}-{hi:<4}%     {0:>4}         ---           ---")
-
-
-# =============================================================================
-# ALSO: last-layer gauge fraction (no ReLU above it)
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("LAST LAYER (L6) GAUGE FRACTION (no ReLU after it; gauge should always be ~50%)")
-print(f"{'=' * 90}")
-
-print(f"\n{'Bias':>6}  {'L6 gauge %':>12}  {'Valid seeds':>12}")
-print("-" * 35)
-for bias_val in BIAS_INITS:
-    r = results[bias_val]
-    col = r['gauge'][:, NUM_LAYERS - 1]
-    valid = col[~np.isnan(col)]
-    if len(valid) > 0:
-        print(f"{bias_val:>+6.0f}  {np.mean(valid)*100:>12.1f}  {len(valid):>12}")
-    else:
-        print(f"{bias_val:>+6.0f}  {'NaN':>12}  {0:>12}")
-
-
-# =============================================================================
-# HYPOTHESIS TESTS
-# =============================================================================
-
-print(f"\n\n{'=' * 90}")
-print("HYPOTHESIS TESTS")
-print(f"{'=' * 90}")
-
-# H1: Where gradients exist, gauge fraction is substantial (>30%)
-valid_gauges = [g for g in summary_gauge if not np.isnan(g)]
-h1 = len(valid_gauges) > 0 and all(g > 30.0 for g in valid_gauges)
-print(f"\nH1: Gauge fraction >30% wherever gradients are non-trivial?")
-print(f"    Valid values: {[f'{g:.1f}%' for g in valid_gauges]}")
-print(f"    --> {'PASS' if h1 else 'FAIL'}")
-
-# H2: Gauge fraction is near-constant among valid conditions (spread < 15pp)
-if len(valid_gauges) >= 2:
-    gauge_valid_arr = np.array(valid_gauges)
-    gauge_spread = gauge_valid_arr.max() - gauge_valid_arr.min()
-    h2 = gauge_spread < 15.0
-    print(f"\nH2: Gauge fraction spread < 15pp among valid conditions (local property)?")
-    print(f"    Spread: {gauge_spread:.1f}pp")
-    print(f"    --> {'PASS' if h2 else 'FAIL'}")
-else:
-    h2 = None
-    print(f"\nH2: Only {len(valid_gauges)} valid conditions. SKIPPED.")
-
-# H3: Dead neurons cause zero gradients -> NaN gauge (not low gauge)
-# Check if conditions with 100% dead neurons all produce NaN
-fully_dead_biases = [b for b in BIAS_INITS if np.mean(results[b]['dead']) > 0.95]
-if fully_dead_biases:
-    all_nan_for_dead = True
-    for b in fully_dead_biases:
-        gauge_flat = results[b]['gauge'].flatten()
-        n_valid = np.sum(~np.isnan(gauge_flat))
-        # Last layer might still have valid gauge (linear output layer)
-        # Check non-last layers
-        for l in range(NUM_LAYERS - 1):
-            col = results[b]['gauge'][:, l]
-            if np.any(~np.isnan(col)):
+    fully_dead_biases = [
+        float(condition["bias_init"])
+        for condition in condition_results
+        if float(np.mean(condition["dead"])) > 0.95
+    ]
+    h3_result = None
+    if fully_dead_biases:
+        all_nan_for_dead = True
+        for condition in condition_results:
+            if float(condition["bias_init"]) not in fully_dead_biases:
+                continue
+            hidden_gauge = np.asarray(condition["hidden_gauge"], dtype=float)
+            if np.any(~np.isnan(hidden_gauge)):
                 all_nan_for_dead = False
-    h3 = all_nan_for_dead
-    print(f"\nH3: Fully-dead conditions have NaN gauge in hidden layers (zero gradient)?")
-    print(f"    Fully dead bias values: {fully_dead_biases}")
-    print(f"    --> {'PASS' if h3 else 'FAIL'}")
-else:
-    h3 = None
-    print(f"\nH3: No fully-dead conditions. SKIPPED.")
+        h3_result = bool(all_nan_for_dead)
 
-# H4: Fine-grained: among non-dead layers, correlation is weak
-if len(all_dead_points) >= 5:
-    h4 = abs(fine_corr) < 0.5
-    print(f"\nH4: Per-layer correlation |r| < 0.5 (gauge independent of partial dead fraction)?")
-    print(f"    r = {fine_corr:.4f}, N = {len(all_dead_points)}")
-    print(f"    --> {'PASS' if h4 else 'FAIL'}")
-else:
-    h4 = None
-    print(f"\nH4: Insufficient data points. SKIPPED.")
+    h4_result = None
+    if pooled_summary["n_points"] >= 5 and np.isfinite(pooled_summary["pearson_r"]):
+        h4_result = bool(abs(pooled_summary["pearson_r"]) < 0.5)
 
-total_pass = sum(1 for h in [h1, h2, h3, h4] if h is True)
-total_tests = sum(1 for h in [h1, h2, h3, h4] if h is not None)
+    test_records = [
+        {
+            "name": "H1",
+            "question": "Is hidden-layer gauge substantial where gradients are non-trivial?",
+            "result": h1_result,
+            "status": "PASS" if bool(h1_result) else "FAIL",
+            "details": {
+                "valid_hidden_gauge_condition_means": valid_hidden_gauges,
+                "criterion": "> 30% for all valid hidden-layer condition means",
+            },
+        },
+        {
+            "name": "H2",
+            "question": "Is hidden-layer gauge approximately constant across valid conditions?",
+            "result": h2_result,
+            "status": "SKIPPED" if h2_result is None else ("PASS" if bool(h2_result) else "FAIL"),
+            "details": {
+                "spread_percent_points": h2_spread,
+                "valid_condition_count": len(valid_hidden_gauges),
+                "criterion": "spread < 15 percentage points; require at least 3 valid conditions",
+            },
+        },
+        {
+            "name": "H3",
+            "question": "Do near-fully-dead hidden conditions yield NaN hidden-layer gauge?",
+            "result": h3_result,
+            "status": "SKIPPED" if h3_result is None else ("PASS" if bool(h3_result) else "FAIL"),
+            "details": {
+                "fully_dead_biases": fully_dead_biases,
+                "criterion": "all hidden-layer gauges NaN when mean hidden dead fraction > 95%",
+            },
+        },
+        {
+            "name": "H4",
+            "question": "Is pooled hidden dead-vs-gauge correlation weak (|r| < 0.5)?",
+            "result": h4_result,
+            "status": "SKIPPED" if h4_result is None else ("PASS" if bool(h4_result) else "FAIL"),
+            "details": {
+                "pearson_r": pooled_summary["pearson_r"],
+                "n_points": pooled_summary["n_points"],
+                "criterion": "|r| < 0.5 with at least 5 valid hidden-layer points",
+            },
+        },
+    ]
+
+    total_pass = sum(bool(test["result"]) for test in test_records if test["result"] is not None)
+    total_tests = sum(1 for test in test_records if test["result"] is not None)
+
+    calibrated_conclusion = [
+        "This is a toy probe of batch-dead hidden units versus gauge fraction in the raw gradient.",
+        "The primary summaries use hidden layers only; the last layer is a separate control.",
+        "NaN gauge values indicate hidden layers whose gradients are too small (or non-finite) for a reliable decomposition.",
+        "Condition-level conclusions are descriptive only when fewer than 3 bias conditions have valid hidden-layer gauge summaries.",
+        "This experiment does not run Muon and does not directly measure Muon benefit.",
+    ]
+
+    return {
+        "condition_summaries": condition_summaries,
+        "summary_dead_percent": _to_float_list(summary_dead),
+        "summary_hidden_gauge_percent": _to_float_list(summary_gauge),
+        "per_layer_dead_table": per_layer_dead_table,
+        "per_layer_gauge_table": per_layer_gauge_table,
+        "condition_level": condition_level,
+        "pooled_hidden_summary": pooled_summary,
+        "last_layer_control": last_layer_control,
+        "tests": {
+            "records": test_records,
+            "total_pass": int(total_pass),
+            "total_tests": int(total_tests),
+        },
+        "calibrated_conclusion": calibrated_conclusion,
+    }
 
 
 # =============================================================================
-# FINAL VERDICT
+# REPORTING
 # =============================================================================
 
-print(f"\n\n{'=' * 90}")
-print("FINAL VERDICT: H11 GAUGE vs DEAD NEURONS")
-print(f"{'=' * 90}")
 
-if len(valid_gauges) >= 2:
-    print(f"""
-  Valid conditions (non-NaN gauge): {len(valid_gauges)}/{len(BIAS_INITS)}
-  Gauge fraction range (valid): {min(valid_gauges):.1f}% to {max(valid_gauges):.1f}%
-  Spread: {gauge_spread:.1f}pp
-  Per-layer fine-grained correlation: r = {fine_corr:.4f}
-  Tests passed: {total_pass}/{total_tests}
-""")
-else:
-    print(f"""
-  Valid conditions (non-NaN gauge): {len(valid_gauges)}/{len(BIAS_INITS)}
-  Tests passed: {total_pass}/{total_tests}
-""")
+def _print_condition_summary_table(analysis: Dict[str, Any]) -> None:
+    print(f"\n\n{'=' * 110}")
+    print("SUMMARY TABLE (primary analysis uses hidden layers only)")
+    print(f"{'=' * 110}")
+    header = (
+        f"\n{'Bias':>6}  {'Hidden dead %':>13}  {'Hidden gauge %':>15}  "
+        f"{'Hidden NaNs':>11}  {'L6 gauge %':>11}  {'Loss':>12}  {'Early stops':>11}"
+    )
+    print(header)
+    print("-" * 92)
+    for row in analysis["condition_summaries"]:
+        print(
+            f"{row['bias_init']:>+6.0f}  "
+            f"{row['mean_hidden_dead_percent']:>13.1f}  "
+            f"{_format_percent(row['mean_hidden_gauge_percent']):>15}  "
+            f"{row['nan_hidden_gauge_count']:>11}  "
+            f"{_format_percent(row['mean_last_layer_gauge_percent']):>11}  "
+            f"{row['mean_loss']:>12.4f}  "
+            f"{row['num_stopped_early']:>11}"
+        )
 
-print("  INTERPRETATION:")
-print("  - Dead neurons produce ZERO gradients -> NaN gauge fraction (undefined).")
-print("  - Where gradients flow, gauge fraction remains near ~50%.")
-print("  - The question 'does gauge drop with dead neurons' is CONFOUNDED:")
-print("    dead neurons don't reduce gauge -- they eliminate gradients entirely.")
-print("  - The gauge is a property of the gradient GEOMETRY, which requires")
-print("    nonzero gradients to be measurable.")
-print(f"\n{'=' * 90}")
+
+def _print_per_layer_tables(experiment_results: Dict[str, Any], analysis: Dict[str, Any]) -> None:
+    print(f"\n\n{'=' * 110}")
+    print("PER-LAYER HIDDEN DEAD FRACTION (%, mean over seeds)")
+    print(f"{'=' * 110}")
+    print(f"\n{'Bias':>6}", end="")
+    for name in experiment_results["hidden_layer_names"]:
+        print(f"  {name:>8}", end="")
+    print(f"  {'Mean':>8}")
+    print("-" * (8 + 10 * len(experiment_results["hidden_layer_names"]) + 10))
+    for row in analysis["per_layer_dead_table"]:
+        print(f"{row['bias_init']:>+6.0f}", end="")
+        for value in row["layer_dead_percent"]:
+            print(f"  {value:>8.1f}", end="")
+        print(f"  {row['mean_hidden_dead_percent']:>8.1f}")
+
+    print(f"\n\n{'=' * 110}")
+    print("PER-LAYER GAUGE FRACTION (%, mean over seeds, NaN = unreliable / zero-gradient regime)")
+    print(f"{'=' * 110}")
+    print(f"\n{'Bias':>6}", end="")
+    for name in experiment_results["layer_names"]:
+        print(f"  {name:>8}", end="")
+    print(f"  {'Hidden mean':>12}  {'L6':>8}")
+    print("-" * (8 + 10 * len(experiment_results["layer_names"]) + 24))
+    for row in analysis["per_layer_gauge_table"]:
+        print(f"{row['bias_init']:>+6.0f}", end="")
+        for value in row["layer_gauge_percent"]:
+            print(f"  {_format_percent(value):>8}", end="")
+        print(
+            f"  {_format_percent(row['mean_hidden_gauge_percent']):>12}"
+            f"  {_format_percent(row['mean_last_layer_gauge_percent']):>8}"
+        )
+
+
+def _print_condition_level_analysis(analysis: Dict[str, Any]) -> None:
+    level = analysis["condition_level"]
+    print(f"\n\n{'=' * 110}")
+    print("CONDITION-LEVEL DEAD-vs-GAUGE ANALYSIS (hidden layers only)")
+    print(f"{'=' * 110}")
+    print(f"\nValid conditions: {level['valid_condition_count']}/{level['total_condition_count']}")
+    if np.isfinite(level["pearson_r"]):
+        print(f"Pearson r: {level['pearson_r']:.4f}")
+        print(f"Slope:     {level['slope']:.4f} gauge-pp per dead-pp")
+    else:
+        print("Pearson r: NaN")
+        print("Slope:     NaN")
+    print(f"Status:    {level['status']}")
+    if level["status"] == "DESCRIPTIVE_ONLY":
+        print("Note: fewer than 3 valid conditions; treat this only as descriptive.")
+
+
+def _print_pooled_hidden_analysis(analysis: Dict[str, Any]) -> None:
+    pooled = analysis["pooled_hidden_summary"]
+    print(f"\n\n{'=' * 110}")
+    print("POOLED HIDDEN-LAYER DEAD-vs-GAUGE ANALYSIS")
+    print(f"{'=' * 110}")
+    print(f"\nValid hidden-layer points: {pooled['n_points']}")
+    if np.isfinite(pooled["pearson_r"]):
+        print(f"Pearson r: {pooled['pearson_r']:.4f}")
+    else:
+        print(f"Pearson r: NaN ({pooled['status']})")
+
+    print(f"\n{'Dead % bin':>12}  {'N':>4}  {'Mean gauge %':>13}  {'Std gauge %':>12}")
+    print(f"  {'-' * 50}")
+    for row in pooled["bin_summary"]:
+        if row["n_points"] > 0:
+            print(
+                f"{row['dead_bin_label']:>12}  {row['n_points']:>4}  "
+                f"{row['mean_gauge_percent']:>13.1f}  {row['std_gauge_percent']:>12.1f}"
+            )
+        else:
+            print(f"{row['dead_bin_label']:>12}  {0:>4}  {'---':>13}  {'---':>12}")
+
+
+def _print_last_layer_control(analysis: Dict[str, Any], last_layer_name: str) -> None:
+    print(f"\n\n{'=' * 110}")
+    print(f"LAST-LAYER CONTROL ({last_layer_name}; no ReLU after it)")
+    print(f"{'=' * 110}")
+    print(f"\n{'Bias':>6}  {'Gauge %':>10}  {'Valid seeds':>12}  {'NaN seeds':>10}")
+    print("-" * 48)
+    for row in analysis["last_layer_control"]:
+        print(
+            f"{row['bias_init']:>+6.0f}  "
+            f"{_format_percent(row['mean_last_layer_gauge_percent']):>10}  "
+            f"{row['valid_last_layer_count']:>12}  "
+            f"{row['nan_last_layer_count']:>10}"
+        )
+
+
+def _print_tests(analysis: Dict[str, Any]) -> None:
+    print(f"\n\n{'=' * 110}")
+    print("HYPOTHESIS CHECKS")
+    print(f"{'=' * 110}")
+    for test in analysis["tests"]["records"]:
+        print(f"\n{test['name']}: {test['question']}")
+        print(f"    --> {test['status']}")
+        details = test["details"]
+        if test["name"] == "H1":
+            values = details["valid_hidden_gauge_condition_means"]
+            print(f"    Valid hidden-layer condition means: {[f'{v:.1f}%' for v in values]}")
+        elif test["name"] == "H2":
+            spread = details["spread_percent_points"]
+            if np.isfinite(spread):
+                print(f"    Spread: {spread:.1f}pp")
+            print(f"    Valid conditions: {details['valid_condition_count']}")
+        elif test["name"] == "H3":
+            print(f"    Fully dead biases: {details['fully_dead_biases']}")
+        elif test["name"] == "H4":
+            pearson_r = details["pearson_r"]
+            if np.isfinite(pearson_r):
+                print(f"    r = {pearson_r:.4f}, N = {details['n_points']}")
+            else:
+                print(f"    r = NaN, N = {details['n_points']}")
+
+    print(
+        f"\nTests passed: {analysis['tests']['total_pass']}/"
+        f"{analysis['tests']['total_tests']}"
+    )
+
+
+def _print_conclusion(analysis: Dict[str, Any]) -> None:
+    print(f"\n\n{'=' * 110}")
+    print("CALIBRATED CONCLUSION")
+    print(f"{'=' * 110}")
+    for bullet in analysis["calibrated_conclusion"]:
+        print(f"- {bullet}")
+
+
+def print_report(experiment_results: Dict[str, Any], analysis: Dict[str, Any]) -> None:
+    """Print the full report corresponding to the current analysis."""
+    _print_condition_summary_table(analysis)
+    _print_per_layer_tables(experiment_results, analysis)
+    _print_condition_level_analysis(analysis)
+    _print_pooled_hidden_analysis(analysis)
+    _print_last_layer_control(analysis, experiment_results["last_layer_name"])
+    _print_tests(analysis)
+    _print_conclusion(analysis)
+
+
+def main() -> None:
+    experiment_results = run_experiment(verbose=True)
+    analysis = analyze_results(experiment_results)
+    print_report(experiment_results, analysis)
+
+
+if __name__ == "__main__":
+    main()
